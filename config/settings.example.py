@@ -43,8 +43,7 @@ class Settings(BaseSettings):
     # === Database ===
     DATABASE_URL: str = "sqlite+aiosqlite:///data/arb.db"
 
-    class Config:
-        env_file = ".env"
+    model_config = {"env_file": ".env"}
 
 
 settings = Settings()

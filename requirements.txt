@@ -6,7 +6,6 @@ pydantic-settings==2.1.0
 # Async
 aiohttp==3.9.1
 websockets==12.0
-asyncio==3.4.3
 
 # APIs
 py-clob-client==0.1.0  # Polymarket
