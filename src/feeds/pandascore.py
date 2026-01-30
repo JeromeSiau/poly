@@ -12,6 +12,9 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 import httpx
+import structlog
+
+logger = structlog.get_logger()
 
 from .base import BaseFeed, FeedEvent
 
@@ -291,9 +294,7 @@ class PandaScoreFeed(BaseFeed):
                     for event in events:
                         await self._emit(event)
                 except Exception as e:
-                    # Log error but continue polling other matches
-                    # In production, use proper logging
-                    pass
+                    logger.error("poll_loop_error", game=game, match_id=match_id, error=str(e))
 
             await asyncio.sleep(self._poll_interval)
 
