@@ -50,7 +50,7 @@ def get_async_engine(database_url: str = DEFAULT_ASYNC_DATABASE_URL) -> AsyncEng
     return _async_engine
 
 
-def get_session(database_url: str = DEFAULT_DATABASE_URL) -> Session:
+def get_sync_session(database_url: str = DEFAULT_DATABASE_URL) -> Session:
     """Get a synchronous database session."""
     global _sync_session_factory
     if _sync_session_factory is None:
@@ -81,7 +81,7 @@ def get_async_session_factory(
 
 
 @asynccontextmanager
-async def get_async_session(
+async def get_session(
     database_url: str = DEFAULT_ASYNC_DATABASE_URL,
 ) -> AsyncGenerator[AsyncSession, None]:
     """Get an async database session as a context manager."""
@@ -95,6 +95,10 @@ async def get_async_session(
         raise
     finally:
         await session.close()
+
+
+# Alias for backwards compatibility
+get_async_session = get_session
 
 
 def init_db(database_url: str = DEFAULT_DATABASE_URL) -> None:

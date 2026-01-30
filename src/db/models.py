@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models for game events, markets, trades, and positions."""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy import (
     Column,
@@ -73,7 +73,7 @@ class Trade(Base):
     trigger_event = Column(String(100), nullable=True)  # Event that triggered the trade
     status = Column(String(50), nullable=False)  # "PENDING", "FILLED", "CANCELLED", "FAILED"
     execution_time_ms = Column(Integer, nullable=True)  # Execution time in milliseconds
-    order_id = Column(String(255), nullable=True)  # External order ID from Polymarket
+    polymarket_order_id = Column(String(255), nullable=True)  # External order ID from Polymarket
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     filled_at = Column(DateTime, nullable=True)
@@ -83,19 +83,22 @@ class Trade(Base):
 
 
 class Position(Base):
-    """Model for tracking current positions in markets."""
+    """Open and closed positions."""
 
     __tablename__ = "positions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    market_id = Column(String(255), nullable=False, index=True)
-    outcome = Column(String(255), nullable=False)
-    size = Column(Float, nullable=False, default=0.0)
-    average_price = Column(Float, nullable=True)
+    market_id = Column(String(100), nullable=False, index=True)
+    outcome = Column(String(100), nullable=False)
+    entry_price = Column(Float, nullable=False)
+    current_price = Column(Float, nullable=False)
+    size = Column(Float, nullable=False)
     realized_pnl = Column(Float, default=0.0)
     unrealized_pnl = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    is_open = Column(Boolean, default=True)
+    opened_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
 
     def __repr__(self) -> str:
         return f"<Position(id={self.id}, market_id={self.market_id}, outcome={self.outcome}, size={self.size})>"
