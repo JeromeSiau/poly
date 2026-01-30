@@ -30,7 +30,7 @@ class SignificantEvent:
     @property
     def should_trade(self) -> bool:
         """Determine if this event warrants placing a trade."""
-        return self.is_significant and self.impact_score >= 0.5
+        return self.is_significant and self.impact_score >= 0.4
 
 
 class EventDetector:
@@ -47,11 +47,12 @@ class EventDetector:
         "tower": 0.25,
         "dragon": 0.30,
         "rift_herald": 0.25,
-        "baron_kill": 0.85,
-        "elder_dragon": 0.90,
+        "baron": 0.85,
+        "elder": 0.90,
         "inhibitor": 0.40,
         "ace": 0.60,
         "first_blood": 0.20,
+        "nexus_turret": 0.70,
     }
 
     # CS:GO event weights
@@ -60,8 +61,8 @@ class EventDetector:
         "round_end": 0.35,
         "ace": 0.50,
         "clutch": 0.45,
-        "bomb_plant": 0.15,
-        "bomb_defuse": 0.25,
+        "bomb_planted": 0.15,
+        "bomb_defused": 0.35,
         "overtime_start": 0.60,
         "match_point": 0.80,
     }
@@ -73,9 +74,10 @@ class EventDetector:
         "roshan": 0.75,
         "aegis_pickup": 0.70,
         "barracks": 0.50,
-        "ancient_attack": 0.85,
+        "ancient_damage": 0.80,
         "team_wipe": 0.65,
         "buyback": 0.25,
+        "mega_creeps": 0.85,
     }
 
     def __init__(self):
@@ -143,7 +145,7 @@ class EventDetector:
         impact_score = min(base_weight * time_multiplier, 1.0)
 
         # Baron and Elder are always high impact regardless of time
-        if event_type in ("baron_kill", "elder_dragon"):
+        if event_type in ("baron", "elder"):
             impact_score = max(impact_score, self.LOL_WEIGHTS[event_type])
 
         # Determine favored team
@@ -153,9 +155,9 @@ class EventDetector:
         killer = data.get("killer", "Unknown")
         if event_type == "kill":
             description = f"Kill by {killer} ({favored_team}) at {game_time}min"
-        elif event_type == "baron_kill":
+        elif event_type == "baron":
             description = f"Baron kill by {favored_team}"
-        elif event_type == "elder_dragon":
+        elif event_type == "elder":
             description = f"Elder Dragon taken by {favored_team}"
         else:
             description = f"{event_type} by {favored_team}"
@@ -262,7 +264,7 @@ class EventDetector:
         impact_score = min(base_weight * time_multiplier, 1.0)
 
         # Roshan and ancient events are always high impact
-        if event_type in ("roshan", "ancient_attack", "aegis_pickup"):
+        if event_type in ("roshan", "ancient_damage", "aegis_pickup"):
             impact_score = max(impact_score, self.DOTA2_WEIGHTS.get(event_type, 0.7))
 
         # Determine favored team
@@ -271,7 +273,7 @@ class EventDetector:
         # Build description
         if event_type == "roshan":
             description = f"Roshan killed by {favored_team}"
-        elif event_type == "ancient_attack":
+        elif event_type == "ancient_damage":
             description = f"Ancient under attack by {favored_team}"
         else:
             description = f"{event_type} by {favored_team}"

@@ -41,7 +41,7 @@ class TestSignificantEventClassification:
         """Baron kill is always highly significant."""
         event = FeedEvent(
             source="pandascore",
-            event_type="baron_kill",
+            event_type="baron",
             game="lol",
             data={"team": "T1"},
             timestamp=datetime.utcnow().timestamp()
