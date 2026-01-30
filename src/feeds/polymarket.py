@@ -11,9 +11,12 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
+import structlog
 import websockets
+
+logger = structlog.get_logger()
 from websockets import ClientConnection
 
 from .base import BaseFeed, FeedEvent
@@ -142,6 +145,10 @@ class PolymarketFeed(BaseFeed):
         """
         await self.subscribe_market(match_id)
 
+    async def unsubscribe(self, game: str, match_id: str) -> None:
+        """Unsubscribe from a market (BaseFeed interface)."""
+        await self.unsubscribe_market(match_id)
+
     async def subscribe_market(self, market_id: str) -> None:
         """Subscribe to order book updates for a market.
 
@@ -259,8 +266,8 @@ class PolymarketFeed(BaseFeed):
                     await self._ws.ping()
             except asyncio.CancelledError:
                 break
-            except Exception:
-                # Connection may have been lost
+            except Exception as e:
+                logger.error("receive_loop_error", error=str(e))
                 break
 
     async def _receive_loop(self) -> None:
@@ -275,8 +282,8 @@ class PolymarketFeed(BaseFeed):
             except websockets.exceptions.ConnectionClosed:
                 self._connected = False
                 break
-            except Exception:
-                # Log error but continue processing
+            except Exception as e:
+                logger.error("receive_loop_error", error=str(e))
                 continue
 
     async def _process_message(self, data: dict[str, Any]) -> None:

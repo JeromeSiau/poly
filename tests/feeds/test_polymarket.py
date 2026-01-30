@@ -80,3 +80,28 @@ class TestPolymarketFeed:
         prob = feed.calculate_implied_probability(0.64, 0.66)
 
         assert prob == 0.65
+
+    def test_merge_levels_add_new(self):
+        """Test adding a new price level."""
+        feed = PolymarketFeed()
+        existing = [(0.64, 100.0), (0.63, 200.0)]
+        updates = [(0.65, 50.0)]  # New level
+        result = feed._merge_levels(existing, updates, descending=True)
+        assert (0.65, 50.0) in result
+        assert len(result) == 3
+
+    def test_merge_levels_remove_zero_size(self):
+        """Test removing a level with size 0."""
+        feed = PolymarketFeed()
+        existing = [(0.64, 100.0), (0.63, 200.0)]
+        updates = [(0.64, 0.0)]  # Remove this level
+        result = feed._merge_levels(existing, updates, descending=True)
+        assert (0.64, 100.0) not in result
+        assert len(result) == 1
+
+    def test_get_best_prices_unknown_market(self):
+        """Test get_best_prices returns (None, None) for unknown market."""
+        feed = PolymarketFeed()
+        best_bid, best_ask = feed.get_best_prices("unknown", "YES")
+        assert best_bid is None
+        assert best_ask is None
