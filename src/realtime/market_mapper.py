@@ -1,7 +1,23 @@
-"""Market Mapper - Links game events to Polymarket markets."""
+"""Market Mapper - Links game events to Polymarket markets.
 
+Handles:
+1. Manual mapping registration
+2. Automatic discovery from Polymarket API
+3. Team name normalization with aliases
+4. Fuzzy matching between PandaScore and Polymarket team names
+"""
+
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+import httpx
+import structlog
+
+from src.utils.team_matching import normalize_team_name, match_team_name, TEAM_ALIASES
+
+logger = structlog.get_logger()
 
 
 @dataclass
@@ -34,15 +50,15 @@ class MarketMapping:
 
     @staticmethod
     def _normalize_team_name(name: str) -> str:
-        """Normalize team name for comparison.
+        """Normalize team name for comparison using shared utility.
 
         Args:
             name: Raw team name.
 
         Returns:
-            Normalized team name (lowercase, stripped).
+            Normalized team name (lowercase, with alias resolution).
         """
-        return name.lower().strip()
+        return normalize_team_name(name)
 
     @staticmethod
     def _detect_game(market_data: dict) -> str:
@@ -120,40 +136,8 @@ class MarketMapping:
 class MarketMapper:
     """Registry for mapping game events to Polymarket markets."""
 
-    # Common team name aliases
-    TEAM_ALIASES: dict[str, str] = {
-        # League of Legends
-        "skt": "T1",
-        "sk telecom": "T1",
-        "sk telecom t1": "T1",
-        "skt t1": "T1",
-        "damwon": "DK",
-        "damwon gaming": "DK",
-        "dwg": "DK",
-        "dwg kia": "DK",
-        "gen.g": "Gen.G",
-        "geng": "Gen.G",
-        "samsung": "Gen.G",
-        "samsung galaxy": "Gen.G",
-        # CS:GO / CS2
-        "navi": "Navi",
-        "natus vincere": "Navi",
-        "faze": "FaZe",
-        "faze clan": "FaZe",
-        "g2": "G2",
-        "g2 esports": "G2",
-        "vitality": "Vitality",
-        "team vitality": "Vitality",
-        # Dota 2
-        "og": "OG",
-        "team spirit": "Spirit",
-        "spirit": "Spirit",
-        "liquid": "Liquid",
-        "team liquid": "Liquid",
-        # General
-        "c9": "Cloud9",
-        "cloud 9": "Cloud9",
-    }
+    GAMMA_API = "https://gamma-api.polymarket.com"
+    LOL_SERIES_ID = "10311"
 
     def __init__(self):
         """Initialize an empty MarketMapper."""
@@ -241,26 +225,15 @@ class MarketMapper:
         return self._by_polymarket_id.get(polymarket_id)
 
     def _normalize_team(self, team: str) -> str:
-        """Normalize a team name using aliases.
+        """Normalize a team name using shared team_matching utility.
 
         Args:
             team: Raw team name.
 
         Returns:
-            Normalized/canonical team name.
+            Normalized/canonical team name (lowercase).
         """
-        team_lower = team.lower().strip()
-
-        # Check if it's an alias
-        if team_lower in self.TEAM_ALIASES:
-            return self.TEAM_ALIASES[team_lower].lower()
-
-        # Check if it matches any alias value
-        for alias, canonical in self.TEAM_ALIASES.items():
-            if canonical.lower() == team_lower:
-                return canonical.lower()
-
-        return team_lower
+        return normalize_team_name(team)
 
     def get_all_mappings(self) -> list[MarketMapping]:
         """Get all registered mappings.
@@ -269,3 +242,245 @@ class MarketMapper:
             List of all MarketMapping instances.
         """
         return list(self._mappings)
+
+    @staticmethod
+    def parse_teams_from_title(title: str) -> tuple[str, str] | None:
+        """Extract team names from a Polymarket market title.
+
+        Handles formats like:
+        - "LoL: T1 vs G2 Esports"
+        - "LoL: Fnatic vs SK Gaming (BO3)"
+        - "LoL: Team A vs Team B (BO3) - LEC Regular Season"
+
+        Args:
+            title: Market title string.
+
+        Returns:
+            Tuple of (team_a, team_b) or None if parsing fails.
+        """
+        # Remove game prefix
+        clean = re.sub(r"^(LoL|Dota2?|CS:?GO|CS2|Valorant):\s*", "", title, flags=re.I)
+
+        # Split by " vs " first
+        if " vs " not in clean.lower():
+            return None
+
+        parts = re.split(r"\s+vs\s+", clean, flags=re.I)
+        if len(parts) != 2:
+            return None
+
+        team_a = parts[0].strip()
+        team_b = parts[1].strip()
+
+        # Remove (BOx) from team_b (it's usually attached to team_b)
+        team_b = re.sub(r"\s*\(BO\d+\)\s*", "", team_b)
+
+        # Remove tournament/league info after " - "
+        team_b = re.sub(r"\s*-\s+.*$", "", team_b)
+
+        if not team_a or not team_b:
+            return None
+
+        return (team_a, team_b)
+
+    def sync_from_polymarket(
+        self,
+        game: str = "lol",
+        limit: int = 50,
+        only_active: bool = True,
+    ) -> int:
+        """Fetch markets from Polymarket API and create mappings.
+
+        Args:
+            game: Game type to fetch ("lol", "csgo", "dota2").
+            limit: Maximum number of markets to fetch.
+            only_active: If True, only fetch markets accepting orders.
+
+        Returns:
+            Number of new mappings created.
+        """
+        series_id = self.LOL_SERIES_ID if game == "lol" else None
+
+        params: dict = {
+            "closed": "false",
+            "limit": limit,
+        }
+        if series_id:
+            params["series_id"] = series_id
+
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.get(f"{self.GAMMA_API}/events", params=params)
+                response.raise_for_status()
+                events = response.json()
+        except Exception as e:
+            logger.error("polymarket_fetch_failed", error=str(e))
+            return 0
+
+        new_count = 0
+
+        for event in events:
+            title = event.get("title", "")
+            markets = event.get("markets", [])
+
+            if not markets:
+                continue
+
+            market = markets[0]
+
+            # Skip if not accepting orders
+            if only_active and not market.get("acceptingOrders", False):
+                continue
+
+            # Skip if already resolved (price is 0 or 1)
+            prices_str = market.get("outcomePrices", "[]")
+            try:
+                prices = json.loads(prices_str)
+                if prices and prices[0] in ["0", "1", 0, 1]:
+                    continue
+            except (json.JSONDecodeError, IndexError):
+                pass
+
+            # Parse teams from title
+            teams = self.parse_teams_from_title(title)
+            if not teams:
+                logger.debug("cannot_parse_teams", title=title)
+                continue
+
+            team_a, team_b = teams
+
+            # Get CLOB token IDs and outcomes
+            try:
+                clob_ids = json.loads(market.get("clobTokenIds", "[]"))
+                outcomes = json.loads(market.get("outcomes", "[]"))
+            except json.JSONDecodeError:
+                continue
+
+            if not clob_ids or len(outcomes) < 2:
+                continue
+
+            # Market ID is the first CLOB token ID
+            market_id = clob_ids[0]
+
+            # Skip if already registered
+            if self.find_by_polymarket_id(market_id):
+                continue
+
+            # Skip Over/Under markets (not direct team vs team)
+            if outcomes[0].lower() in ("over", "under"):
+                logger.debug("skipping_over_under_market", title=title)
+                continue
+
+            # Create mapping: Map team names to their Polymarket outcome tokens
+            # Two formats exist:
+            # 1. Outcomes are team names: ["T1", "Gen.G"] -> map directly
+            # 2. Outcomes are Yes/No: ["Yes", "No"] -> team_a=Yes, team_b=No
+            if outcomes[0].lower() in ("yes", "no"):
+                # Yes/No format: "Will team_a beat team_b?"
+                # team_a (subject of question) maps to "Yes"
+                outcome_mapping = {
+                    team_a: outcomes[0],  # Yes
+                    team_b: outcomes[1],  # No
+                }
+            else:
+                # Team name format: outcomes ARE the team names
+                outcome_mapping = {
+                    outcomes[0]: outcomes[0],
+                    outcomes[1]: outcomes[1],
+                }
+
+            mapping = self.add_mapping(
+                game=game,
+                event_identifier=f"{game}_{team_a}_vs_{team_b}",
+                polymarket_id=market_id,
+                outcomes=outcome_mapping,
+            )
+
+            # Also store the alternate CLOB ID for the second outcome
+            if len(clob_ids) > 1:
+                self._by_polymarket_id[clob_ids[1]] = mapping
+
+            logger.info(
+                "mapping_created",
+                title=title[:50],
+                team_a=team_a,
+                team_b=team_b,
+                market_id=market_id[:20] + "...",
+            )
+            new_count += 1
+
+        logger.info(
+            "sync_complete",
+            game=game,
+            total_events=len(events),
+            new_mappings=new_count,
+        )
+
+        return new_count
+
+    def find_market_fuzzy(
+        self,
+        game: str,
+        team_a: str,
+        team_b: str,
+    ) -> Optional[MarketMapping]:
+        """Find a market using fuzzy team name matching.
+
+        Tries multiple strategies:
+        1. Exact match after normalization
+        2. Alias resolution
+        3. Partial string matching
+
+        Args:
+            game: Game identifier.
+            team_a: First team name (from PandaScore).
+            team_b: Second team name (from PandaScore).
+
+        Returns:
+            Matching MarketMapping or None.
+        """
+        # Try exact match first
+        result = self.find_market(game, [team_a, team_b])
+        if result:
+            return result
+
+        # Normalize using aliases
+        norm_a = self._normalize_team(team_a)
+        norm_b = self._normalize_team(team_b)
+
+        # Try with normalized names
+        for mapping in self._mappings:
+            if mapping.game.lower() != game.lower():
+                continue
+
+            mapping_teams = set(mapping.team_to_outcome.keys())
+            mapping_teams_normalized = {
+                self._normalize_team(t) for t in mapping_teams
+            }
+
+            if {norm_a, norm_b} == mapping_teams_normalized:
+                return mapping
+
+            # Try partial matching (team name contains or is contained)
+            for mt in mapping_teams:
+                mt_lower = mt.lower()
+                if (
+                    (norm_a in mt_lower or mt_lower in norm_a)
+                    and (norm_b in mt_lower or mt_lower in norm_b)
+                ):
+                    continue  # Same team matched both, skip
+
+                matched_a = norm_a in mt_lower or mt_lower in norm_a
+                matched_b = norm_b in mt_lower or mt_lower in norm_b
+
+                if matched_a or matched_b:
+                    # Check the other team
+                    other_teams = mapping_teams - {mt}
+                    for ot in other_teams:
+                        ot_lower = ot.lower()
+                        if matched_a and (norm_b in ot_lower or ot_lower in norm_b):
+                            return mapping
+                        if matched_b and (norm_a in ot_lower or ot_lower in norm_a):
+                            return mapping
+
+        return None
