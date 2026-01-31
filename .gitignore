@@ -1,5 +1,4 @@
-# Configuration with secrets
-config/settings.py
+# Secrets
 .env
 
 # Byte-compiled / optimized / DLL files
