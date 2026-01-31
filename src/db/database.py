@@ -16,8 +16,8 @@ from .models import Base
 
 
 # Default database URL (SQLite for development)
-DEFAULT_DATABASE_URL = "sqlite:///./data/poly.db"
-DEFAULT_ASYNC_DATABASE_URL = "sqlite+aiosqlite:///./data/poly.db"
+DEFAULT_DATABASE_URL = "sqlite:///./data/arb.db"
+DEFAULT_ASYNC_DATABASE_URL = "sqlite+aiosqlite:///./data/arb.db"
 
 # Global engine instances
 _sync_engine: Optional[create_engine] = None
