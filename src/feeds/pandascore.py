@@ -3,9 +3,14 @@
 
 PandaScore provides real-time esports data with ~300ms latency from actual
 game events, giving 30-40 seconds advantage over Twitch/YouTube viewers.
+
+Uses WebSockets for lowest-latency event delivery:
+- Events endpoint: wss://live.pandascore.co/matches/{match_id}/events
+- Frames endpoint: wss://live.pandascore.co/matches/{match_id} (every 2s)
 """
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -13,6 +18,8 @@ from typing import Any, Callable, Optional
 
 import httpx
 import structlog
+import websockets
+from websockets.exceptions import ConnectionClosed
 
 logger = structlog.get_logger()
 
@@ -115,34 +122,32 @@ class PandaScoreEvent(FeedEvent):
 class PandaScoreFeed(BaseFeed):
     """Real-time esports data feed from PandaScore API.
 
-    Supports multiple esports titles with polling-based event updates.
+    Supports multiple esports titles with WebSocket-based event updates.
     The API provides ~300ms latency from actual game events.
+
+    WebSocket endpoints:
+    - Events: wss://live.pandascore.co/matches/{match_id}/events (real-time)
+    - Frames: wss://live.pandascore.co/matches/{match_id} (every 2s snapshot)
     """
 
     SUPPORTED_GAMES = ["lol", "dota2", "csgo", "valorant"]
     BASE_URL = "https://api.pandascore.co"
-    DEFAULT_POLL_INTERVAL = 1.0  # seconds
+    WS_BASE_URL = "wss://live.pandascore.co"
 
-    def __init__(
-        self,
-        api_key: str,
-        poll_interval: float = DEFAULT_POLL_INTERVAL,
-    ):
+    def __init__(self, api_key: str):
         """Initialize PandaScore feed.
 
         Args:
             api_key: PandaScore API key
-            poll_interval: Interval between polls in seconds (default: 1.0)
         """
         super().__init__()
         self._api_key = api_key
-        self._poll_interval = poll_interval
         self._client: Optional[httpx.AsyncClient] = None
-        self._poll_task: Optional[asyncio.Task] = None
-        self._last_event_ids: dict[str, set[str]] = {}  # match_id -> seen event IDs
+        self._ws_tasks: dict[str, asyncio.Task] = {}  # match_id -> WebSocket task
+        self._ws_connections: dict[str, websockets.WebSocketClientProtocol] = {}
 
     async def connect(self) -> None:
-        """Establish connection to PandaScore API."""
+        """Establish HTTP client for REST API calls (discovery, etc.)."""
         if self._connected:
             return
 
@@ -155,27 +160,42 @@ class PandaScoreFeed(BaseFeed):
             timeout=10.0,
         )
         self._connected = True
+        logger.info("pandascore_connected")
 
     async def disconnect(self) -> None:
-        """Close connection to PandaScore API."""
-        if self._poll_task:
-            self._poll_task.cancel()
+        """Close all connections (HTTP client + WebSockets)."""
+        # Cancel all WebSocket tasks
+        for match_id, task in list(self._ws_tasks.items()):
+            task.cancel()
             try:
-                await self._poll_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._poll_task = None
+            logger.debug("ws_task_cancelled", match_id=match_id)
 
+        self._ws_tasks.clear()
+
+        # Close all WebSocket connections
+        for match_id, ws in list(self._ws_connections.items()):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self._ws_connections.clear()
+
+        # Close HTTP client
         if self._client:
             await self._client.aclose()
             self._client = None
 
         self._connected = False
         self._subscriptions.clear()
-        self._last_event_ids.clear()
+        logger.info("pandascore_disconnected")
 
     async def subscribe(self, game: str, match_id: str) -> None:
-        """Subscribe to events for a specific match.
+        """Subscribe to real-time events for a specific match via WebSocket.
+
+        Opens a WebSocket connection to receive events as they happen.
 
         Args:
             game: Game type (must be in SUPPORTED_GAMES)
@@ -188,11 +208,43 @@ class PandaScoreFeed(BaseFeed):
             raise ValueError(f"Unsupported game: {game}. Supported: {self.SUPPORTED_GAMES}")
 
         self._subscriptions.add((game, match_id))
-        self._last_event_ids.setdefault(match_id, set())
 
-        # Start polling if not already running
-        if self._poll_task is None or self._poll_task.done():
-            self._poll_task = asyncio.create_task(self._poll_loop())
+        # Start WebSocket listener if not already running for this match
+        if match_id not in self._ws_tasks or self._ws_tasks[match_id].done():
+            self._ws_tasks[match_id] = asyncio.create_task(
+                self._ws_listen(game, match_id)
+            )
+            logger.info("ws_subscription_started", game=game, match_id=match_id)
+
+    async def unsubscribe(self, match_id: str) -> None:
+        """Unsubscribe from a match and close its WebSocket.
+
+        Args:
+            match_id: Match identifier to unsubscribe from
+        """
+        # Remove from subscriptions
+        self._subscriptions = {
+            (g, m) for g, m in self._subscriptions if m != match_id
+        }
+
+        # Cancel WebSocket task
+        if match_id in self._ws_tasks:
+            self._ws_tasks[match_id].cancel()
+            try:
+                await self._ws_tasks[match_id]
+            except asyncio.CancelledError:
+                pass
+            del self._ws_tasks[match_id]
+
+        # Close WebSocket connection
+        if match_id in self._ws_connections:
+            try:
+                await self._ws_connections[match_id].close()
+            except Exception:
+                pass
+            del self._ws_connections[match_id]
+
+        logger.info("ws_unsubscribed", match_id=match_id)
 
     async def get_live_matches(self, game: str) -> list[dict[str, Any]]:
         """Get currently running matches for a game.
@@ -285,51 +337,150 @@ class PandaScoreFeed(BaseFeed):
         end_time = time.perf_counter()
         return (end_time - start_time) * 1000  # Convert to milliseconds
 
-    async def _poll_loop(self) -> None:
-        """Continuously poll for new events on subscribed matches."""
-        while self._subscriptions and self._connected:
-            for game, match_id in list(self._subscriptions):
-                try:
-                    events = await self._fetch_new_events(game, match_id)
-                    for event in events:
-                        await self._emit(event)
-                except Exception as e:
-                    logger.error("poll_loop_error", game=game, match_id=match_id, error=str(e))
+    async def _ws_listen(self, game: str, match_id: str) -> None:
+        """Listen to WebSocket events for a match.
 
-            await asyncio.sleep(self._poll_interval)
-
-    async def _fetch_new_events(
-        self,
-        game: str,
-        match_id: str,
-    ) -> list[PandaScoreEvent]:
-        """Fetch only new events for a match (not seen before).
+        Connects to the events endpoint for real-time event delivery.
+        Automatically reconnects on connection loss.
 
         Args:
             game: Game type
             match_id: Match identifier
-
-        Returns:
-            List of new PandaScoreEvent objects
         """
-        if not self._client:
-            return []
+        url = f"{self.WS_BASE_URL}/matches/{match_id}/events?token={self._api_key}"
+        reconnect_delay = 1.0
+        max_reconnect_delay = 30.0
 
-        try:
-            response = await self._client.get(f"/{game}/matches/{match_id}/events")
-            response.raise_for_status()
-        except httpx.HTTPError:
-            return []
+        while (game, match_id) in self._subscriptions:
+            try:
+                logger.debug("ws_connecting", match_id=match_id)
 
-        new_events = []
-        seen_ids = self._last_event_ids.get(match_id, set())
+                async with websockets.connect(
+                    url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    self._ws_connections[match_id] = ws
+                    reconnect_delay = 1.0  # Reset on successful connection
 
-        for raw_event in response.json():
-            event_id = raw_event.get("id") or f"{raw_event.get('type')}_{raw_event.get('timestamp')}"
-            if event_id not in seen_ids:
-                seen_ids.add(event_id)
-                event = PandaScoreEvent.from_raw(game, match_id, raw_event)
-                new_events.append(event)
+                    # First message should be "hello"
+                    hello = await ws.recv()
+                    hello_data = json.loads(hello)
+                    if hello_data.get("type") == "hello":
+                        logger.info(
+                            "ws_connected",
+                            match_id=match_id,
+                            game=game,
+                        )
 
-        self._last_event_ids[match_id] = seen_ids
-        return new_events
+                    # Listen for events
+                    async for message in ws:
+                        try:
+                            raw_event = json.loads(message)
+                            event = PandaScoreEvent.from_raw(game, match_id, raw_event)
+                            await self._emit(event)
+
+                            logger.debug(
+                                "ws_event_received",
+                                match_id=match_id,
+                                event_type=event.event_type,
+                            )
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                "ws_invalid_json",
+                                match_id=match_id,
+                                error=str(e),
+                            )
+
+            except ConnectionClosed as e:
+                logger.warning(
+                    "ws_connection_closed",
+                    match_id=match_id,
+                    code=e.code,
+                    reason=e.reason,
+                )
+            except asyncio.CancelledError:
+                logger.debug("ws_cancelled", match_id=match_id)
+                raise
+            except Exception as e:
+                logger.error(
+                    "ws_error",
+                    match_id=match_id,
+                    error=str(e),
+                )
+
+            # Clean up connection reference
+            self._ws_connections.pop(match_id, None)
+
+            # Reconnect with exponential backoff
+            if (game, match_id) in self._subscriptions:
+                logger.info(
+                    "ws_reconnecting",
+                    match_id=match_id,
+                    delay=reconnect_delay,
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+    async def subscribe_frames(self, game: str, match_id: str) -> None:
+        """Subscribe to frame snapshots (every 2 seconds) via WebSocket.
+
+        Frames contain full game state snapshots, useful for tracking
+        scores, gold, objectives, etc.
+
+        Args:
+            game: Game type
+            match_id: Match identifier
+        """
+        if game not in self.SUPPORTED_GAMES:
+            raise ValueError(f"Unsupported game: {game}")
+
+        task_key = f"{match_id}_frames"
+        if task_key not in self._ws_tasks or self._ws_tasks[task_key].done():
+            self._ws_tasks[task_key] = asyncio.create_task(
+                self._ws_listen_frames(game, match_id)
+            )
+            logger.info("ws_frames_subscription_started", game=game, match_id=match_id)
+
+    async def _ws_listen_frames(self, game: str, match_id: str) -> None:
+        """Listen to frame snapshots via WebSocket.
+
+        Args:
+            game: Game type
+            match_id: Match identifier
+        """
+        url = f"{self.WS_BASE_URL}/matches/{match_id}?token={self._api_key}"
+        reconnect_delay = 1.0
+
+        while (game, match_id) in self._subscriptions:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    hello = await ws.recv()
+                    logger.info("ws_frames_connected", match_id=match_id)
+
+                    async for message in ws:
+                        try:
+                            frame = json.loads(message)
+                            # Emit frame as a special event type
+                            event = PandaScoreEvent(
+                                source="pandascore",
+                                event_type="frame",
+                                game=game,
+                                data=frame.get("payload", frame),
+                                timestamp=time.time(),
+                                match_id=match_id,
+                            )
+                            await self._emit(event)
+                        except json.JSONDecodeError:
+                            pass
+
+            except ConnectionClosed:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("ws_frames_error", error=str(e))
+
+            if (game, match_id) in self._subscriptions:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30.0)
