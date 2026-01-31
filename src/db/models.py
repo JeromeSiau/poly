@@ -102,3 +102,175 @@ class Position(Base):
 
     def __repr__(self) -> str:
         return f"<Position(id={self.id}, market_id={self.market_id}, outcome={self.outcome}, size={self.size})>"
+
+
+class CrossMarketEvent(Base):
+    """Cross-market event pairs for arbitrage."""
+
+    __tablename__ = "cross_market_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(Text, nullable=False)
+    category = Column(String(50), nullable=True)  # sports, politics, crypto
+    resolution_date = Column(DateTime, nullable=True)
+
+    # Platform-specific IDs (nullable - not all platforms have all events)
+    polymarket_id = Column(String(255), nullable=True, index=True)
+    azuro_condition_id = Column(String(255), nullable=True, index=True)
+    overtime_game_id = Column(String(255), nullable=True, index=True)
+
+    # Matching metadata
+    match_confidence = Column(Float, nullable=True)
+    match_method = Column(String(50), nullable=True)  # llm, exact, fuzzy
+    verified_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<CrossMarketEvent(id={self.id}, name={self.name[:30]}...)>"
+
+
+class PriceSnapshot(Base):
+    """Price snapshots for arb detection."""
+
+    __tablename__ = "price_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, nullable=False, index=True)
+    platform = Column(String(50), nullable=False)  # polymarket, azuro, overtime
+    outcome = Column(String(100), nullable=False)  # YES, NO, team name
+    price = Column(Float, nullable=False)
+    liquidity = Column(Float, nullable=True)
+    captured_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<PriceSnapshot(platform={self.platform}, price={self.price})>"
+
+
+class CrossMarketOpportunity(Base):
+    """Detected cross-market arbitrage opportunities."""
+
+    __tablename__ = "cross_market_opportunities"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(Integer, nullable=False, index=True)
+
+    # Source (buy side)
+    source_platform = Column(String(50), nullable=False)
+    source_price = Column(Float, nullable=False)
+    source_liquidity = Column(Float, nullable=True)
+
+    # Target (sell side)
+    target_platform = Column(String(50), nullable=False)
+    target_price = Column(Float, nullable=False)
+    target_liquidity = Column(Float, nullable=True)
+
+    # Calculations
+    gross_edge_pct = Column(Float, nullable=False)
+    fees_pct = Column(Float, nullable=True)
+    gas_estimate = Column(Float, nullable=True)
+    net_edge_pct = Column(Float, nullable=False)
+
+    # Status
+    status = Column(String(50), default="detected")  # detected, alerted, approved, executed, expired, skipped
+    detected_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<CrossMarketOpportunity(id={self.id}, edge={self.net_edge_pct:.2%})>"
+
+
+class CrossMarketTrade(Base):
+    """Executed cross-market trades."""
+
+    __tablename__ = "cross_market_trades"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    opportunity_id = Column(Integer, nullable=False, index=True)
+
+    # Source leg execution
+    source_tx_hash = Column(String(255), nullable=True)
+    source_chain = Column(String(50), nullable=True)
+    source_amount = Column(Float, nullable=True)
+    source_price_filled = Column(Float, nullable=True)
+    source_gas_paid = Column(Float, nullable=True)
+    source_status = Column(String(50), nullable=True)  # pending, confirmed, failed
+
+    # Target leg execution
+    target_tx_hash = Column(String(255), nullable=True)
+    target_chain = Column(String(50), nullable=True)
+    target_amount = Column(Float, nullable=True)
+    target_price_filled = Column(Float, nullable=True)
+    target_gas_paid = Column(Float, nullable=True)
+    target_status = Column(String(50), nullable=True)
+
+    # Aggregate
+    execution_time_ms = Column(Integer, nullable=True)
+    realized_edge_pct = Column(Float, nullable=True)
+    realized_pnl = Column(Float, nullable=True)
+
+    executed_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<CrossMarketTrade(id={self.id}, pnl={self.realized_pnl})>"
+
+
+class LiveObservation(Base):
+    """Live observations for paper trading."""
+
+    __tablename__ = "live_observations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    match_id = Column(String(255), nullable=False, index=True)
+    event_type = Column(String(100), nullable=False)
+    game_state = Column(JSON, nullable=False)
+
+    # Model prediction
+    model_prediction = Column(Float, nullable=False)
+
+    # Market prices at different times
+    polymarket_price = Column(Float, nullable=True)
+    polymarket_price_30s = Column(Float, nullable=True)
+    polymarket_price_60s = Column(Float, nullable=True)
+    polymarket_price_120s = Column(Float, nullable=True)
+
+    # Result
+    actual_winner = Column(String(255), nullable=True)
+    latency_ms = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    @property
+    def edge_theoretical(self) -> float:
+        """Calculate theoretical edge."""
+        if self.polymarket_price is None:
+            return 0.0
+        return self.model_prediction - self.polymarket_price
+
+    def __repr__(self) -> str:
+        return f"<LiveObservation(id={self.id}, match={self.match_id}, pred={self.model_prediction:.2f})>"
+
+
+class PaperTrade(Base):
+    """Simulated trades for paper trading."""
+
+    __tablename__ = "paper_trades"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    observation_id = Column(Integer, nullable=False, index=True)
+
+    side = Column(String(10), nullable=False)  # BUY or SELL
+    entry_price = Column(Float, nullable=False)
+    simulated_fill_price = Column(Float, nullable=False)
+    size = Column(Float, nullable=False)
+
+    edge_theoretical = Column(Float, nullable=False)
+    edge_realized = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<PaperTrade(id={self.id}, side={self.side}, size={self.size}, pnl={self.pnl})>"
