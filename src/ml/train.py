@@ -134,7 +134,6 @@ class ImpactModel:
 def train_model(
     data_path: Path,
     output_path: Path,
-    game: str = "lol",
     validation_split: float = 0.2,
 ) -> dict:
     """Train model from CSV data file."""

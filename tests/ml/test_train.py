@@ -102,3 +102,17 @@ class TestImpactModel:
         assert "train_auc" in metrics
         assert "val_auc" in metrics
         assert metrics["val_auc"] > 0.5
+
+    def test_train_model_from_csv(self, sample_data):
+        """train_model loads CSV and trains model."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "data.csv"
+            model_path = Path(tmpdir) / "model.pkl"
+
+            sample_data.to_csv(data_path, index=False)
+
+            metrics = train_model(data_path, model_path)
+
+            assert model_path.exists()
+            assert "train_auc" in metrics
+            assert "val_auc" in metrics
