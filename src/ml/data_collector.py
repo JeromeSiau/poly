@@ -14,7 +14,17 @@ logger = structlog.get_logger()
 
 @dataclass
 class EventData:
-    """Single event with game state snapshot for ML training."""
+    """Single event with game state snapshot for ML training.
+
+    Note on field limitations:
+        - gold_diff: Always 0 because PandaScore events API does not include
+          gold data per event. Gold tracking would require the frames endpoint
+          which provides periodic snapshots. This field is reserved for future
+          implementation.
+        - winner: Not populated by fetch_match_events(). The winner is only
+          known from MatchData, so callers must set event.winner externally
+          after fetching (e.g., event.winner = match.winner).
+    """
 
     event_type: str
     timestamp: float
@@ -22,14 +32,15 @@ class EventData:
     game_time_minutes: float
 
     # Game state at event time
+    # Note: gold_diff is always 0 - see class docstring for explanation
     gold_diff: int
     kill_diff: int
     tower_diff: int
     dragon_diff: int
     baron_diff: int
 
-    # Ground truth label
-    winner: str  # Team that won the game
+    # Ground truth label (must be set externally - see class docstring)
+    winner: str
 
 
 @dataclass
@@ -56,6 +67,7 @@ class HistoricalDataCollector:
 
     async def connect(self) -> None:
         """Create HTTP client."""
+        logger.info("connecting_to_pandascore", base_url=self.BASE_URL)
         self._client = httpx.AsyncClient(
             base_url=self.BASE_URL,
             headers={
@@ -64,12 +76,15 @@ class HistoricalDataCollector:
             },
             timeout=30.0,
         )
+        logger.info("connected_to_pandascore")
 
     async def disconnect(self) -> None:
         """Close HTTP client."""
+        logger.info("disconnecting_from_pandascore")
         if self._client:
             await self._client.aclose()
             self._client = None
+        logger.info("disconnected_from_pandascore")
 
     async def fetch_past_matches(
         self,
@@ -81,6 +96,9 @@ class HistoricalDataCollector:
         if not self._client:
             raise RuntimeError("Not connected. Call connect() first.")
 
+        logger.info(
+            "fetching_past_matches", game=game, limit=limit, page=page
+        )
         response = await self._client.get(
             f"/{game}/matches/past",
             params={
@@ -120,24 +138,38 @@ class HistoricalDataCollector:
                 )
             )
 
+        logger.info("fetched_past_matches", game=game, match_count=len(matches))
         return matches
 
     async def fetch_match_events(
         self,
         game: str,
-        match_id: int,
         game_id: int,
     ) -> list[EventData]:
-        """Fetch events for a specific game within a match."""
+        """Fetch events for a specific game within a match.
+
+        Note: The returned EventData objects will have:
+            - gold_diff: Always 0 (API limitation - see EventData docstring)
+            - winner: Empty string (must be set externally from MatchData)
+
+        Args:
+            game: Game slug (e.g., "lol" for League of Legends)
+            game_id: PandaScore game ID (from MatchData.games)
+
+        Returns:
+            List of EventData with game state snapshots at each event.
+        """
         if not self._client:
             raise RuntimeError("Not connected. Call connect() first.")
 
+        logger.info("fetching_match_events", game=game, game_id=game_id)
         response = await self._client.get(
             f"/{game}/games/{game_id}/events",
         )
         response.raise_for_status()
 
         raw_events = response.json()
+        logger.debug("received_raw_events", game_id=game_id, count=len(raw_events))
 
         events = []
         state = {
@@ -182,6 +214,7 @@ class HistoricalDataCollector:
                 )
             )
 
+        logger.info("fetched_match_events", game_id=game_id, event_count=len(events))
         return events
 
     def _update_state(

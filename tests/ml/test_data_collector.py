@@ -86,7 +86,7 @@ class TestHistoricalDataCollector:
         )
 
         events = await collector.fetch_match_events(
-            game="lol", match_id=12345, game_id=111
+            game="lol", game_id=111
         )
 
         assert len(events) == 2
