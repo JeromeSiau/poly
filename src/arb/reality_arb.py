@@ -90,7 +90,19 @@ class RealityArbEngine:
             market_mapper: Mapper for linking events to markets
         """
         self.polymarket_feed = polymarket_feed
-        self.event_detector = event_detector or EventDetector()
+
+        # Load ML model if configured
+        if event_detector:
+            self.event_detector = event_detector
+        elif settings.ML_USE_MODEL:
+            from pathlib import Path
+            model_path = Path(settings.ML_MODEL_PATH)
+            self.event_detector = EventDetector(
+                model_path=model_path if model_path.exists() else None
+            )
+        else:
+            self.event_detector = EventDetector()
+
         self.market_mapper = market_mapper or MarketMapper()
 
         # Risk parameters (from settings)

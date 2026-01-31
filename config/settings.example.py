@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     MAX_TRADES_PER_HOUR: int = 20
     AUTOPILOT_MODE: bool = False
 
+    # === ML Model ===
+    ML_MODEL_PATH: str = "models/impact_model.pkl"
+    ML_USE_MODEL: bool = True  # Set to False to use static weights
+
     # === Database ===
     DATABASE_URL: str = "sqlite+aiosqlite:///data/arb.db"
 
