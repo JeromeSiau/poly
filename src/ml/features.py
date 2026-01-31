@@ -5,8 +5,6 @@ Converts raw event data into feature vectors for XGBoost.
 Features are team-agnostic to prevent overfitting to team names.
 """
 
-from typing import Optional
-
 import pandas as pd
 
 from src.ml.data_collector import EventData
