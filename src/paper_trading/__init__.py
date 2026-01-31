@@ -1,5 +1,6 @@
 """Paper trading system."""
 
+from .alerts import TelegramAlerter
 from .engine import PaperTradingEngine
 from .execution_sim import ExecutionSimulator
 from .market_observer import MarketObserver, PriceCapture
@@ -15,4 +16,5 @@ __all__ = [
     "TradeRecord",
     "MarketObserver",
     "PriceCapture",
+    "TelegramAlerter",
 ]
