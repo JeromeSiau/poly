@@ -88,3 +88,8 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated data
+data/*.csv
+data/raw/
+reports/
