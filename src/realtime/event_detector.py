@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Any
 
+import structlog
+
 from src.feeds.base import FeedEvent
+
+logger = structlog.get_logger()
 
 
 @dataclass
@@ -96,14 +100,11 @@ class EventDetector:
                 to static weight-based estimation.
         """
         self.model = None
-        self.feature_extractor = None
 
         if model_path and model_path.exists():
             from src.ml.train import ImpactModel
-            from src.ml.features import FeatureExtractor
 
             self.model = ImpactModel.load(model_path)
-            self.feature_extractor = FeatureExtractor(game="lol")
 
     def classify(self, event: FeedEvent) -> SignificantEvent:
         """
@@ -411,9 +412,8 @@ class EventDetector:
                     # ML model predicts win probability directly
                     ml_price = self.model.predict_single(features)
                     return max(0.01, min(0.99, ml_price))
-                except Exception:
-                    # Fall through to static estimation on any ML error
-                    pass
+                except Exception as e:
+                    logger.warning("ml_prediction_failed", error=str(e))
 
         # Fallback: static weight-based estimation
         # Base price movement based on impact score
