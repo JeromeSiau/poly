@@ -12,6 +12,7 @@ Event impact scoring:
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Any
 
 from src.feeds.base import FeedEvent
@@ -45,11 +46,16 @@ class EventDetector:
     LOL_WEIGHTS: dict[str, float] = {
         "kill": 0.15,
         "tower": 0.25,
+        "tower_destroyed": 0.25,
         "dragon": 0.30,
+        "dragon_kill": 0.30,
         "rift_herald": 0.25,
         "baron": 0.85,
+        "baron_kill": 0.85,
         "elder": 0.90,
+        "elder_kill": 0.90,
         "inhibitor": 0.40,
+        "inhibitor_destroyed": 0.40,
         "ace": 0.60,
         "first_blood": 0.20,
         "nexus_turret": 0.70,
@@ -80,9 +86,24 @@ class EventDetector:
         "mega_creeps": 0.85,
     }
 
-    def __init__(self):
-        """Initialize the event detector."""
-        pass
+    def __init__(self, model_path: Optional[Path] = None):
+        """Initialize the event detector.
+
+        Args:
+            model_path: Optional path to a trained ML model. If provided and
+                the file exists, the model will be loaded for price impact
+                estimation. If not provided or file doesn't exist, falls back
+                to static weight-based estimation.
+        """
+        self.model = None
+        self.feature_extractor = None
+
+        if model_path and model_path.exists():
+            from src.ml.train import ImpactModel
+            from src.ml.features import FeatureExtractor
+
+            self.model = ImpactModel.load(model_path)
+            self.feature_extractor = FeatureExtractor(game="lol")
 
     def classify(self, event: FeedEvent) -> SignificantEvent:
         """
@@ -145,7 +166,7 @@ class EventDetector:
         impact_score = min(base_weight * time_multiplier, 1.0)
 
         # Baron and Elder are always high impact regardless of time
-        if event_type in ("baron", "elder"):
+        if event_type in ("baron", "baron_kill", "elder", "elder_kill"):
             impact_score = max(impact_score, self.LOL_WEIGHTS[event_type])
 
         # Determine favored team
@@ -288,6 +309,79 @@ class EventDetector:
             event_description=description
         )
 
+    def _extract_features_from_event(self, event: SignificantEvent) -> Optional[dict]:
+        """
+        Extract ML features from a SignificantEvent.
+
+        Converts event data to the feature format expected by the ML model.
+        Returns None if insufficient data is available for feature extraction.
+
+        Args:
+            event: The classified significant event
+
+        Returns:
+            Feature dictionary for ML model, or None if extraction fails
+        """
+        if event.original_event is None:
+            return None
+
+        data = event.original_event.data
+        event_type = event.original_event.event_type.lower()
+
+        # Check for required game state fields
+        game_time = data.get("game_time_minutes")
+        if game_time is None:
+            return None
+
+        # Extract game state features with defaults
+        gold_diff = data.get("gold_diff", 0)
+        kill_diff = data.get("kill_diff", 0)
+        tower_diff = data.get("tower_diff", 0)
+        dragon_diff = data.get("dragon_diff", 0)
+        baron_diff = data.get("baron_diff", 0)
+
+        # Compute normalized features
+        if game_time > 0:
+            gold_diff_normalized = gold_diff / game_time
+            kill_diff_normalized = kill_diff / game_time
+        else:
+            gold_diff_normalized = 0.0
+            kill_diff_normalized = 0.0
+
+        # Derived features
+        is_ahead = 1 if gold_diff > 0 else 0
+        is_late_game = 1 if game_time > 25 else 0
+
+        # Build feature dict
+        features = {
+            "game_time_minutes": float(game_time),
+            "gold_diff": float(gold_diff),
+            "gold_diff_normalized": float(gold_diff_normalized),
+            "kill_diff": float(kill_diff),
+            "kill_diff_normalized": float(kill_diff_normalized),
+            "tower_diff": float(tower_diff),
+            "dragon_diff": float(dragon_diff),
+            "baron_diff": float(baron_diff),
+            "is_ahead": is_ahead,
+            "is_late_game": is_late_game,
+        }
+
+        # One-hot encode event type (LoL event types)
+        lol_event_types = [
+            "kill",
+            "tower_destroyed",
+            "dragon_kill",
+            "baron_kill",
+            "elder_kill",
+            "inhibitor_destroyed",
+            "ace",
+        ]
+
+        for et in lol_event_types:
+            features[f"event_{et}"] = 1 if event_type == et else 0
+
+        return features
+
     def estimate_price_impact(
         self,
         event: SignificantEvent,
@@ -296,8 +390,8 @@ class EventDetector:
         """
         Estimate how the market price should move based on the event.
 
-        The price movement is proportional to the impact score, with
-        diminishing returns as price approaches extremes (0 or 1).
+        Uses ML model if available and event has sufficient context,
+        otherwise falls back to static weight-based estimation.
 
         Args:
             event: The classified significant event
@@ -309,6 +403,19 @@ class EventDetector:
         if not event.is_significant:
             return current_price
 
+        # Try ML model first if available
+        if self.model is not None:
+            features = self._extract_features_from_event(event)
+            if features is not None:
+                try:
+                    # ML model predicts win probability directly
+                    ml_price = self.model.predict_single(features)
+                    return max(0.01, min(0.99, ml_price))
+                except Exception:
+                    # Fall through to static estimation on any ML error
+                    pass
+
+        # Fallback: static weight-based estimation
         # Base price movement based on impact score
         # Impact score of 0.85 (baron) should move price by ~15%
         # Impact score of 0.55 (late kill) should move price by ~5-8%
