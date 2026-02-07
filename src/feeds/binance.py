@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 
 import structlog
 import websockets
+from websockets import ClientConnection
 
 from .base import BaseFeed, FeedEvent
 
@@ -55,8 +56,8 @@ class BinanceFeed(BaseFeed):
         super().__init__()
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         self._fair_value_window = fair_value_window
-        self._recent_trades: dict[str, list[BinanceTick]] = {}
-        self._ws: Optional[Any] = None
+        self._recent_trades: dict[str, deque[BinanceTick]] = {}
+        self._ws: Optional[ClientConnection] = None
         self._direction_threshold: float = 0.001  # 0.1% move = directional
 
     async def connect(self) -> None:
@@ -79,31 +80,42 @@ class BinanceFeed(BaseFeed):
         if not self._ws:
             raise RuntimeError("Not connected")
 
-        async for message in self._ws:
-            data = json.loads(message)
-            if "data" in data:
-                data = data["data"]
+        try:
+            async for message in self._ws:
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    logger.error("binance_json_decode_error", message=message[:200])
+                    continue
 
-            tick = BinanceTick.from_raw(data)
-            if not tick.symbol:
-                continue
+                if "data" in data:
+                    data = data["data"]
 
-            if tick.symbol not in self._recent_trades:
-                self._recent_trades[tick.symbol] = []
-            trades = self._recent_trades[tick.symbol]
-            trades.append(tick)
-            if len(trades) > self._fair_value_window:
-                trades.pop(0)
+                tick = BinanceTick.from_raw(data)
+                if not tick.symbol:
+                    continue
 
-            event = FeedEvent(
-                source="binance",
-                event_type="trade",
-                game="crypto",
-                data={"symbol": tick.symbol, "price": tick.price, "qty": tick.quantity},
-                timestamp=tick.timestamp,
-                match_id=tick.symbol,
-            )
-            await self._emit(event)
+                if tick.symbol not in self._recent_trades:
+                    self._recent_trades[tick.symbol] = deque(maxlen=self._fair_value_window)
+                self._recent_trades[tick.symbol].append(tick)
+
+                event = FeedEvent(
+                    source="binance",
+                    event_type="trade",
+                    game="crypto",
+                    data={"symbol": tick.symbol, "price": tick.price, "qty": tick.quantity},
+                    timestamp=tick.timestamp,
+                    match_id=tick.symbol,
+                )
+                await self._emit(event)
+        except Exception as exc:
+            logger.error("binance_websocket_error", error=str(exc))
+            self._connected = False
+            raise
+
+    def get_recent_trades(self, symbol: str) -> list[BinanceTick]:
+        """Get recent trades for a symbol."""
+        return list(self._recent_trades.get(symbol, []))
 
     def get_fair_value(self, symbol: str) -> Optional[float]:
         """Calculate VWAP fair value from recent trades."""
