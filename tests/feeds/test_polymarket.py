@@ -73,6 +73,21 @@ class TestPolymarketFeed:
         assert best_bid == 0.64
         assert best_ask == 0.66
 
+    def test_get_best_levels(self):
+        feed = PolymarketFeed()
+        feed._local_orderbook = {
+            "0x123abc": {
+                "YES": {"bids": [(0.64, 100), (0.63, 200)], "asks": [(0.66, 150)]},
+            }
+        }
+
+        best_bid, bid_size, best_ask, ask_size = feed.get_best_levels("0x123abc", "YES")
+
+        assert best_bid == 0.64
+        assert bid_size == 100
+        assert best_ask == 0.66
+        assert ask_size == 150
+
     def test_calculate_implied_probability(self):
         feed = PolymarketFeed()
 

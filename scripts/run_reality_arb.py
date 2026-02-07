@@ -16,7 +16,6 @@ This script:
 
 import asyncio
 import argparse
-import os
 import signal
 import sys
 from pathlib import Path
@@ -39,13 +38,16 @@ structlog.configure(
 logger = structlog.get_logger()
 
 from config.settings import settings
+from src.feeds.base import FeedEvent
 from src.feeds.pandascore import PandaScoreFeed
 from src.feeds.polymarket import PolymarketFeed
-from src.realtime.event_detector import EventDetector, SignificantEvent
+from src.realtime.event_detector import EventDetector
 from src.realtime.market_mapper import MarketMapper, MarketMapping
 from src.arb.reality_arb import RealityArbEngine
+from src.arb.polymarket_executor import PolymarketExecutor
 from src.db.database import init_db_async
 from src.bot.reality_handlers import RealityArbHandler
+from src.risk.manager import UnifiedRiskManager
 
 
 class RealityArbBot:
@@ -66,14 +68,27 @@ class RealityArbBot:
         self.polymarket = PolymarketFeed()
         self.detector = EventDetector()
         self.mapper = MarketMapper()
+        self.risk_manager = UnifiedRiskManager(
+            global_capital=settings.GLOBAL_CAPITAL,
+            reality_allocation_pct=settings.CAPITAL_ALLOCATION_REALITY_PCT,
+            crossmarket_allocation_pct=settings.CAPITAL_ALLOCATION_CROSSMARKET_PCT,
+            max_position_pct=settings.MAX_POSITION_PCT,
+            daily_loss_limit_pct=settings.DAILY_LOSS_LIMIT_PCT,
+        )
         self.engine = RealityArbEngine(
             polymarket_feed=self.polymarket,
             event_detector=self.detector,
-            market_mapper=self.mapper
+            market_mapper=self.mapper,
+            risk_manager=self.risk_manager,
+            autopilot=self.autopilot,
         )
 
         # Telegram handler (optional)
         self.telegram_handler: Optional[RealityArbHandler] = None
+        self._telegram_bot: Optional[Any] = None
+
+        # Latest frame snapshots by match_id
+        self._latest_frames: dict[str, dict[str, Any]] = {}
 
         self._running = False
 
@@ -87,6 +102,13 @@ class RealityArbBot:
         # Connect to feeds
         await self.pandascore.connect()
         await self.polymarket.connect()
+
+        # Sync markets from Polymarket for mapping
+        await self._sync_markets()
+
+        # Initialize executor and Telegram if configured
+        await self._init_executor()
+        await self._init_telegram()
 
         # Register event handler
         self.pandascore.on_event(self._on_game_event)
@@ -113,6 +135,62 @@ class RealityArbBot:
 
         logger.info("bot_stopped")
 
+    async def _sync_markets(self) -> None:
+        """Sync Polymarket markets into the mapper."""
+        try:
+            new_count = self.mapper.sync_from_polymarket(
+                game=self.game,
+                limit=settings.REALITY_SYNC_MARKET_LIMIT,
+                only_active=settings.REALITY_SYNC_ONLY_ACTIVE,
+            )
+            logger.info(
+                "polymarket_sync_complete",
+                game=self.game,
+                new_mappings=new_count,
+            )
+        except Exception as e:
+            logger.error("polymarket_sync_failed", error=str(e))
+
+    async def _init_executor(self) -> None:
+        """Initialize Polymarket executor if credentials are configured."""
+        if not settings.POLYMARKET_PRIVATE_KEY or not settings.POLYMARKET_WALLET_ADDRESS:
+            logger.warning("polymarket_executor_not_configured")
+            return
+
+        try:
+            self.engine.executor = PolymarketExecutor(
+                host=settings.POLYMARKET_CLOB_HTTP,
+                chain_id=settings.POLYMARKET_CHAIN_ID,
+                private_key=settings.POLYMARKET_PRIVATE_KEY,
+                funder=settings.POLYMARKET_WALLET_ADDRESS,
+                api_key=settings.POLYMARKET_API_KEY or None,
+                api_secret=settings.POLYMARKET_API_SECRET or None,
+                api_passphrase=settings.POLYMARKET_API_PASSPHRASE or None,
+            )
+            logger.info("polymarket_executor_initialized")
+        except Exception as e:
+            logger.error("polymarket_executor_init_failed", error=str(e))
+
+    async def _init_telegram(self) -> None:
+        """Initialize Telegram bot if configured."""
+        if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+            logger.warning("telegram_not_configured")
+            return
+
+        try:
+            from telegram import Bot
+
+            self._telegram_bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+            self.telegram_handler = RealityArbHandler(
+                bot=self._telegram_bot,
+                engine=self.engine,
+            )
+            logger.info("telegram_initialized")
+        except ImportError:
+            logger.warning("telegram_package_not_installed")
+        except Exception as e:
+            logger.error("telegram_initialization_failed", error=str(e))
+
     async def _subscribe_live_matches(self) -> None:
         """Find and subscribe to currently live matches."""
         try:
@@ -135,10 +213,25 @@ class RealityArbBot:
                 teams=teams,
                 league=league
             )
+            if not mapping and len(teams) >= 2:
+                mapping = self.mapper.find_market_fuzzy(
+                    game=self.game,
+                    team_a=teams[0],
+                    team_b=teams[1],
+                )
 
             if mapping:
+                self.mapper.link_match(match_id, mapping)
                 await self.pandascore.subscribe(self.game, match_id)
-                await self.polymarket.subscribe_market(mapping.polymarket_id)
+                if settings.REALITY_USE_FRAMES:
+                    await self.pandascore.subscribe_frames(self.game, match_id)
+
+                token_ids = set(mapping.outcome_token_ids.values())
+                if not token_ids:
+                    token_ids = {mapping.polymarket_id}
+
+                for token_id in token_ids:
+                    await self.polymarket.subscribe_market(token_id)
 
                 logger.info("subscribed_to_match",
                            match=match.get("name"),
@@ -162,8 +255,30 @@ class RealityArbBot:
         Args:
             event: Game event from PandaScore feed
         """
+        # Frame events are used to enrich later events
+        if getattr(event, "event_type", "") == "frame":
+            if getattr(event, "match_id", None):
+                self._latest_frames[str(event.match_id)] = event.data
+            return
+
+        event_to_classify = event
+        match_id = getattr(event, "match_id", None)
+        if match_id and str(match_id) in self._latest_frames:
+            merged_data = {
+                **self._latest_frames[str(match_id)],
+                **event.data,
+            }
+            event_to_classify = FeedEvent(
+                source=event.source,
+                event_type=event.event_type,
+                game=event.game,
+                data=merged_data,
+                timestamp=event.timestamp,
+                match_id=str(match_id),
+            )
+
         # Classify event
-        significant = self.detector.classify(event)
+        significant = self.detector.classify(event_to_classify)
 
         if not significant.should_trade:
             return
@@ -173,50 +288,48 @@ class RealityArbBot:
                    impact=significant.impact_score)
 
         # Find market mapping - use match_id from the event if available
-        match_id = getattr(event, 'match_id', None)
         mapping: Optional[MarketMapping] = None
 
         if match_id:
-            # Try to find mapping by looking through all mappings
-            for m in self.mapper.get_all_mappings():
-                if match_id in m.event_identifier:
-                    mapping = m
-                    break
+            mapping = self.mapper.find_by_match_id(str(match_id))
 
         if not mapping:
             logger.debug("no_market_mapping_found", match_id=match_id)
             return
 
         # Evaluate opportunity
-        opportunity = await self.engine.process_event(significant, mapping)
+        result = await self.engine.process_event(significant, mapping)
 
-        if opportunity:
-            size = self.engine.calculate_position_size(
-                self.engine._pending_opportunities.get(mapping.polymarket_id)
-            ) if mapping.polymarket_id in self.engine._pending_opportunities else 0.0
+        if not result:
+            return
 
-            if self.autopilot:
-                # Auto-execute
-                pending_opp = self.engine._pending_opportunities.get(mapping.polymarket_id)
-                if pending_opp:
-                    result = await self.engine.execute(pending_opp, size)
-                    logger.info("auto_executed", result=result)
-            else:
-                # Send Telegram alert
-                if self.telegram_handler and settings.TELEGRAM_CHAT_ID:
-                    pending_opp = self.engine._pending_opportunities.get(mapping.polymarket_id)
+        status = result.get("status")
+        if status in ("RISK_HALTED", "RATE_LIMITED", "SIZE_ZERO"):
+            logger.info("opportunity_skipped", status=status)
+            return
+
+        if not self.autopilot:
+            # Send Telegram alert for manual approval
+            if self.telegram_handler and settings.TELEGRAM_CHAT_ID:
+                if status in ("PENDING_APPROVAL", "CLOSE_PENDING_APPROVAL"):
+                    pending_opp = self.engine._pending_opportunities.get(
+                        mapping.polymarket_id
+                    )
                     if pending_opp:
                         try:
                             chat_id = int(settings.TELEGRAM_CHAT_ID)
+                            size = result.get("size", 0.0)
                             await self.telegram_handler.send_alert(
                                 chat_id=chat_id,
                                 opportunity=pending_opp,
                                 market_title=mapping.event_identifier,
-                                size=size
+                                size=size,
                             )
                         except ValueError:
-                            logger.error("invalid_telegram_chat_id",
-                                       chat_id=settings.TELEGRAM_CHAT_ID)
+                            logger.error(
+                                "invalid_telegram_chat_id",
+                                chat_id=settings.TELEGRAM_CHAT_ID,
+                            )
 
 
 async def main() -> None:

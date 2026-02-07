@@ -218,6 +218,32 @@ class PolymarketFeed(BaseFeed):
 
         return (best_bid, best_ask)
 
+    def get_best_levels(
+        self, market_id: str, outcome: str
+    ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """Get best bid/ask prices and sizes for a market outcome.
+
+        Args:
+            market_id: Polymarket market identifier
+            outcome: "YES" or "NO"
+
+        Returns:
+            Tuple of (best_bid, bid_size, best_ask, ask_size). Values are None if unavailable.
+        """
+        if market_id not in self._local_orderbook:
+            return (None, None, None, None)
+
+        orderbook = self._local_orderbook[market_id].get(outcome, {})
+        bids = orderbook.get("bids", [])
+        asks = orderbook.get("asks", [])
+
+        best_bid = bids[0][0] if bids else None
+        bid_size = bids[0][1] if bids else None
+        best_ask = asks[0][0] if asks else None
+        ask_size = asks[0][1] if asks else None
+
+        return (best_bid, bid_size, best_ask, ask_size)
+
     def calculate_implied_probability(
         self, best_bid: Optional[float], best_ask: Optional[float]
     ) -> Optional[float]:

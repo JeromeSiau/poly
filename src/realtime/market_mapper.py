@@ -28,6 +28,8 @@ class MarketMapping:
     game: str
     event_identifier: str
     team_to_outcome: dict[str, str] = field(default_factory=dict)
+    outcome_token_ids: dict[str, str] = field(default_factory=dict)
+    match_id: Optional[str] = None
 
     def get_outcome_for_team(self, team: str) -> Optional[str]:
         """Get the Polymarket outcome token for a given team.
@@ -46,6 +48,30 @@ class MarketMapping:
         for stored_team, outcome in self.team_to_outcome.items():
             if self._normalize_team_name(stored_team) == normalized:
                 return outcome
+        return None
+
+    def get_token_id_for_outcome(self, outcome: str) -> Optional[str]:
+        """Get the token ID for a specific outcome label.
+
+        Args:
+            outcome: Outcome string (e.g., "YES", "NO", team name)
+
+        Returns:
+            Token ID string if known, otherwise None.
+        """
+        if not outcome:
+            return None
+
+        # Try exact match first
+        token_id = self.outcome_token_ids.get(outcome)
+        if token_id:
+            return token_id
+
+        # Fallback to case-insensitive matching
+        for key, value in self.outcome_token_ids.items():
+            if key.lower() == outcome.lower():
+                return value
+
         return None
 
     @staticmethod
@@ -100,7 +126,8 @@ class MarketMapping:
         cls,
         market_data: dict,
         team_a: str,
-        team_b: str
+        team_b: str,
+        match_id: Optional[str] = None,
     ) -> "MarketMapping":
         """Create a MarketMapping from Polymarket market data.
 
@@ -114,6 +141,7 @@ class MarketMapping:
         """
         polymarket_id = market_data.get("id", "")
         outcomes = market_data.get("outcomes", ["Yes", "No"])
+        token_ids = market_data.get("clobTokenIds", []) or market_data.get("clob_token_ids", [])
 
         # team_a is typically YES (the subject of "Will X beat Y?")
         team_to_outcome = {
@@ -123,13 +151,27 @@ class MarketMapping:
 
         game = cls._detect_game(market_data)
         question = market_data.get("question", "")
-        event_identifier = f"{game}_{team_a}_vs_{team_b}"
+        event_identifier = f"{game}_{team_a}_vs_{team_b}_{question}" if question else f"{game}_{team_a}_vs_{team_b}"
+
+        outcome_token_ids: dict[str, str] = {}
+        try:
+            # Ensure we align outcomes with token IDs if provided
+            if isinstance(token_ids, str):
+                token_ids = json.loads(token_ids)
+        except json.JSONDecodeError:
+            token_ids = []
+
+        if token_ids and len(token_ids) >= len(outcomes):
+            for idx, outcome in enumerate(outcomes):
+                outcome_token_ids[outcome] = token_ids[idx]
 
         return cls(
             polymarket_id=polymarket_id,
             game=game,
             event_identifier=event_identifier,
             team_to_outcome=team_to_outcome,
+            outcome_token_ids=outcome_token_ids,
+            match_id=match_id,
         )
 
 
@@ -143,13 +185,16 @@ class MarketMapper:
         """Initialize an empty MarketMapper."""
         self._mappings: list[MarketMapping] = []
         self._by_polymarket_id: dict[str, MarketMapping] = {}
+        self._by_match_id: dict[str, MarketMapping] = {}
 
     def add_mapping(
         self,
         game: str,
         event_identifier: str,
         polymarket_id: str,
-        outcomes: dict[str, str]
+        outcomes: dict[str, str],
+        outcome_token_ids: Optional[dict[str, str]] = None,
+        match_id: Optional[str] = None,
     ) -> MarketMapping:
         """Add a new mapping to the registry.
 
@@ -167,10 +212,27 @@ class MarketMapper:
             game=game,
             event_identifier=event_identifier,
             team_to_outcome=outcomes,
+            outcome_token_ids=outcome_token_ids or {},
+            match_id=match_id,
         )
         self._mappings.append(mapping)
         self._by_polymarket_id[polymarket_id] = mapping
+        if match_id:
+            self._by_match_id[match_id] = mapping
         return mapping
+
+    def link_match(self, match_id: str, mapping: MarketMapping) -> None:
+        """Associate a live match_id with a mapping.
+
+        Args:
+            match_id: PandaScore match identifier
+            mapping: MarketMapping instance
+        """
+        if not match_id:
+            return
+
+        mapping.match_id = match_id
+        self._by_match_id[match_id] = mapping
 
     def find_market(
         self,
@@ -223,6 +285,17 @@ class MarketMapper:
             The matching MarketMapping or None if not found.
         """
         return self._by_polymarket_id.get(polymarket_id)
+
+    def find_by_match_id(self, match_id: str) -> Optional[MarketMapping]:
+        """Find a mapping by match ID.
+
+        Args:
+            match_id: PandaScore match identifier
+
+        Returns:
+            Matching MarketMapping or None.
+        """
+        return self._by_match_id.get(match_id)
 
     def _normalize_team(self, team: str) -> str:
         """Normalize a team name using shared team_matching utility.
@@ -389,11 +462,21 @@ class MarketMapper:
                     outcomes[1]: outcomes[1],
                 }
 
+            outcome_token_ids: dict[str, str] = {}
+            if clob_ids and len(outcomes) >= 2:
+                # Align outcome tokens with outcome labels
+                for idx, outcome_label in enumerate(outcomes):
+                    if idx < len(clob_ids):
+                        outcome_token_ids[outcome_label] = clob_ids[idx]
+
+            event_identifier = f"{game}_{team_a}_vs_{team_b}_{title}" if title else f"{game}_{team_a}_vs_{team_b}"
+
             mapping = self.add_mapping(
                 game=game,
-                event_identifier=f"{game}_{team_a}_vs_{team_b}",
+                event_identifier=event_identifier,
                 polymarket_id=market_id,
                 outcomes=outcome_mapping,
+                outcome_token_ids=outcome_token_ids,
             )
 
             # Also store the alternate CLOB ID for the second outcome

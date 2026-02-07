@@ -116,6 +116,18 @@ class PandaScoreEvent(FeedEvent):
             # Generic fallback - include all payload data
             data = dict(payload)
 
+        # Best-effort normalization of game time
+        if "game_time_minutes" not in data:
+            raw_time = (
+                payload.get("game_time_minutes")
+                or payload.get("game_time_seconds")
+                or payload.get("game_time")
+            )
+            if isinstance(raw_time, (int, float)):
+                # Heuristic: if value looks like seconds, convert to minutes
+                minutes = raw_time / 60 if raw_time > 100 else raw_time
+                data["game_time_minutes"] = float(minutes)
+
         return data
 
 
@@ -434,6 +446,9 @@ class PandaScoreFeed(BaseFeed):
         """
         if game not in self.SUPPORTED_GAMES:
             raise ValueError(f"Unsupported game: {game}")
+
+        # Ensure subscription tracking so frame loop stays active
+        self._subscriptions.add((game, match_id))
 
         task_key = f"{match_id}_frames"
         if task_key not in self._ws_tasks or self._ws_tasks[task_key].done():

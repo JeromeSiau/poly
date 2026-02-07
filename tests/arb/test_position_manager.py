@@ -54,6 +54,7 @@ class TestPositionManager:
         pm.open_position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.55,
             size=100.0,
             trigger_event="Baron kill",
@@ -82,6 +83,7 @@ class TestPositionManager:
         pm.open_position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.55,
             size=100.0,
             trigger_event="Baron kill",
@@ -112,6 +114,7 @@ class TestPositionManager:
         pm.open_position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.55,
             size=100.0,
             trigger_event="Baron kill",
@@ -141,6 +144,7 @@ class TestPositionManager:
         pm.open_position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.55,
             size=100.0,
             trigger_event="Baron kill",
@@ -169,6 +173,7 @@ class TestPositionManager:
         pm.open_position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.55,
             size=100.0,
             trigger_event="Baron kill",
@@ -192,6 +197,7 @@ class TestPositionManager:
         pm.open_position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.50,
             size=100.0,
             trigger_event="First event",
@@ -217,8 +223,8 @@ class TestPositionManager:
         """Should track multiple positions independently."""
         pm = PositionManager()
 
-        pm.open_position("market_1", "T1", 0.55, 100.0, "Event 1")
-        pm.open_position("market_2", "GenG", 0.60, 150.0, "Event 2")
+        pm.open_position("market_1", "T1", "YES", 0.55, 100.0, "Event 1")
+        pm.open_position("market_2", "GenG", "YES", 0.60, 150.0, "Event 2")
 
         assert len(pm.get_all_positions()) == 2
         assert pm.get_total_exposure() == 250.0
@@ -237,6 +243,7 @@ class TestPosition:
         position = Position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.50,
             size=100.0,
             opened_at=0.0,
@@ -254,6 +261,7 @@ class TestPosition:
         position = Position(
             market_id="market_123",
             team="T1",
+            outcome="YES",
             entry_price=0.60,
             size=120.0,
             opened_at=0.0,

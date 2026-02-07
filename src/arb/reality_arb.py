@@ -10,15 +10,18 @@ This is the main trading logic that:
 6. Executes trade if in autopilot mode, or alerts for manual approval
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import Any, Optional
+import time
 
 import structlog
 
 from src.realtime.event_detector import EventDetector, SignificantEvent
 from src.realtime.market_mapper import MarketMapper, MarketMapping
 from src.arb.position_manager import PositionManager, PositionAction, PositionDecision
+from src.risk.manager import UnifiedRiskManager
 from config.settings import settings
 
 logger = structlog.get_logger()
@@ -36,6 +39,12 @@ class ArbOpportunity:
     edge_pct: float
     trigger_event: str
     timestamp: float
+    token_id: Optional[str] = None
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_size: Optional[float] = None
+    ask_size: Optional[float] = None
+    available_liquidity: Optional[float] = None
 
     @property
     def is_valid(self) -> bool:
@@ -49,17 +58,20 @@ class ArbOpportunity:
         min_edge = settings.MIN_EDGE_PCT
         max_edge = settings.ANOMALY_THRESHOLD_PCT
 
+        age_seconds = time.time() - self.timestamp
+
         return (
             self.edge_pct >= min_edge
             and self.edge_pct < max_edge
-            and self.current_price > 0
-            and self.current_price < 1
+            and 0 < self.current_price < 1
+            and age_seconds <= settings.MAX_BROADCAST_LAG_SECONDS
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert opportunity to dictionary for serialization."""
         return {
             "market_id": self.market_id,
+            "token_id": self.token_id,
             "side": self.side,
             "outcome": self.outcome,
             "current_price": self.current_price,
@@ -68,6 +80,11 @@ class ArbOpportunity:
             "trigger_event": self.trigger_event,
             "timestamp": self.timestamp,
             "is_valid": self.is_valid,
+            "best_bid": self.best_bid,
+            "best_ask": self.best_ask,
+            "bid_size": self.bid_size,
+            "ask_size": self.ask_size,
+            "available_liquidity": self.available_liquidity,
         }
 
 
@@ -84,6 +101,8 @@ class RealityArbEngine:
         event_detector: Optional[EventDetector] = None,
         market_mapper: Optional[MarketMapper] = None,
         position_manager: Optional[PositionManager] = None,
+        risk_manager: Optional[UnifiedRiskManager] = None,
+        autopilot: Optional[bool] = None,
     ):
         """Initialize the Reality Arbitrage Engine.
 
@@ -110,10 +129,18 @@ class RealityArbEngine:
         self.market_mapper = market_mapper or MarketMapper()
 
         # Risk parameters (from settings)
-        self.capital: float = 10000.0
+        self.risk_manager = risk_manager
+        self.capital: float = (
+            self.risk_manager.get_available_capital("reality")
+            if self.risk_manager
+            else settings.GLOBAL_CAPITAL * (settings.CAPITAL_ALLOCATION_REALITY_PCT / 100.0)
+        )
         self.max_position_pct: float = settings.MAX_POSITION_PCT
         self.min_edge_pct: float = settings.MIN_EDGE_PCT
         self.anomaly_threshold: float = settings.ANOMALY_THRESHOLD_PCT
+        self.fee_bps: int = settings.POLYMARKET_FEE_BPS
+        self.autopilot: bool = settings.AUTOPILOT_MODE if autopilot is None else autopilot
+        self.max_trades_per_hour: int = settings.MAX_TRADES_PER_HOUR
 
         # Position manager for tracking open positions and handling reversals
         self.position_manager = position_manager or PositionManager(
@@ -125,6 +152,7 @@ class RealityArbEngine:
 
         # Pending opportunities
         self._pending_opportunities: dict[str, ArbOpportunity] = {}
+        self._trade_timestamps: deque[float] = deque()
 
     def evaluate_opportunity(
         self,
@@ -153,42 +181,60 @@ class RealityArbEngine:
             )
             return None
 
-        # Get current market prices
+        # Resolve token ID for the outcome (fallback to mapping.polymarket_id)
+        token_id = mapping.get_token_id_for_outcome(outcome) or mapping.polymarket_id
+
+        # Get current market prices (best bid/ask + sizes)
+        best_bid = best_ask = bid_size = ask_size = None
         if self.polymarket_feed:
-            best_bid, best_ask = self.polymarket_feed.get_best_prices(
-                mapping.polymarket_id, outcome
-            )
+            best_levels = None
+            get_best_levels = getattr(self.polymarket_feed, "get_best_levels", None)
+            if callable(get_best_levels):
+                try:
+                    best_levels = get_best_levels(token_id, outcome)
+                except Exception:
+                    best_levels = None
+
+            if isinstance(best_levels, tuple) and len(best_levels) == 4:
+                best_bid, bid_size, best_ask, ask_size = best_levels
+            else:
+                best_bid, best_ask = self.polymarket_feed.get_best_prices(
+                    token_id, outcome
+                )
         else:
             best_bid, best_ask = None, None
 
         if best_bid is None or best_ask is None:
             logger.warning(
                 "no_prices_available",
-                market_id=mapping.polymarket_id,
+                market_id=token_id,
                 outcome=outcome,
             )
             return None
 
-        # Current price is the midpoint
-        current_price = (best_bid + best_ask) / 2
+        # Mid price for fair value estimation
+        mid_price = (best_bid + best_ask) / 2
+
+        # Entry price (long-only): pay the ask
+        entry_price = best_ask
 
         # Estimate fair price based on event impact
         # Use the event detector's price impact estimation
         estimated_fair_price = self.event_detector.estimate_price_impact(
-            event, current_price
+            event, mid_price
         )
 
-        # Calculate edge
-        edge_pct = estimated_fair_price - current_price
+        # Calculate edge (long-only)
+        edge_pct = estimated_fair_price - entry_price
 
-        # Determine side based on edge direction
-        if edge_pct > 0:
-            side = "BUY"
-        elif edge_pct < 0:
-            side = "SELL"
-            edge_pct = abs(edge_pct)
-        else:
+        # Apply fee estimate (in bps)
+        if self.fee_bps > 0:
+            edge_pct -= self.fee_bps / 10000.0
+
+        if edge_pct <= 0:
             return None
+
+        side = "BUY"
 
         # Check if edge meets minimum threshold
         if edge_pct < self.min_edge_pct:
@@ -199,16 +245,32 @@ class RealityArbEngine:
             )
             return None
 
+        # Check for anomaly (likely stale data or mapping issue)
+        if edge_pct >= self.anomaly_threshold:
+            logger.warning(
+                "anomaly_detected",
+                edge_pct=edge_pct,
+                threshold=self.anomaly_threshold,
+                market_id=token_id,
+            )
+            return None
+
         # Create opportunity
         opportunity = ArbOpportunity(
             market_id=mapping.polymarket_id,
+            token_id=token_id,
             side=side,
             outcome=outcome,
-            current_price=current_price,
+            current_price=entry_price,
             estimated_fair_price=estimated_fair_price,
             edge_pct=edge_pct,
             trigger_event=event.event_description,
             timestamp=datetime.now(UTC).timestamp(),
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            available_liquidity=(ask_size * entry_price) if ask_size else None,
         )
 
         # Store in pending opportunities
@@ -217,6 +279,7 @@ class RealityArbEngine:
         logger.info(
             "opportunity_detected",
             market_id=opportunity.market_id,
+            token_id=opportunity.token_id,
             side=opportunity.side,
             outcome=opportunity.outcome,
             edge_pct=opportunity.edge_pct,
@@ -242,6 +305,15 @@ class RealityArbEngine:
         Returns:
             Position size in dollars (capped by max_position_pct)
         """
+        # Use UnifiedRiskManager if available
+        if self.risk_manager:
+            available_liquidity = opportunity.available_liquidity or self.capital
+            return self.risk_manager.calculate_position_size(
+                strategy="reality",
+                available_liquidity=available_liquidity,
+                edge_pct=opportunity.edge_pct,
+            )
+
         # Max position based on capital and risk limit
         max_position = self.capital * self.max_position_pct
 
@@ -279,6 +351,47 @@ class RealityArbEngine:
 
         return position
 
+    def _event_age_seconds(self, event: SignificantEvent) -> Optional[float]:
+        """Compute event age in seconds if possible."""
+        if event.original_event and hasattr(event.original_event, "timestamp"):
+            return max(0.0, time.time() - float(event.original_event.timestamp))
+        return None
+
+    def _within_latency_window(self, event: SignificantEvent) -> bool:
+        """Check if event age is within configured lag window."""
+        age_seconds = self._event_age_seconds(event)
+        if age_seconds is None:
+            return True
+
+        if age_seconds < settings.MIN_BROADCAST_LAG_SECONDS:
+            logger.debug(
+                "event_too_fresh",
+                age_seconds=age_seconds,
+                min_lag=settings.MIN_BROADCAST_LAG_SECONDS,
+            )
+            return False
+
+        if age_seconds > settings.MAX_BROADCAST_LAG_SECONDS:
+            logger.debug(
+                "event_too_stale",
+                age_seconds=age_seconds,
+                max_lag=settings.MAX_BROADCAST_LAG_SECONDS,
+            )
+            return False
+
+        return True
+
+    def _prune_trade_timestamps(self) -> None:
+        """Remove trade timestamps older than 1 hour."""
+        cutoff = time.time() - 3600
+        while self._trade_timestamps and self._trade_timestamps[0] < cutoff:
+            self._trade_timestamps.popleft()
+
+    def _within_trade_limit(self) -> bool:
+        """Check if we are within the max trades per hour limit."""
+        self._prune_trade_timestamps()
+        return len(self._trade_timestamps) < self.max_trades_per_hour
+
     async def execute(
         self,
         opportunity: ArbOpportunity,
@@ -305,9 +418,12 @@ class RealityArbEngine:
                 "message": "Opportunity is no longer valid",
             }
 
+        token_id = opportunity.token_id or opportunity.market_id
+
         logger.info(
             "executing_trade",
             market_id=opportunity.market_id,
+            token_id=token_id,
             side=opportunity.side,
             outcome=opportunity.outcome,
             size=size,
@@ -316,7 +432,7 @@ class RealityArbEngine:
 
         try:
             result = await self.executor.place_order(
-                market_id=opportunity.market_id,
+                token_id=token_id,
                 side=opportunity.side,
                 outcome=opportunity.outcome,
                 size=size,
@@ -364,15 +480,42 @@ class RealityArbEngine:
         Returns:
             Trade result if executed, opportunity dict if pending, None if no opportunity
         """
+        # Risk halt check
+        if self.risk_manager and self.risk_manager.is_halted:
+            logger.warning("risk_halt_active")
+            return {"status": "RISK_HALTED"}
+
+        # Skip events outside latency window
+        if not self._within_latency_window(event):
+            return None
+
         # ALWAYS update existing position prices for P&L tracking
         # This must happen regardless of whether there's an opportunity
         existing = self.position_manager.get_position(mapping.polymarket_id)
         if existing and self.polymarket_feed:
-            outcome = mapping.get_outcome_for_team(existing.team)
+            outcome = existing.outcome or mapping.get_outcome_for_team(existing.team)
+            token_id = existing.outcome_token_id
+            if not token_id and outcome:
+                token_id = mapping.get_token_id_for_outcome(outcome)
+            token_id = token_id or mapping.polymarket_id
+
             if outcome:
-                best_bid, best_ask = self.polymarket_feed.get_best_prices(
-                    mapping.polymarket_id, outcome
-                )
+                best_bid = best_ask = None
+                best_levels = None
+                get_best_levels = getattr(self.polymarket_feed, "get_best_levels", None)
+                if callable(get_best_levels):
+                    try:
+                        best_levels = get_best_levels(token_id, outcome)
+                    except Exception:
+                        best_levels = None
+
+                if isinstance(best_levels, tuple) and len(best_levels) == 4:
+                    best_bid, _, best_ask, _ = best_levels
+                else:
+                    best_bid, best_ask = self.polymarket_feed.get_best_prices(
+                        token_id, outcome
+                    )
+
                 if best_bid and best_ask:
                     existing.update_price((best_bid + best_ask) / 2)
 
@@ -383,12 +526,27 @@ class RealityArbEngine:
 
         size = self.calculate_position_size(opportunity)
 
+        # Rate limit only in autopilot mode
+        if self.autopilot and not self._within_trade_limit():
+            logger.warning(
+                "rate_limit_hit",
+                max_trades_per_hour=self.max_trades_per_hour,
+            )
+            return {
+                **opportunity.to_dict(),
+                "status": "RATE_LIMITED",
+            }
+
         # Consult position manager for what action to take
         decision = self.position_manager.evaluate(
             market_id=opportunity.market_id,
             favored_team=event.favored_team,
             fair_price=opportunity.estimated_fair_price,
-            current_market_price=opportunity.current_price,
+            current_market_price=(
+                (opportunity.best_bid + opportunity.best_ask) / 2
+                if opportunity.best_bid is not None and opportunity.best_ask is not None
+                else opportunity.current_price
+            ),
             edge_pct=opportunity.edge_pct,
             min_edge=self.min_edge_pct,
             suggested_size=size,
@@ -419,11 +577,37 @@ class RealityArbEngine:
 
         if decision.action == PositionAction.CLOSE:
             # Need to close position (reversal detected)
-            if settings.AUTOPILOT_MODE and self.executor:
+            if self.autopilot and self.executor:
+                exit_price = opportunity.current_price
+                if decision.existing_position and self.polymarket_feed:
+                    close_outcome = decision.existing_position.outcome
+                    close_token_id = decision.existing_position.outcome_token_id
+                    if not close_token_id and close_outcome:
+                        close_token_id = mapping.get_token_id_for_outcome(close_outcome)
+                    close_token_id = close_token_id or mapping.polymarket_id
+
+                    best_levels = None
+                    get_best_levels = getattr(self.polymarket_feed, "get_best_levels", None)
+                    if callable(get_best_levels):
+                        try:
+                            best_levels = get_best_levels(close_token_id, close_outcome)
+                        except Exception:
+                            best_levels = None
+
+                    if isinstance(best_levels, tuple) and len(best_levels) == 4:
+                        best_bid = best_levels[0]
+                    else:
+                        best_bid, _ = self.polymarket_feed.get_best_prices(
+                            close_token_id, close_outcome
+                        )
+
+                    if best_bid:
+                        exit_price = best_bid
+
                 # Execute SELL order
                 close_result = await self._execute_close(
                     decision.existing_position,
-                    opportunity.current_price,
+                    exit_price,
                     decision.reason,
                 )
                 return {
@@ -454,16 +638,18 @@ class RealityArbEngine:
                 }
 
             # Check if autopilot mode is enabled
-            if settings.AUTOPILOT_MODE and self.executor:
+            if self.autopilot and self.executor:
                 # CRITICAL: Record position BEFORE execution to prevent loss tracking
                 # on crash. If execution fails, we roll back the position.
                 if decision.action == PositionAction.OPEN:
                     self.position_manager.open_position(
                         market_id=opportunity.market_id,
                         team=event.favored_team,
+                        outcome=opportunity.outcome,
                         entry_price=opportunity.current_price,
                         size=trade_size,
                         trigger_event=opportunity.trigger_event,
+                        outcome_token_id=opportunity.token_id,
                     )
                 elif decision.action == PositionAction.ADD:
                     self.position_manager.add_to_position(
@@ -495,6 +681,8 @@ class RealityArbEngine:
                             market_id=opportunity.market_id,
                             message="ADD position rollback not implemented",
                         )
+                else:
+                    self._trade_timestamps.append(time.time())
 
                 return {
                     **opportunity.to_dict(),
@@ -533,10 +721,11 @@ class RealityArbEngine:
             return {"status": "NO_EXECUTOR"}
 
         try:
+            token_id = position.outcome_token_id or position.market_id
             result = await self.executor.place_order(
-                market_id=position.market_id,
+                token_id=token_id,
                 side="SELL",
-                outcome=position.team,
+                outcome=position.outcome,
                 size=position.size,
                 price=exit_price,
             )
@@ -553,6 +742,12 @@ class RealityArbEngine:
                 market_id=position.market_id,
                 realized_pnl=closed.get("realized_pnl") if closed else None,
             )
+
+            if closed and self.risk_manager:
+                self.risk_manager.record_pnl(
+                    closed.get("realized_pnl", 0.0),
+                    strategy="reality",
+                )
 
             return {
                 **result,
@@ -622,6 +817,12 @@ class RealityArbEngine:
             winner=winner,
             realized_pnl=closed.get("realized_pnl") if closed else None,
         )
+
+        if closed and self.risk_manager:
+            self.risk_manager.record_pnl(
+                closed.get("realized_pnl", 0.0),
+                strategy="reality",
+            )
 
         return closed
 

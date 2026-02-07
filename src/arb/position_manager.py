@@ -35,12 +35,14 @@ class Position:
 
     market_id: str
     team: str               # Team we're betting ON (the one we bought)
+    outcome: str            # Outcome label used for execution (YES/NO or team)
     entry_price: float      # Price we paid (0-1)
     size: float             # Position size in dollars
     opened_at: float        # Timestamp when opened
     trigger_event: str      # What event triggered the position
 
     # Running P&L tracking
+    outcome_token_id: Optional[str] = None  # Token ID for execution
     current_price: float = 0.0
     unrealized_pnl: float = 0.0
 
@@ -64,6 +66,8 @@ class Position:
         return {
             "market_id": self.market_id,
             "team": self.team,
+            "outcome": self.outcome,
+            "outcome_token_id": self.outcome_token_id,
             "entry_price": self.entry_price,
             "current_price": self.current_price,
             "size": self.size,
@@ -262,9 +266,11 @@ class PositionManager:
         self,
         market_id: str,
         team: str,
+        outcome: str,
         entry_price: float,
         size: float,
         trigger_event: str,
+        outcome_token_id: Optional[str] = None,
     ) -> Position:
         """Open a new position.
 
@@ -281,6 +287,8 @@ class PositionManager:
         position = Position(
             market_id=market_id,
             team=team,
+            outcome=outcome,
+            outcome_token_id=outcome_token_id,
             entry_price=entry_price,
             size=size,
             opened_at=datetime.now(UTC).timestamp(),
@@ -342,6 +350,68 @@ class PositionManager:
             entry_price=position.entry_price,
             exit_price=exit_price,
             realized_pnl=realized_pnl,
+            reason=reason,
+        )
+
+        return closed_record
+
+    def close_position_partial(
+        self,
+        market_id: str,
+        exit_price: float,
+        size_to_close: float,
+        reason: str = "partial_close",
+    ) -> Optional[dict]:
+        """Close part of an existing position.
+
+        Args:
+            market_id: Market to partially close
+            exit_price: Price we're selling at
+            size_to_close: Dollar amount to close
+            reason: Why we're closing
+
+        Returns:
+            Closed position details for the partial close, or None if no position
+        """
+        position = self._positions.get(market_id)
+
+        if position is None:
+            return None
+
+        if size_to_close <= 0:
+            return None
+
+        if size_to_close >= position.size:
+            return self.close_position(market_id, exit_price, reason=reason)
+
+        # Calculate realized P&L for the closed portion
+        shares_to_close = size_to_close / position.entry_price
+        realized_pnl = shares_to_close * (exit_price - position.entry_price)
+
+        # Reduce position size
+        position.size -= size_to_close
+        position.update_price(exit_price)
+
+        closed_record = {
+            **position.to_dict(),
+            "exit_price": exit_price,
+            "realized_pnl": realized_pnl,
+            "closed_at": datetime.now(UTC).timestamp(),
+            "close_reason": reason,
+            "closed_size": size_to_close,
+        }
+
+        self._closed_positions.append(closed_record)
+
+        logger.info(
+            "position_partially_closed",
+            market_id=market_id,
+            team=position.team,
+            entry_price=position.entry_price,
+            exit_price=exit_price,
+            realized_pnl=realized_pnl,
+            closed_size=size_to_close,
+            remaining_size=position.size,
             reason=reason,
         )
 
