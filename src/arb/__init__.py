@@ -2,12 +2,23 @@
 """Arbitrage Engines - Core trading logic."""
 
 from .reality_arb import RealityArbEngine, ArbOpportunity
+from .polymarket_executor import PolymarketExecutor
 from .cross_market_arb import CrossMarketArbEngine, CrossMarketOpportunity, EvaluationResult
+from .crypto_arb import CryptoArbEngine, CryptoArbOpportunity
+from .no_bet_scanner import NoBetScanner, NoBetOpportunity
+from .dependency_detector import DependencyDetector, MarketDependency
 
 __all__ = [
     "RealityArbEngine",
     "ArbOpportunity",
+    "PolymarketExecutor",
     "CrossMarketArbEngine",
     "CrossMarketOpportunity",
     "EvaluationResult",
+    "CryptoArbEngine",
+    "CryptoArbOpportunity",
+    "NoBetScanner",
+    "NoBetOpportunity",
+    "DependencyDetector",
+    "MarketDependency",
 ]

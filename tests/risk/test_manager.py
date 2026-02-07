@@ -68,3 +68,32 @@ def test_reset_daily_stats(risk_manager):
     risk_manager.reset_daily_stats()
     assert risk_manager.daily_pnl == 0.0
     assert risk_manager.check_daily_loss_limit() is True
+
+
+def test_crypto_allocation():
+    mgr = UnifiedRiskManager(
+        global_capital=10000,
+        reality_allocation_pct=30,
+        crossmarket_allocation_pct=30,
+        crypto_allocation_pct=20,
+        nobet_allocation_pct=20,
+        max_position_pct=0.10,
+        daily_loss_limit_pct=0.05,
+    )
+    assert mgr.get_available_capital("crypto") == 2000.0
+    assert mgr.get_available_capital("nobet") == 2000.0
+
+
+def test_record_pnl_crypto():
+    mgr = UnifiedRiskManager(
+        global_capital=10000,
+        reality_allocation_pct=25,
+        crossmarket_allocation_pct=25,
+        crypto_allocation_pct=25,
+        nobet_allocation_pct=25,
+        max_position_pct=0.10,
+        daily_loss_limit_pct=0.05,
+    )
+    mgr.record_pnl(100.0, "crypto")
+    assert mgr.get_strategy_pnl("crypto") == 100.0
+    assert mgr.daily_pnl == 100.0

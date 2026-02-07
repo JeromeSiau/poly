@@ -1,7 +1,7 @@
-"""Unified Risk Manager for cross-market arbitrage strategies.
+"""Unified Risk Manager for all arbitrage strategies.
 
-This module provides a shared risk management layer between the Reality Arb
-and Cross-Market Arb strategies. It enforces:
+This module provides a shared risk management layer across all strategies
+(Reality Arb, Cross-Market Arb, Crypto Arb, NO Bet). It enforces:
 - Global capital limits and per-strategy allocation
 - Position sizing using fractional Kelly criterion
 - Daily loss limit tracking and trading halts
@@ -13,7 +13,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-StrategyType = Literal["reality", "crossmarket"]
+StrategyType = Literal["reality", "crossmarket", "crypto", "nobet"]
 
 
 class UnifiedRiskManager:
@@ -30,6 +30,8 @@ class UnifiedRiskManager:
         crossmarket_allocation_pct: float,
         max_position_pct: float,
         daily_loss_limit_pct: float,
+        crypto_allocation_pct: float = 0.0,
+        nobet_allocation_pct: float = 0.0,
     ) -> None:
         """Initialize the Unified Risk Manager.
 
@@ -39,10 +41,14 @@ class UnifiedRiskManager:
             crossmarket_allocation_pct: Percentage of capital allocated to Cross-Market Arb (0-100)
             max_position_pct: Maximum position size as a fraction of allocated capital (0-1)
             daily_loss_limit_pct: Daily loss limit as a fraction of global capital (0-1)
+            crypto_allocation_pct: Percentage of capital allocated to Crypto Arb (0-100)
+            nobet_allocation_pct: Percentage of capital allocated to NO Bet strategy (0-100)
         """
         self._global_capital = global_capital
         self._reality_allocation_pct = reality_allocation_pct
         self._crossmarket_allocation_pct = crossmarket_allocation_pct
+        self._crypto_allocation_pct = crypto_allocation_pct
+        self._nobet_allocation_pct = nobet_allocation_pct
         self._max_position_pct = max_position_pct
         self._daily_loss_limit_pct = daily_loss_limit_pct
 
@@ -51,6 +57,8 @@ class UnifiedRiskManager:
         self._daily_pnl_by_strategy: dict[str, float] = {
             "reality": 0.0,
             "crossmarket": 0.0,
+            "crypto": 0.0,
+            "nobet": 0.0,
         }
 
         # Trading halt flag
@@ -88,6 +96,10 @@ class UnifiedRiskManager:
             allocation_pct = self._reality_allocation_pct
         elif strategy == "crossmarket":
             allocation_pct = self._crossmarket_allocation_pct
+        elif strategy == "crypto":
+            allocation_pct = self._crypto_allocation_pct
+        elif strategy == "nobet":
+            allocation_pct = self._nobet_allocation_pct
         else:
             logger.warning("unknown_strategy", strategy=strategy)
             return 0.0
@@ -247,6 +259,8 @@ class UnifiedRiskManager:
         self._daily_pnl_by_strategy = {
             "reality": 0.0,
             "crossmarket": 0.0,
+            "crypto": 0.0,
+            "nobet": 0.0,
         }
         self._is_halted = False
 
@@ -282,4 +296,6 @@ class UnifiedRiskManager:
             "strategy_pnl": self._daily_pnl_by_strategy.copy(),
             "reality_capital": self.get_available_capital("reality"),
             "crossmarket_capital": self.get_available_capital("crossmarket"),
+            "crypto_capital": self.get_available_capital("crypto"),
+            "nobet_capital": self.get_available_capital("nobet"),
         }
