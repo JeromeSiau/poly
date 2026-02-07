@@ -1,0 +1,93 @@
+{
+  "game": "lol",
+  "match_id": "synthetic_match_001",
+  "teams": ["T1", "Gen.G"],
+  "winner": "T1",
+  "market": {
+    "market_id": "synthetic_lol_001",
+    "initial_price": 0.5,
+    "spread": 0.02,
+    "lag": 0.3,
+    "fill_mode": "partial",
+    "min_fill_usd": 25,
+    "bid_size": 500,
+    "ask_size": 500
+  },
+  "risk": {
+    "capital": 10000,
+    "min_edge_pct": 0.02,
+    "max_position_pct": 0.1
+  },
+  "events": [
+    {
+      "event_type": "kill",
+      "team": "T1",
+      "game_time_minutes": 6,
+      "gold_diff": 500,
+      "kill_diff": 1,
+      "true_prob": 0.54
+    },
+    {
+      "event_type": "dragon_kill",
+      "team": "T1",
+      "game_time_minutes": 12,
+      "gold_diff": 1400,
+      "kill_diff": 2,
+      "dragon_diff": 1,
+      "true_prob": 0.6
+    },
+    {
+      "event_type": "tower_destroyed",
+      "team": "T1",
+      "game_time_minutes": 14,
+      "gold_diff": 2200,
+      "kill_diff": 3,
+      "tower_diff": 1,
+      "true_prob": 0.63
+    },
+    {
+      "event_type": "baron_kill",
+      "team": "T1",
+      "game_time_minutes": 24,
+      "gold_diff": 4500,
+      "kill_diff": 5,
+      "baron_diff": 1,
+      "true_prob": 0.75
+    },
+    {
+      "event_type": "kill",
+      "team": "Gen.G",
+      "game_time_minutes": 27,
+      "gold_diff": 3000,
+      "kill_diff": 4,
+      "true_prob": 0.7
+    },
+    {
+      "event_type": "dragon_kill",
+      "team": "T1",
+      "game_time_minutes": 29,
+      "gold_diff": 3800,
+      "kill_diff": 5,
+      "dragon_diff": 2,
+      "true_prob": 0.78
+    },
+    {
+      "event_type": "elder_kill",
+      "team": "T1",
+      "game_time_minutes": 33,
+      "gold_diff": 6000,
+      "kill_diff": 7,
+      "dragon_diff": 3,
+      "true_prob": 0.88
+    },
+    {
+      "event_type": "tower_destroyed",
+      "team": "T1",
+      "game_time_minutes": 35,
+      "gold_diff": 7000,
+      "kill_diff": 8,
+      "tower_diff": 3,
+      "true_prob": 0.92
+    }
+  ]
+}

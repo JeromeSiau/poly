@@ -1,0 +1,23 @@
+https://x.com/mindsharexbt/status/2019121617410891970
+
+ce trader a dev un bot qui produit une thèse sur les meilleurs événements Polymarket grâce à perplexity et fait +$10k/mois
+
+le bot fonctionne de cette manière : 
+
+il scan tous les marchés Polymarket actifs
+
+analyse et récupère ceux qui sont le plus intéressants/qui ont le + haut potentiel d'alpha
+
+il transfère ces marchés à perplexity pour une recherche profonde sur le sujet en question 
+
+ça permet de ne pas perdre son temps à chercher les événements vraiment intéressants, le bot renvoie une liste de marchés avec une recherche sur le sujet qui permet de mieux évaluer l'intérêt d'un marché
+
+des features peuvent être ajoutées pour permettre de directement exécuter les trades (même monitor avec un scoring)
+
+plus besoin de scroller sur twitter et de faire de longues recherches manuelles qui ne mènent pas aux bonnes informations
+
+totalement faisable en vibe coding selon la profondeur de vos features
+
+20€ claude code + 20€ perplexity = 40€/mois
+
+c'est aujourd'hui accessible à tout le monde de dev un tool qui vous facilite la vie et permet d'exercer un edge sur le marché

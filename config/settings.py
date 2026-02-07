@@ -7,8 +7,13 @@ class Settings(BaseSettings):
     # === Polymarket ===
     POLYMARKET_API_KEY: str = ""
     POLYMARKET_API_SECRET: str = ""
+    POLYMARKET_API_PASSPHRASE: str = ""
     POLYMARKET_WALLET_ADDRESS: str = ""
     POLYMARKET_PRIVATE_KEY: str = ""
+    POLYMARKET_CHAIN_ID: int = 137
+    POLYMARKET_FEE_BPS: int = 0
+    POLYMARKET_ORDER_TYPE: str = "FOK"
+    POLYMARKET_POST_ONLY: bool = False
 
     # WebSocket endpoints
     POLYMARKET_CLOB_HTTP: str = "https://clob.polymarket.com"
@@ -34,6 +39,9 @@ class Settings(BaseSettings):
     ANOMALY_THRESHOLD_PCT: float = 0.15  # 15% edge = suspicious
     MIN_BROADCAST_LAG_SECONDS: float = 5.0  # Min lag to trade
     MAX_BROADCAST_LAG_SECONDS: float = 60.0  # Max lag (stale data?)
+    REALITY_SYNC_MARKET_LIMIT: int = 200
+    REALITY_SYNC_ONLY_ACTIVE: bool = True
+    REALITY_USE_FRAMES: bool = True
 
     # === Execution ===
     ORDER_TIMEOUT_SECONDS: float = 5.0
@@ -75,6 +83,36 @@ class Settings(BaseSettings):
     GLOBAL_CAPITAL: float = 10000.0
     CAPITAL_ALLOCATION_REALITY_PCT: float = 50.0
     CAPITAL_ALLOCATION_CROSSMARKET_PCT: float = 50.0
+
+    # === Crypto Reality Arb ===
+    CRYPTO_ARB_SYMBOLS: str = "BTCUSDT,ETHUSDT,SOLUSDT"
+    CRYPTO_ARB_SCAN_INTERVAL: float = 1.0  # scan every 1 second
+    CRYPTO_ARB_FAIR_VALUE_WINDOW: int = 10  # last 10 trades for VWAP
+    CRYPTO_ARB_CEX_SENSITIVITY: float = 30.0  # prob shift multiplier
+    CRYPTO_ARB_STALE_SECONDS: float = 45.0
+    CAPITAL_ALLOCATION_CRYPTO_PCT: float = 0.0  # disabled by default
+
+    # === NO Bet Strategy (NeverYES contrarian approach) ===
+    NO_BET_MIN_YES_PRICE: float = 0.35  # lower bound of sweet spot
+    NO_BET_MAX_YES_PRICE: float = 0.65  # upper bound of sweet spot
+    NO_BET_MIN_LIQUIDITY: float = 1000.0
+    NO_BET_MIN_VOLUME_24H: float = 5000.0
+    NO_BET_SCAN_INTERVAL: float = 300.0
+    NO_BET_MAX_PER_MARKET_PCT: float = 0.02
+    CAPITAL_ALLOCATION_NOBET_PCT: float = 0.0
+
+    # === Market Screener ===
+    SCREENER_MIN_ALPHA_SCORE: float = 0.6
+    SCREENER_TOP_N: int = 10
+    SCREENER_SCAN_INTERVAL: float = 3600.0
+    SCREENER_LLM_PROVIDER: str = "claude"
+    PERPLEXITY_API_KEY: str = ""
+
+    # === Combinatorial Arbitrage ===
+    COMBO_ARB_SCAN_INTERVAL: float = 60.0
+    COMBO_ARB_MIN_PROFIT: float = 0.05
+    COMBO_ARB_MAX_PAIRS_PER_SCAN: int = 50
+    COMBO_ARB_DEPENDENCY_CONFIDENCE: float = 0.90
 
     model_config = {"env_file": ".env"}
 

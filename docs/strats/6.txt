@@ -1,0 +1,35 @@
+https://x.com/krajekis/status/2018366927530229831
+
+I want to share some results and feedback from people who used my @Polymarket
+ BTC 15-minute assistant:
+
+1. Supphieros made $253 in profit over 3 days, starting with $40, using basic risk management (5–15% of the deposit per trade).
+His strategy was buying low-priced shares and quickly flipping them for profits grindin high volatility
+
+Feedback:
+“The bot works great, the data loads very fast, and it has all the indicators needed for comfortable trading. Huge respect for making this, especially since it’s free.”
+
+Account:
+https://
+polymarket.com/@Supphieros?via=krajekis
+
+
+2. Bigsibas made $324 in profit in 2 days, starting with around $100.
+His strategy was different - he bought shares conservatively with bigger size in last 5-9 mins and waited for resolution in most expected scenario.
+
+Feedback:
+“You really solved my problem. Before your assistant, I was unfocused and tried to watch Binance and TradingView at the same time, and often missed impulses. With everything in one place, it was a real game changer. And you made it free - big respect.”
+
+Account:
+https://
+polymarket.com/@bigsibas?via=krajekis
+ 
+
+Really appreciate all the feedback and messages you’ve been sending me!
+
+I built this assistant mainly to solve my own focus and execution issues, so seeing it help other people in real trades means a lot.
+The post with Assistant has already passed 74k views, which honestly surprised me!
+
+Thanks to everyone who tested it, shared results, 
+I’m reading everything and will keep improving it step by step.
+I'm really glad that i can help people be more effective in their trading and generate more profits!

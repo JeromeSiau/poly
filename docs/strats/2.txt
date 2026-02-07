@@ -1,0 +1,72 @@
+https://x.com/frostikkkk/status/2019584411424211202
+
+I analyzed 50 Polymarket bots - here's how they printed $10M+ in 2026.
+
+insane start to 2026 on Polymarket.
+bots and whales are absolutely cooking.
+i dug into the leaderboard and profiled beasts raking in millions.
+top 20 alone stacked over $9M PNL this month, pushing aggregate past $10M easy when you count the volume players.
+not hype - straight data from on-chain profiles and real trades.
+these aren't gamblers. they're machines hunting mismatches, hedging risks, and compounding non-stop.
+let's break it down.
+first, the big picture.
+Polymarket's exploding with sports, crypto swings, politics inefficiencies.
+bots thrive on volume: tiny bets, high reps, low drawdown.
+92%+ winrates on thousands of trades.
+from my study, AI-built bots spot cex lags, arb spreads, and snipe underdogs.
+no emotion, just print.
+top categories:
+
+    sports: NBA/NHL over/unders, esports like LoL/CS.
+    crypto: 15-min BTC/ETH/SOL ups/downs.
+    politics/elections: fed rates, canadian polls, geopolitics, etc.
+
+deep dive on the data.
+i scanned 50+ profiles (top leaderboard + hidden gems from X).
+80%+ winrate is real if you volume hunt.
+here's standout bots/whales by type (checkable profiles):
+
+    crypto (BTC/ETH/SOL/XRP): 92% avg winrate, $35k–$951k monthly PNL range. key tactics: 15-min swings, spotting cex lags, compounding small bets. example: 0x8dxd ($1M overall, >14k trades), profile: https://polymarket.com/@0x8dxd?via=1234
+
+Image
+
+    politics/elections/Fed: 94% avg winrate, $20k–$600k monthly PNL range. key tactics: Inefficiency plays, long-term holds, insider-like accuracy. example: taut-dogwood (96.3% winrate on Fed), profile: https://polymarket.com/@taut-dogwood?via=1234
+
+Image
+
+    sports (NBA/NHL/ESports): 95%+ avg winrate, $100k–$5M monthly PNL range. key tactics: hedging underdogs, over/unders, high-volume tiny edges. example: bossoskil1 ($820k on LoL), profile: https://polymarket.com/profile/0xa5ea13a81d2b7e8e424b182bdc1db08e756bd96a?via=1234
+
+Image
+
+    arbitrage: 98% avg winrate, $116k–$4M monthly PNL range. key tactics: grabbing yes/no spreads <100¢, 40 trades/min, liquidity farming. example: cry.eth2 (26k+ trades on micro spreads), profile: https://polymarket.com/@cry.eth2?via=1234
+
+Image
+general hedgers: 92%+ avg winrate, $300k–$531k monthly PNL range. key tactics: auto-hedge, low risk, multi-market. example: ewww1 ($341k), profile: https://polymarket.com/@ewww1?via=1234
+Image
+all real, on-chain.
+why bots win?
+humans miss the volume.
+bots fire 13k+ trades, snag 1-2¢ edges, compound to insanity.
+you can try build a bot using AI prompts. no code needed (check my article about Claude bots).
+frostikk
+@frostikkkk
+·
+Jan 24
+Article cover image
+how "Claude + Polymarket" will retire you?
+let's figure it out.
+imagine kicking off with zero coding know-how and flipping it into a money-making trading bot on Polymarket, powered by AI like Claude.
+newbies are tapping into Claude's knack for...
+but warning, run several audits on your bot to make sure it's working correctly.
+here's how you can copy bots for free. no need to build.
+use @PolyCop_Trader
+ - telegram bot mirrors whales instant.
+deposit, pick your traders, set limits, print passive.
+hands-off: auto tp/sl, slippage control, 1-click sells.
+tap in: https://t.me/PolyCop_BOT?start=ref_frostikkkk
+tweak risks, compound wins.
+final thoughts.
+2026 is the year bots eat Polymarket.
+if you're not automating or copying, you're exit liquidity.
+i did this analysis to show it's doable.
+good luck, print $$$.
