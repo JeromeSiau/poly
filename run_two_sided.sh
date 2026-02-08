@@ -12,7 +12,7 @@ BASE="$(cd "$(dirname "$0")" && pwd)"
 #   5: wallet size in USD (default: 200)
 #   6: fair mode -> "external_only" (default), "timing_only", "hybrid"
 #   7: fair blend (used only for hybrid, default: 0.6)
-#   8: strategy style -> "default" (default) or "rn1_mimic"
+#   8: strategy style -> "default" (default), "rn1_mimic", or "rn1_sport"
 MIN_EDGE="${1:-0.02}"
 EXIT_EDGE="${2:-0.006}"
 WALLET_USD="${5:-${WALLET_USD:-200}}"
@@ -40,12 +40,17 @@ MAX_MARKET_NET="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.06; i
 WATCH_INTERVAL="${WATCH_INTERVAL:-5}"
 SIGNAL_COOLDOWN="${SIGNAL_COOLDOWN:-8}"
 MAX_ORDERS_PER_CYCLE="${MAX_ORDERS_PER_CYCLE:-4}"
+SCAN_LIMIT="${SCAN_LIMIT:-250}"
+MAX_BOOK_CONCURRENCY="${MAX_BOOK_CONCURRENCY:-24}"
+ENTRY_REQUIRE_ENDED="${ENTRY_REQUIRE_ENDED:-0}"
+ENTRY_MIN_SECONDS_SINCE_END="${ENTRY_MIN_SECONDS_SINCE_END:-0}"
 PAIR_MERGE_MIN_EDGE="${PAIR_MERGE_MIN_EDGE:-0.003}"
 MIN_LIQUIDITY="${MIN_LIQUIDITY:-500}"
 MIN_VOLUME_24H="${MIN_VOLUME_24H:-100}"
 MAX_DAYS_TO_END="${MAX_DAYS_TO_END:-1}"
 INCLUDE_NONSPORTS="${INCLUDE_NONSPORTS:-0}"
 EVENT_PREFIXES="${EVENT_PREFIXES:-}"
+FORCE_TIMING_ONLY=0
 
 UNIVERSE_FLAGS=()
 if [[ "$INCLUDE_NONSPORTS" == "1" ]]; then
@@ -55,6 +60,54 @@ fi
 EXEC_FLAGS=("--paper-fill")
 if [[ "$MODE" == "live" ]]; then
   EXEC_FLAGS=("--autopilot" "--no-paper-fill")
+fi
+
+STYLE_FLAGS=()
+case "$STRATEGY_STYLE" in
+  default)
+    ;;
+  rn1_mimic)
+    # RN1-like profile: avoid classic SELL/settlement loop, keep BUY pressure.
+    STYLE_FLAGS+=("--buy-only" "--no-settle-resolved")
+    FORCE_TIMING_ONLY=1
+    # More RN1-like market coverage/cadence defaults.
+    if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
+    if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="1"; fi
+    if [[ "$MAX_ORDERS_PER_CYCLE" == "4" ]]; then MAX_ORDERS_PER_CYCLE="12"; fi
+    if [[ "$PAIR_MERGE_MIN_EDGE" == "0.003" ]]; then PAIR_MERGE_MIN_EDGE="0.001"; fi
+    if [[ "$MIN_LIQUIDITY" == "500" ]]; then MIN_LIQUIDITY="100"; fi
+    if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="20"; fi
+    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="3"; fi
+    if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="1"; fi
+    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="epl,cs2,lal,nba,fl1,sea,por,tur,cbb"; fi
+    if [[ "$SCAN_LIMIT" == "250" ]]; then SCAN_LIMIT="1200"; fi
+    if [[ "$MAX_BOOK_CONCURRENCY" == "24" ]]; then MAX_BOOK_CONCURRENCY="80"; fi
+    ;;
+  rn1_sport)
+    # RN1-like profile for sports focus (exclude esports/non-sports by default).
+    STYLE_FLAGS+=("--buy-only" "--no-settle-resolved" "--entry-require-ended" "--entry-min-seconds-since-end" "$ENTRY_MIN_SECONDS_SINCE_END")
+    FORCE_TIMING_ONLY=1
+    if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
+    if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="0"; fi
+    if [[ "$MAX_ORDERS_PER_CYCLE" == "4" ]]; then MAX_ORDERS_PER_CYCLE="16"; fi
+    if [[ "$PAIR_MERGE_MIN_EDGE" == "0.003" ]]; then PAIR_MERGE_MIN_EDGE="0.001"; fi
+    if [[ "$MIN_LIQUIDITY" == "500" ]]; then MIN_LIQUIDITY="100"; fi
+    if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="20"; fi
+    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="1"; fi
+    if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="0"; fi
+    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="epl,lal,sea,fl1,por,bun,tur,arg,col1,nba,cbb,atp,wta"; fi
+    if [[ "$SCAN_LIMIT" == "250" ]]; then SCAN_LIMIT="1200"; fi
+    if [[ "$MAX_BOOK_CONCURRENCY" == "24" ]]; then MAX_BOOK_CONCURRENCY="80"; fi
+    if [[ "$ENTRY_REQUIRE_ENDED" == "0" ]]; then ENTRY_REQUIRE_ENDED="1"; fi
+    ;;
+  *)
+    echo "Invalid STRATEGY_STYLE: $STRATEGY_STYLE (expected default|rn1_mimic|rn1_sport)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$FORCE_TIMING_ONLY" == "1" && "$FAIR_MODE" != "timing_only" ]]; then
+  FAIR_MODE="timing_only"
 fi
 
 FAIR_FLAGS=()
@@ -74,29 +127,9 @@ case "$FAIR_MODE" in
     ;;
 esac
 
-STYLE_FLAGS=()
-case "$STRATEGY_STYLE" in
-  default)
-    ;;
-  rn1_mimic)
-    # RN1-like profile: avoid classic SELL/settlement loop, keep BUY pressure.
-    STYLE_FLAGS+=("--buy-only" "--no-settle-resolved")
-    # More RN1-like market coverage/cadence defaults.
-    if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
-    if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="1"; fi
-    if [[ "$MAX_ORDERS_PER_CYCLE" == "4" ]]; then MAX_ORDERS_PER_CYCLE="12"; fi
-    if [[ "$PAIR_MERGE_MIN_EDGE" == "0.003" ]]; then PAIR_MERGE_MIN_EDGE="0.001"; fi
-    if [[ "$MIN_LIQUIDITY" == "500" ]]; then MIN_LIQUIDITY="100"; fi
-    if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="20"; fi
-    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="3"; fi
-    if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="1"; fi
-    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="epl,cs2,lal,nba,fl1,sea,por,tur,cbb"; fi
-    ;;
-  *)
-    echo "Invalid STRATEGY_STYLE: $STRATEGY_STYLE (expected default|rn1_mimic)" >&2
-    exit 1
-    ;;
-esac
+if [[ "$ENTRY_REQUIRE_ENDED" == "1" && "$STRATEGY_STYLE" != "rn1_sport" ]]; then
+  STYLE_FLAGS+=("--entry-require-ended" "--entry-min-seconds-since-end" "$ENTRY_MIN_SECONDS_SINCE_END")
+fi
 
 # Rebuild universe flags after strategy-style overrides.
 UNIVERSE_FLAGS=()
@@ -108,10 +141,12 @@ if [[ -n "$EVENT_PREFIXES" ]]; then
 fi
 
 exec >> "$LOG_FILE" 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start tag=$TAG mode=$MODE wallet_usd=$WALLET_USD fair_mode=$FAIR_MODE fair_blend=$FAIR_BLEND strategy_style=$STRATEGY_STYLE min_edge=$MIN_EDGE exit_edge=$EXIT_EDGE min_order=$MIN_ORDER max_order=$MAX_ORDER max_outcome_inv=$MAX_OUTCOME_INV max_market_net=$MAX_MARKET_NET interval=$WATCH_INTERVAL signal_cooldown=$SIGNAL_COOLDOWN max_orders_per_cycle=$MAX_ORDERS_PER_CYCLE pair_merge_min_edge=$PAIR_MERGE_MIN_EDGE min_liquidity=$MIN_LIQUIDITY min_volume_24h=$MIN_VOLUME_24H max_days_to_end=$MAX_DAYS_TO_END include_nonsports=$INCLUDE_NONSPORTS event_prefixes=$EVENT_PREFIXES"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start tag=$TAG mode=$MODE wallet_usd=$WALLET_USD fair_mode=$FAIR_MODE fair_blend=$FAIR_BLEND strategy_style=$STRATEGY_STYLE min_edge=$MIN_EDGE exit_edge=$EXIT_EDGE min_order=$MIN_ORDER max_order=$MAX_ORDER max_outcome_inv=$MAX_OUTCOME_INV max_market_net=$MAX_MARKET_NET interval=$WATCH_INTERVAL signal_cooldown=$SIGNAL_COOLDOWN max_orders_per_cycle=$MAX_ORDERS_PER_CYCLE scan_limit=$SCAN_LIMIT max_book_concurrency=$MAX_BOOK_CONCURRENCY entry_require_ended=$ENTRY_REQUIRE_ENDED entry_min_seconds_since_end=$ENTRY_MIN_SECONDS_SINCE_END pair_merge_min_edge=$PAIR_MERGE_MIN_EDGE min_liquidity=$MIN_LIQUIDITY min_volume_24h=$MIN_VOLUME_24H max_days_to_end=$MAX_DAYS_TO_END include_nonsports=$INCLUDE_NONSPORTS event_prefixes=$EVENT_PREFIXES"
 
 exec "$BASE/.venv/bin/python" "$BASE/scripts/run_two_sided_inventory.py" \
   watch \
+  --limit "$SCAN_LIMIT" \
+  --max-book-concurrency "$MAX_BOOK_CONCURRENCY" \
   "${FAIR_FLAGS[@]}" \
   "${STYLE_FLAGS[@]}" \
   "${EXEC_FLAGS[@]}" \

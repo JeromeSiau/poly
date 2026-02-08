@@ -767,6 +767,8 @@ async def fetch_markets(
     sports_only: bool,
     max_days_to_end: float,
     event_prefixes: list[str],
+    entry_require_ended: bool,
+    entry_min_seconds_since_end: float,
 ) -> list[dict[str, Any]]:
     all_markets: list[dict[str, Any]] = []
     offset = 0
@@ -809,12 +811,20 @@ async def fetch_markets(
                     continue
             if sports_only and not _looks_sports(question, [str(o) for o in outcomes]):
                 continue
-            if max_days_to_end > 0:
+            end_dt: Optional[datetime] = None
+            if max_days_to_end > 0 or entry_require_ended:
                 end_dt = _parse_datetime(raw.get("endDate"))
                 if end_dt is None:
                     continue
+
+            if max_days_to_end > 0 and end_dt is not None:
                 delta_days = (end_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
                 if delta_days < -1.0 or delta_days > max_days_to_end:
+                    continue
+
+            if entry_require_ended and end_dt is not None:
+                seconds_since_end = (datetime.now(timezone.utc) - end_dt).total_seconds()
+                if seconds_since_end < entry_min_seconds_since_end:
                     continue
 
             all_markets.append(raw)
@@ -1358,6 +1368,8 @@ async def run_cycle(
         sports_only=not args.include_nonsports,
         max_days_to_end=args.max_days_to_end,
         event_prefixes=_parse_csv_values(args.event_prefixes),
+        entry_require_ended=args.entry_require_ended,
+        entry_min_seconds_since_end=args.entry_min_seconds_since_end,
     )
     snapshots = await build_snapshots(
         client=client,
@@ -1571,6 +1583,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Optional comma-separated event slug prefixes filter (e.g. epl,cs2,lal).",
+    )
+    parser.add_argument(
+        "--entry-require-ended",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Only consider markets whose endDate has passed.",
+    )
+    parser.add_argument(
+        "--entry-min-seconds-since-end",
+        type=float,
+        default=0.0,
+        help="When --entry-require-ended is enabled, minimum seconds since market endDate.",
     )
     parser.add_argument(
         "--max-book-concurrency",
