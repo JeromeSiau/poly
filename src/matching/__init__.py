@@ -1,10 +1,20 @@
 """Event matching module for cross-market arbitrage."""
 
+from src.matching.bookmaker_matcher import (
+    BookmakerEvent,
+    BookmakerMarket,
+    BookmakerMarketMatch,
+    BookmakerMatcher,
+)
 from src.matching.event_matcher import CrossMarketMatcher, MatchedEvent
 from src.matching.llm_verifier import LLMVerifier, MatchResult
 from src.matching.normalizer import EventNormalizer
 
 __all__ = [
+    "BookmakerEvent",
+    "BookmakerMarket",
+    "BookmakerMarketMatch",
+    "BookmakerMatcher",
     "CrossMarketMatcher",
     "EventNormalizer",
     "LLMVerifier",

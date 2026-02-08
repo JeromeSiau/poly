@@ -7,6 +7,14 @@ from .cross_market_arb import CrossMarketArbEngine, CrossMarketOpportunity, Eval
 from .crypto_arb import CryptoArbEngine, CryptoArbOpportunity
 from .no_bet_scanner import NoBetScanner, NoBetOpportunity
 from .dependency_detector import DependencyDetector, MarketDependency
+from .two_sided_inventory import (
+    TwoSidedInventoryEngine,
+    MarketSnapshot,
+    OutcomeQuote,
+    TradeIntent,
+    InventoryState,
+    FillResult,
+)
 
 __all__ = [
     "RealityArbEngine",
@@ -21,4 +29,10 @@ __all__ = [
     "NoBetOpportunity",
     "DependencyDetector",
     "MarketDependency",
+    "TwoSidedInventoryEngine",
+    "MarketSnapshot",
+    "OutcomeQuote",
+    "TradeIntent",
+    "InventoryState",
+    "FillResult",
 ]

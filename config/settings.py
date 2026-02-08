@@ -28,6 +28,15 @@ class Settings(BaseSettings):
     SPORTSDATAIO_API_KEY: str = ""
     SPORTSDATAIO_BASE_URL: str = "https://api.sportsdata.io/v3"
 
+    # === The Odds API (External Fair) ===
+    ODDS_API_KEY: str = ""
+    ODDS_API_BASE_URL: str = "https://api.the-odds-api.com/v4"
+    ODDS_API_SPORTS: str = "upcoming"
+    ODDS_API_REGIONS: str = "eu"
+    ODDS_API_MARKETS: str = "h2h"
+    ODDS_API_MIN_REFRESH_SECONDS: float = 14400.0
+    ODDS_MATCH_MIN_CONFIDENCE: float = 0.68
+
     # === Telegram ===
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
@@ -100,6 +109,24 @@ class Settings(BaseSettings):
     NO_BET_SCAN_INTERVAL: float = 300.0
     NO_BET_MAX_PER_MARKET_PCT: float = 0.02
     CAPITAL_ALLOCATION_NOBET_PCT: float = 0.0
+
+    # === Two-Sided Inventory Arb ===
+    TWO_SIDED_SCAN_INTERVAL: float = 20.0
+    TWO_SIDED_MIN_EDGE_PCT: float = 0.015
+    TWO_SIDED_EXIT_EDGE_PCT: float = 0.003
+    TWO_SIDED_MIN_ORDER_USD: float = 25.0
+    TWO_SIDED_MAX_ORDER_USD: float = 400.0
+    TWO_SIDED_MAX_OUTCOME_INVENTORY_USD: float = 2500.0
+    TWO_SIDED_MAX_MARKET_NET_USD: float = 1200.0
+    TWO_SIDED_INVENTORY_SKEW_PCT: float = 0.02
+    TWO_SIDED_MAX_HOLD_SECONDS: float = 86400.0
+    TWO_SIDED_MIN_LIQUIDITY: float = 10000.0
+    TWO_SIDED_MIN_VOLUME_24H: float = 5000.0
+    TWO_SIDED_MAX_DAYS_TO_END: float = 3.0
+    TWO_SIDED_MAX_ORDERS_PER_CYCLE: int = 15
+    TWO_SIDED_SIGNAL_COOLDOWN_SECONDS: float = 45.0
+    TWO_SIDED_MAX_BOOK_CONCURRENCY: int = 30
+    TWO_SIDED_EXTERNAL_FAIR_BLEND: float = 0.85
 
     # === Market Screener ===
     SCREENER_MIN_ALPHA_SCORE: float = 0.6
