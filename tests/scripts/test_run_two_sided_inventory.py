@@ -13,6 +13,7 @@ from scripts.run_two_sided_inventory import (
     _parse_resolved_binary_market,
     _best_orderbook_level,
     _resolve_probability,
+    fetch_resolved_conditions,
     settle_resolved_inventory,
 )
 from src.arb.two_sided_inventory import MarketSnapshot, OutcomeQuote, TradeIntent, TwoSidedInventoryEngine
@@ -141,6 +142,55 @@ def test_parse_resolved_binary_market_accepts_ended_open_when_enabled() -> None:
         enddate_grace_seconds=300.0,
     )
     assert blocked is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_resolved_conditions_uses_repeated_condition_ids_params() -> None:
+    class _DummyResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._payload
+
+    class _DummyClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def get(self, url, params=None):
+            self.calls.append((url, params))
+            return _DummyResponse(
+                [
+                    {
+                        "conditionId": "cond-a",
+                        "question": "Will Team A win?",
+                        "closed": True,
+                        "endDate": "2026-02-08T12:00:00Z",
+                        "outcomes": '["Yes","No"]',
+                        "outcomePrices": '["0.999","0.001"]',
+                    }
+                ]
+            )
+
+    client = _DummyClient()
+    resolved = await fetch_resolved_conditions(
+        client=client,  # type: ignore[arg-type]
+        condition_ids=["cond-a", "cond-b"],
+        now_ts=1_770_854_400.0,
+        winner_min_price=0.985,
+        loser_max_price=0.015,
+        allow_ended_open=True,
+        enddate_grace_seconds=300.0,
+        fetch_chunk_size=40,
+    )
+
+    assert "cond-a" in resolved
+    assert len(client.calls) == 1
+    _, params = client.calls[0]
+    assert params == [("condition_ids", "cond-a"), ("condition_ids", "cond-b")]
 
 
 def test_paper_recorder_persists_and_replays_inventory(tmp_path) -> None:

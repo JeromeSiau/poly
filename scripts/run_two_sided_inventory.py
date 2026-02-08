@@ -995,9 +995,10 @@ async def fetch_resolved_conditions(
     for idx in range(0, len(unique_ids), chunk_size):
         chunk = unique_ids[idx: idx + chunk_size]
         try:
+            params = [("condition_ids", cid) for cid in chunk]
             response = await client.get(
                 GAMMA_API,
-                params={"condition_ids": ",".join(chunk)},
+                params=params,
             )
             response.raise_for_status()
             rows = response.json()
