@@ -240,3 +240,45 @@ class TestFillAccounting:
         # Sold 100 shares at 0.55 => pnl ~ +11.6667
         assert result.realized_pnl_delta == pytest.approx(11.6666666667, rel=1e-6)
         assert state.shares == pytest.approx(200.0, rel=1e-6)
+
+    def test_settle_position_closes_at_zero_or_one(self):
+        engine = TwoSidedInventoryEngine()
+        engine.apply_fill(
+            TradeIntent(
+                condition_id="cond-1",
+                title="Will Team A win?",
+                outcome="Yes",
+                token_id="tok-yes",
+                side="BUY",
+                price=0.60,
+                size_usd=120.0,  # 200 shares
+                edge_pct=0.02,
+                reason="seed",
+                timestamp=time.time(),
+            )
+        )
+
+        lose_fill = engine.settle_position("cond-1", "Yes", 0.0)
+        assert lose_fill.shares == pytest.approx(200.0, rel=1e-9)
+        assert lose_fill.realized_pnl_delta == pytest.approx(-120.0, rel=1e-9)
+        assert engine.get_state("cond-1", "Yes").shares == pytest.approx(0.0, abs=1e-9)
+
+        # Re-open and settle as winner.
+        engine.apply_fill(
+            TradeIntent(
+                condition_id="cond-1",
+                title="Will Team A win?",
+                outcome="Yes",
+                token_id="tok-yes",
+                side="BUY",
+                price=0.40,
+                size_usd=80.0,  # 200 shares
+                edge_pct=0.02,
+                reason="seed",
+                timestamp=time.time(),
+            )
+        )
+        win_fill = engine.settle_position("cond-1", "Yes", 1.0)
+        assert win_fill.shares == pytest.approx(200.0, rel=1e-9)
+        assert win_fill.realized_pnl_delta == pytest.approx(120.0, rel=1e-9)
+        assert engine.get_state("cond-1", "Yes").shares == pytest.approx(0.0, abs=1e-9)

@@ -56,6 +56,9 @@ logger = structlog.get_logger()
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
 CLOB_API = "https://clob.polymarket.com"
 TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
+DEFAULT_SETTLEMENT_WINNER_MIN_PRICE = 0.985
+DEFAULT_SETTLEMENT_LOSER_MAX_PRICE = 0.015
+DEFAULT_SETTLEMENT_FETCH_CHUNK = 40
 
 SPORT_HINT_PATTERNS = (
     r"\bmap\s+\d+\b",
@@ -181,6 +184,65 @@ def _resolve_probability(odds_map: dict[str, float], mapping_key: str) -> Option
     return _clamp(float(value), 0.001, 0.999)
 
 
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _normalize_outcome_label(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _lookup_outcome_price(outcome_prices: dict[str, float], outcome: str) -> Optional[float]:
+    direct = outcome_prices.get(outcome)
+    if direct is not None:
+        return direct
+    target = _normalize_outcome_label(outcome)
+    for key, price in outcome_prices.items():
+        if _normalize_outcome_label(key) == target:
+            return price
+    return None
+
+
+def _parse_resolved_binary_market(
+    raw: dict[str, Any],
+    *,
+    winner_min_price: float,
+    loser_max_price: float,
+) -> Optional[ResolvedCondition]:
+    condition_id = str(raw.get("conditionId") or "")
+    if not condition_id or not _to_bool(raw.get("closed")):
+        return None
+
+    outcomes = [str(item) for item in parse_json_list(raw.get("outcomes", []))]
+    prices_raw = parse_json_list(raw.get("outcomePrices", []))
+    if len(outcomes) != 2 or len(prices_raw) != len(outcomes):
+        return None
+
+    outcome_prices: dict[str, float] = {}
+    for outcome, price_raw in zip(outcomes, prices_raw):
+        price = _to_float(price_raw, default=-1.0)
+        if not (0.0 <= price <= 1.0):
+            return None
+        outcome_prices[outcome] = price
+
+    winner_price = max(outcome_prices.values())
+    loser_price = min(outcome_prices.values())
+    if winner_price < winner_min_price or loser_price > loser_max_price:
+        return None
+
+    return ResolvedCondition(
+        condition_id=condition_id,
+        title=str(raw.get("question") or condition_id),
+        outcome_prices=outcome_prices,
+    )
+
+
 @dataclass(slots=True)
 class ExternalFairStats:
     odds_events: int = 0
@@ -189,6 +251,13 @@ class ExternalFairStats:
     credits_remaining: Optional[int] = None
     credits_used: Optional[int] = None
     credits_last_call: Optional[int] = None
+
+
+@dataclass(slots=True)
+class ResolvedCondition:
+    condition_id: str
+    title: str
+    outcome_prices: dict[str, float]
 
 
 class ExternalFairRuntime:
@@ -538,8 +607,6 @@ class TwoSidedPaperRecorder:
             size_usd = _to_float(trade.size, default=0.0)
             if not condition_id or not outcome or side not in {"BUY", "SELL"}:
                 continue
-            if price <= 0 or size_usd <= 0:
-                continue
 
             timestamp = trade.created_at or observation.timestamp
             if timestamp is None:
@@ -549,6 +616,20 @@ class TwoSidedPaperRecorder:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
                 ts = timestamp.timestamp()
 
+            reason = str(game_state.get("reason") or "restore")
+            if side == "SELL" and reason.startswith("settlement_"):
+                fill = engine.settle_position(
+                    condition_id=condition_id,
+                    outcome=outcome,
+                    settlement_price=max(0.0, price),
+                    timestamp=ts,
+                )
+                if fill.shares > 0:
+                    restored += 1
+                continue
+
+            if price <= 0 or size_usd <= 0:
+                continue
             restored_intent = TradeIntent(
                 condition_id=condition_id,
                 title=title,
@@ -558,7 +639,7 @@ class TwoSidedPaperRecorder:
                 price=price,
                 size_usd=size_usd,
                 edge_pct=_to_float(trade.edge_theoretical, default=0.0),
-                reason=str(game_state.get("reason") or "restore"),
+                reason=reason,
                 timestamp=ts,
             )
             fill = engine.apply_fill(restored_intent)
@@ -608,13 +689,16 @@ class TwoSidedPaperRecorder:
             "market_bid": quote.bid if quote else None,
             "market_ask": quote.ask if quote else None,
         }
+        if intent.reason.startswith("settlement_"):
+            game_state["is_settlement"] = True
 
         edge_realized: Optional[float] = None
         pnl: Optional[float] = None
         exit_price: Optional[float] = None
         if intent.side == "SELL":
             pnl = fill.realized_pnl_delta
-            edge_realized = pnl / intent.size_usd if intent.size_usd > 0 else 0.0
+            if not intent.reason.startswith("settlement_"):
+                edge_realized = pnl / intent.size_usd if intent.size_usd > 0 else 0.0
             exit_price = fill.fill_price
 
         observation = LiveObservation(
@@ -876,6 +960,137 @@ def inventory_mark_summary(
     }
 
 
+async def fetch_resolved_conditions(
+    client: httpx.AsyncClient,
+    condition_ids: list[str],
+    *,
+    winner_min_price: float,
+    loser_max_price: float,
+    fetch_chunk_size: int,
+) -> dict[str, ResolvedCondition]:
+    resolved: dict[str, ResolvedCondition] = {}
+    if not condition_ids:
+        return resolved
+
+    unique_ids = [cid for cid in dict.fromkeys(condition_ids) if cid]
+    chunk_size = max(1, fetch_chunk_size)
+    for idx in range(0, len(unique_ids), chunk_size):
+        chunk = unique_ids[idx: idx + chunk_size]
+        try:
+            response = await client.get(
+                GAMMA_API,
+                params={"condition_ids": ",".join(chunk)},
+            )
+            response.raise_for_status()
+            rows = response.json()
+        except Exception as exc:
+            logger.warning(
+                "resolution_fetch_error",
+                chunk_size=len(chunk),
+                error=repr(exc),
+            )
+            continue
+
+        if not isinstance(rows, list):
+            continue
+
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            parsed = _parse_resolved_binary_market(
+                raw,
+                winner_min_price=winner_min_price,
+                loser_max_price=loser_max_price,
+            )
+            if parsed is not None:
+                resolved[parsed.condition_id] = parsed
+
+    return resolved
+
+
+def settle_resolved_inventory(
+    engine: TwoSidedInventoryEngine,
+    resolved_conditions: dict[str, ResolvedCondition],
+    *,
+    paper_recorder: Optional[TwoSidedPaperRecorder],
+    now_ts: float,
+) -> int:
+    if not resolved_conditions:
+        return 0
+
+    settled = 0
+    open_inventory = engine.get_open_inventory()
+    for condition_id, by_outcome in open_inventory.items():
+        resolved = resolved_conditions.get(condition_id)
+        if resolved is None:
+            continue
+
+        for outcome in list(by_outcome.keys()):
+            settlement_price = _lookup_outcome_price(resolved.outcome_prices, outcome)
+            if settlement_price is None:
+                logger.debug(
+                    "settlement_outcome_missing",
+                    condition_id=condition_id,
+                    outcome=outcome,
+                    resolved_outcomes=list(resolved.outcome_prices.keys()),
+                )
+                continue
+
+            fill = engine.settle_position(
+                condition_id=condition_id,
+                outcome=outcome,
+                settlement_price=settlement_price,
+                timestamp=now_ts,
+            )
+            if fill.shares <= 0:
+                continue
+            settled += 1
+
+            logger.info(
+                "paper_position_settled",
+                condition_id=condition_id,
+                outcome=outcome,
+                settlement_price=settlement_price,
+                shares=fill.shares,
+                realized_pnl=fill.realized_pnl_delta,
+            )
+
+            if paper_recorder is None:
+                continue
+
+            intent = TradeIntent(
+                condition_id=condition_id,
+                title=resolved.title,
+                outcome=outcome,
+                token_id="",
+                side="SELL",
+                price=settlement_price,
+                size_usd=fill.shares * settlement_price,
+                edge_pct=0.0,
+                reason="settlement_closed_market",
+                timestamp=now_ts,
+            )
+            try:
+                paper_recorder.persist_fill(
+                    intent=intent,
+                    fill=fill,
+                    snapshot=None,
+                    fair_prices={outcome: settlement_price},
+                    execution_mode="paper_settlement",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "paper_db_persist_failed",
+                    condition_id=condition_id,
+                    outcome=outcome,
+                    side="SELL",
+                    reason="settlement_closed_market",
+                    error=repr(exc),
+                )
+
+    return settled
+
+
 def signal_key(intent: TradeIntent) -> tuple[str, str, str, int]:
     return (
         intent.condition_id,
@@ -934,6 +1149,24 @@ async def run_cycle(
     )
 
     now = time.time()
+    settled = 0
+    if args.settle_resolved and args.paper_fill:
+        open_inventory = engine.get_open_inventory()
+        if open_inventory:
+            resolved_conditions = await fetch_resolved_conditions(
+                client=client,
+                condition_ids=list(open_inventory.keys()),
+                winner_min_price=args.settlement_winner_min_price,
+                loser_max_price=args.settlement_loser_max_price,
+                fetch_chunk_size=args.settlement_fetch_chunk,
+            )
+            settled = settle_resolved_inventory(
+                engine=engine,
+                resolved_conditions=resolved_conditions,
+                paper_recorder=paper_recorder if args.persist_paper else None,
+                now_ts=now,
+            )
+
     if fair_runtime is not None:
         await fair_runtime.refresh_if_needed(client=client, raw_markets=raw_markets, now_ts=now)
 
@@ -961,7 +1194,7 @@ async def run_cycle(
 
     print(
         f"\n[{time.strftime('%H:%M:%S')}] markets={len(raw_markets)} "
-        f"snapshots={len(snapshots)} intents={len(all_intents)}"
+        f"snapshots={len(snapshots)} intents={len(all_intents)} settled={settled}"
     )
     if fair_runtime is not None:
         stats = fair_runtime.stats
@@ -1058,7 +1291,7 @@ async def run_cycle(
 
     inv = inventory_mark_summary(engine, snapshots, fair_cache=fair_cache)
     print(
-        f"Executed this cycle: {executed} (failures={failures}) | "
+        f"Executed this cycle: {executed} (failures={failures}, settled={settled}) | "
         f"Inventory open={int(inv['open_positions'])} marked=${inv['marked_notional']:,.2f} "
         f"realized=${inv['realized_pnl']:,.2f}"
     )
@@ -1216,6 +1449,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=settings.TWO_SIDED_MAX_HOLD_SECONDS,
         help="Max hold age before stale exit.",
     )
+    parser.add_argument(
+        "--settle-resolved",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Settle open paper inventory when market is closed with decisive 0/1 outcome prices.",
+    )
+    parser.add_argument(
+        "--settlement-winner-min-price",
+        type=float,
+        default=DEFAULT_SETTLEMENT_WINNER_MIN_PRICE,
+        help="Minimum winner price to treat closed market as resolved.",
+    )
+    parser.add_argument(
+        "--settlement-loser-max-price",
+        type=float,
+        default=DEFAULT_SETTLEMENT_LOSER_MAX_PRICE,
+        help="Maximum loser price to treat closed market as resolved.",
+    )
+    parser.add_argument(
+        "--settlement-fetch-chunk",
+        type=int,
+        default=DEFAULT_SETTLEMENT_FETCH_CHUNK,
+        help="Condition-id batch size for settlement resolution lookup.",
+    )
 
     # Execution mode
     parser.add_argument("--autopilot", action="store_true", help="Place live orders via CLOB executor.")
@@ -1320,14 +1577,16 @@ async def main() -> None:
             exit_edge_pct=args.exit_edge,
         )
         paper_recorder.bootstrap()
-        if args.resume_paper and args.paper_fill and not args.autopilot:
+        if args.resume_paper:
             restored = paper_recorder.replay_into_engine(engine)
-            if restored:
-                logger.info(
-                    "paper_inventory_restored",
-                    fills=restored,
-                    realized_pnl=engine.get_realized_pnl(),
-                )
+            logger.info(
+                "paper_inventory_restored",
+                strategy_tag=strategy_tag,
+                fills=restored,
+                open_conditions=len(engine.get_open_inventory()),
+                realized_pnl=engine.get_realized_pnl(),
+                mode="autopilot" if args.autopilot else ("paper" if args.paper_fill else "scan_only"),
+            )
     logger.info(
         "runner_configuration",
         strategy_tag=strategy_tag,

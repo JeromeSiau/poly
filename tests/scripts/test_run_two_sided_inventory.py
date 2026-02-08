@@ -8,9 +8,12 @@ from sqlalchemy import func, select
 
 from scripts.run_two_sided_inventory import (
     ExternalFairRuntime,
+    ResolvedCondition,
     TwoSidedPaperRecorder,
+    _parse_resolved_binary_market,
     _best_orderbook_level,
     _resolve_probability,
+    settle_resolved_inventory,
 )
 from src.arb.two_sided_inventory import MarketSnapshot, OutcomeQuote, TradeIntent, TwoSidedInventoryEngine
 from src.db.database import get_sync_session
@@ -63,8 +66,46 @@ def test_resolve_probability_supports_inverse_mapping() -> None:
     assert _resolve_probability(odds, "1-home") == pytest.approx(0.39, abs=1e-9)
 
 
+def test_parse_resolved_binary_market_requires_closed_and_decisive() -> None:
+    raw = {
+        "conditionId": "cond-1",
+        "question": "Will Team A win?",
+        "closed": True,
+        "outcomes": '["Yes","No"]',
+        "outcomePrices": '["0.999","0.001"]',
+    }
+    parsed = _parse_resolved_binary_market(
+        raw,
+        winner_min_price=0.985,
+        loser_max_price=0.015,
+    )
+    assert parsed is not None
+    assert parsed.condition_id == "cond-1"
+    assert parsed.outcome_prices["Yes"] == pytest.approx(0.999, rel=1e-9)
+
+    not_decisive = {
+        **raw,
+        "outcomePrices": '["0.61","0.39"]',
+    }
+    assert _parse_resolved_binary_market(
+        not_decisive,
+        winner_min_price=0.985,
+        loser_max_price=0.015,
+    ) is None
+
+    not_closed = {**raw, "closed": False}
+    assert _parse_resolved_binary_market(
+        not_closed,
+        winner_min_price=0.985,
+        loser_max_price=0.015,
+    ) is None
+
+
 def test_paper_recorder_persists_and_replays_inventory(tmp_path) -> None:
-    db_url = f"sqlite+aiosqlite:///{tmp_path / 'two_sided_test.db'}"
+    db_path = tmp_path / "two_sided_test.db"
+    if db_path.exists():
+        db_path.unlink()
+    db_url = f"sqlite+aiosqlite:///{db_path}"
     recorder = TwoSidedPaperRecorder(
         db_url,
         strategy_tag="edge_1p5_0p3",
@@ -144,7 +185,7 @@ def test_paper_recorder_persists_and_replays_inventory(tmp_path) -> None:
         execution_mode="paper",
     )
 
-    session = get_sync_session("sqlite:///" + str(tmp_path / "two_sided_test.db"))
+    session = get_sync_session("sqlite:///" + str(db_path))
     try:
         obs_count = session.execute(select(func.count()).select_from(LiveObservation)).scalar_one()
         trades = session.execute(select(PaperTrade).order_by(PaperTrade.id.asc())).scalars().all()
@@ -212,3 +253,62 @@ async def test_external_fair_shared_db_cache_avoids_duplicate_api_calls(tmp_path
 
     assert call_count["n"] == 1
     assert runtime_b.stats.credits_last_call == 1
+
+
+def test_settle_resolved_inventory_persists_and_replays(tmp_path) -> None:
+    db_path = tmp_path / "two_sided_settlement_test.db"
+    if db_path.exists():
+        db_path.unlink()
+    db_url = f"sqlite+aiosqlite:///{db_path}"
+    recorder = TwoSidedPaperRecorder(
+        db_url,
+        strategy_tag="edge_settlement_case",
+        run_id="edge_settlement_case-test",
+        min_edge_pct=0.015,
+        exit_edge_pct=0.003,
+    )
+    recorder.bootstrap()
+
+    engine = TwoSidedInventoryEngine()
+    buy_intent = TradeIntent(
+        condition_id="cond-resolved",
+        title="Will Team A win?",
+        outcome="Yes",
+        token_id="tok-yes",
+        side="BUY",
+        price=0.60,
+        size_usd=120.0,  # 200 shares
+        edge_pct=0.02,
+        reason="under_fair",
+        timestamp=time.time(),
+    )
+    buy_fill = engine.apply_fill(buy_intent)
+    recorder.persist_fill(
+        intent=buy_intent,
+        fill=buy_fill,
+        snapshot=None,
+        fair_prices={"Yes": 0.62},
+        execution_mode="paper",
+    )
+
+    settled = settle_resolved_inventory(
+        engine=engine,
+        resolved_conditions={
+            "cond-resolved": ResolvedCondition(
+                condition_id="cond-resolved",
+                title="Will Team A win?",
+                outcome_prices={"Yes": 0.0, "No": 1.0},
+            )
+        },
+        paper_recorder=recorder,
+        now_ts=time.time() + 10.0,
+    )
+    assert settled == 1
+    assert engine.get_state("cond-resolved", "Yes").shares == pytest.approx(0.0, abs=1e-9)
+    assert engine.get_realized_pnl() == pytest.approx(-120.0, rel=1e-9)
+
+    replay_engine = TwoSidedInventoryEngine()
+    restored = recorder.replay_into_engine(replay_engine)
+    assert restored == 2
+    assert replay_engine.get_state("cond-resolved", "Yes").shares == pytest.approx(0.0, abs=1e-9)
+    assert replay_engine.get_realized_pnl() == pytest.approx(-120.0, rel=1e-9)

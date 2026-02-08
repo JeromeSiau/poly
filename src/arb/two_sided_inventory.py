@@ -574,6 +574,53 @@ class TwoSidedInventoryEngine:
             avg_price=state.avg_price,
         )
 
+    def settle_position(
+        self,
+        condition_id: str,
+        outcome: str,
+        settlement_price: float,
+        *,
+        timestamp: Optional[float] = None,
+    ) -> FillResult:
+        """Force-close an open outcome at final settlement price.
+
+        This is used for resolved markets where final price can be exactly 0.0/1.0.
+        """
+        del timestamp  # reserved for parity with apply_fill-style callers
+
+        state = self.get_state(condition_id, outcome)
+        if state.shares <= 0:
+            return FillResult(
+                condition_id=condition_id,
+                outcome=outcome,
+                side="SELL",
+                shares=0.0,
+                fill_price=settlement_price,
+                realized_pnl_delta=0.0,
+                remaining_shares=0.0,
+                avg_price=state.avg_price,
+            )
+
+        price = _clamp(settlement_price, 0.0, 1.0)
+        closed_shares = state.shares
+        realized_delta = closed_shares * (price - state.avg_price)
+        state.realized_pnl += realized_delta
+        state.traded_notional += closed_shares * price
+        state.shares = 0.0
+        state.avg_price = 0.0
+        state.opened_at = None
+
+        return FillResult(
+            condition_id=condition_id,
+            outcome=outcome,
+            side="SELL",
+            shares=closed_shares,
+            fill_price=price,
+            realized_pnl_delta=realized_delta,
+            remaining_shares=0.0,
+            avg_price=0.0,
+        )
+
     def get_open_inventory(self) -> dict[str, dict[str, InventoryState]]:
         """Return nested dict by condition and outcome for open lots only."""
         nested: dict[str, dict[str, InventoryState]] = {}
