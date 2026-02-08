@@ -62,7 +62,9 @@ DEFAULT_SETTLEMENT_FETCH_CHUNK = 40
 DEFAULT_SETTLEMENT_ENDDATE_GRACE_SECONDS = 300.0
 DEFAULT_PAIR_MERGE_PRICE = 0.5
 DEFAULT_PAIR_MERGE_MIN_EDGE = 0.002
+DEFAULT_BOOK_404_COOLDOWN_SECONDS = 600.0
 PAIR_BUNDLE_REASONS = {"pair_arb_entry", "pair_arb_exit", "pair_merge"}
+_BOOK_404_SUPPRESS_UNTIL: dict[str, float] = {}
 
 SPORT_HINT_PATTERNS = (
     r"\bmap\s+\d+\b",
@@ -865,11 +867,38 @@ async def fetch_book(
     token_id: str,
     semaphore: asyncio.Semaphore,
 ) -> dict[str, Optional[float]]:
+    now_ts = time.time()
+    suppress_until = _BOOK_404_SUPPRESS_UNTIL.get(token_id)
+    if suppress_until is not None:
+        if now_ts < suppress_until:
+            return {"bid": None, "ask": None, "bid_size": None, "ask_size": None}
+        _BOOK_404_SUPPRESS_UNTIL.pop(token_id, None)
+
     async with semaphore:
         try:
             response = await client.get(f"{CLOB_API}/book", params={"token_id": token_id})
             response.raise_for_status()
             payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 404:
+                previous = _BOOK_404_SUPPRESS_UNTIL.get(token_id, 0.0)
+                suppress_until_next = time.time() + DEFAULT_BOOK_404_COOLDOWN_SECONDS
+                _BOOK_404_SUPPRESS_UNTIL[token_id] = max(previous, suppress_until_next)
+                if previous <= now_ts:
+                    logger.info(
+                        "book_fetch_404_suppressed",
+                        token_id=token_id,
+                        suppress_seconds=DEFAULT_BOOK_404_COOLDOWN_SECONDS,
+                    )
+            else:
+                logger.debug(
+                    "book_fetch_error",
+                    token_id=token_id,
+                    error=repr(exc),
+                    error_type=type(exc).__name__,
+                )
+            return {"bid": None, "ask": None, "bid_size": None, "ask_size": None}
         except Exception as exc:
             logger.debug(
                 "book_fetch_error",
@@ -878,6 +907,8 @@ async def fetch_book(
                 error_type=type(exc).__name__,
             )
             return {"bid": None, "ask": None, "bid_size": None, "ask_size": None}
+
+    _BOOK_404_SUPPRESS_UNTIL.pop(token_id, None)
 
     bids = payload.get("bids", []) if isinstance(payload, dict) else []
     asks = payload.get("asks", []) if isinstance(payload, dict) else []

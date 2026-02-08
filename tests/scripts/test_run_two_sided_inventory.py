@@ -1,11 +1,13 @@
 """Tests for helper logic in run_two_sided_inventory script."""
 
+import asyncio
 import time
 
 import httpx
 import pytest
 from sqlalchemy import func, select
 
+import scripts.run_two_sided_inventory as two_sided_runner
 from scripts.run_two_sided_inventory import (
     ExternalFairRuntime,
     ResolvedCondition,
@@ -13,6 +15,7 @@ from scripts.run_two_sided_inventory import (
     _parse_resolved_binary_market,
     _best_orderbook_level,
     _resolve_probability,
+    fetch_book,
     fetch_resolved_conditions,
     paper_merge_binary_pairs,
     select_intents_for_execution,
@@ -247,6 +250,48 @@ async def test_fetch_resolved_conditions_uses_repeated_condition_ids_params() ->
     assert len(client.calls) == 1
     _, params = client.calls[0]
     assert params == [("condition_ids", "cond-a"), ("condition_ids", "cond-b")]
+
+
+@pytest.mark.asyncio
+async def test_fetch_book_404_is_temporarily_suppressed(monkeypatch) -> None:
+    class _Dummy404Response:
+        def __init__(self, token: str) -> None:
+            self._request = httpx.Request("GET", f"https://clob.polymarket.com/book?token_id={token}")
+            self._response = httpx.Response(404, request=self._request)
+
+        def raise_for_status(self) -> None:
+            raise httpx.HTTPStatusError("404", request=self._request, response=self._response)
+
+        def json(self):
+            return {}
+
+    class _DummyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get(self, url, params=None):
+            self.calls += 1
+            token = str((params or {}).get("token_id") or "unknown")
+            return _Dummy404Response(token)
+
+    token_id = "missing-token-123"
+    now = [1_000.0]
+    monkeypatch.setattr(two_sided_runner.time, "time", lambda: now[0])
+    two_sided_runner._BOOK_404_SUPPRESS_UNTIL.clear()
+
+    client = _DummyClient()
+    semaphore = asyncio.Semaphore(1)
+
+    first = await fetch_book(client, token_id, semaphore)  # triggers remote call + suppression
+    second = await fetch_book(client, token_id, semaphore)  # should be skipped during suppression window
+
+    assert client.calls == 1
+    assert first["bid"] is None
+    assert second["ask"] is None
+
+    now[0] += two_sided_runner.DEFAULT_BOOK_404_COOLDOWN_SECONDS + 1.0
+    await fetch_book(client, token_id, semaphore)
+    assert client.calls == 2
 
 
 def test_paper_merge_binary_pairs_persists_and_replays(tmp_path) -> None:
