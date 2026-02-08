@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -41,8 +42,8 @@ from src.arb.two_sided_inventory import (
     TwoSidedInventoryEngine,
 )
 from src.db.database import get_sync_session, init_db
-from src.db.models import LiveObservation, PaperTrade
-from src.feeds.odds_api import OddsApiClient, OddsApiSnapshot
+from src.db.models import LiveObservation, OddsApiCache, PaperTrade
+from src.feeds.odds_api import OddsApiClient, OddsApiSnapshot, OddsApiUsage
 from src.matching.bookmaker_matcher import (
     BookmakerEvent,
     BookmakerMarket,
@@ -204,6 +205,8 @@ class ExternalFairRuntime:
         min_refresh_seconds: float,
         min_match_confidence: float,
         blend: float,
+        shared_cache_db_url: str = "",
+        shared_cache_ttl_seconds: float = 0.0,
     ) -> None:
         self._sports = sports or ["upcoming"]
         self._regions = regions
@@ -213,11 +216,181 @@ class ExternalFairRuntime:
 
         self._odds = OddsApiClient(api_key=api_key, base_url=base_url)
         self._matcher = BookmakerMatcher(min_event_confidence=min_match_confidence)
+        self._shared_cache_db_url = (
+            _ensure_sync_db_url(shared_cache_db_url) if shared_cache_db_url else ""
+        )
+        self._shared_cache_ttl_seconds = max(0.0, shared_cache_ttl_seconds)
+        sports_key = ",".join(sorted(self._sports))
+        cache_spec = f"{base_url}|sports:{sports_key}|regions:{regions}|markets:{markets}"
+        self._cache_key = f"odds:{hashlib.sha1(cache_spec.encode('utf-8')).hexdigest()}"
+        if self._shared_cache_db_url and self._shared_cache_ttl_seconds > 0:
+            init_db(self._shared_cache_db_url)
 
         self._last_refresh_ts: float = 0.0
         self._events_by_id: dict[str, BookmakerEvent] = {}
         self._matches_by_condition: dict[str, BookmakerMarketMatch] = {}
         self._stats = ExternalFairStats()
+
+    @staticmethod
+    def _event_to_payload(event: BookmakerEvent) -> dict[str, Any]:
+        return {
+            "event_id": event.event_id,
+            "home_team": event.home_team,
+            "away_team": event.away_team,
+            "starts_at": event.starts_at.isoformat() if event.starts_at else None,
+            "sport": event.sport,
+            "league": event.league,
+            "markets": [
+                {
+                    "market_type": market.market_type,
+                    "outcomes": {k: float(v) for k, v in market.outcomes.items()},
+                    "line": market.line,
+                    "market_id": market.market_id,
+                }
+                for market in event.markets
+            ],
+        }
+
+    @staticmethod
+    def _payload_to_event(payload: dict[str, Any]) -> Optional[BookmakerEvent]:
+        event_id = str(payload.get("event_id") or "")
+        home_team = str(payload.get("home_team") or "")
+        away_team = str(payload.get("away_team") or "")
+        if not event_id or not home_team or not away_team:
+            return None
+
+        raw_markets = payload.get("markets")
+        if not isinstance(raw_markets, list):
+            raw_markets = []
+        markets: list[BookmakerMarket] = []
+        for row in raw_markets:
+            if not isinstance(row, dict):
+                continue
+            raw_outcomes = row.get("outcomes")
+            if not isinstance(raw_outcomes, dict):
+                continue
+            outcomes: dict[str, float] = {}
+            for key, value in raw_outcomes.items():
+                outcome_name = str(key).strip()
+                if not outcome_name:
+                    continue
+                outcomes[outcome_name] = _to_float(value, default=0.0)
+            if not outcomes:
+                continue
+            markets.append(
+                BookmakerMarket(
+                    market_type=str(row.get("market_type") or ""),
+                    outcomes=outcomes,
+                    line=_to_float(row.get("line"), default=0.0)
+                    if row.get("line") is not None
+                    else None,
+                    market_id=str(row.get("market_id") or ""),
+                )
+            )
+
+        if not markets:
+            return None
+
+        return BookmakerEvent(
+            event_id=event_id,
+            home_team=home_team,
+            away_team=away_team,
+            starts_at=_parse_datetime(payload.get("starts_at")),
+            sport=str(payload.get("sport") or ""),
+            league=str(payload.get("league") or ""),
+            markets=markets,
+        )
+
+    def _load_shared_snapshot_with_usage(self, now_ts: float) -> Optional[OddsApiSnapshot]:
+        if not self._shared_cache_db_url or self._shared_cache_ttl_seconds <= 0:
+            return None
+
+        session = get_sync_session(self._shared_cache_db_url)
+        try:
+            row = session.execute(
+                select(OddsApiCache).where(OddsApiCache.cache_key == self._cache_key)
+            ).scalar_one_or_none()
+        finally:
+            session.close()
+
+        if row is None or row.fetched_at is None:
+            return None
+        fetched_at = row.fetched_at
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        age = now_ts - fetched_at.timestamp()
+        if age > self._shared_cache_ttl_seconds:
+            return None
+
+        raw_payload = row.payload
+        if not isinstance(raw_payload, list):
+            return None
+        events: list[BookmakerEvent] = []
+        for item in raw_payload:
+            if not isinstance(item, dict):
+                continue
+            parsed = self._payload_to_event(item)
+            if parsed is not None:
+                events.append(parsed)
+
+        usage = OddsApiUsage(
+            remaining=row.credits_remaining,
+            used=row.credits_used,
+            last=row.credits_last_call,
+        )
+        return OddsApiSnapshot(events=events, usage=usage)
+
+    def _store_shared_snapshot(self, snapshot: OddsApiSnapshot, now_ts: float) -> None:
+        if not self._shared_cache_db_url or self._shared_cache_ttl_seconds <= 0:
+            return
+
+        payload = [self._event_to_payload(event) for event in snapshot.events]
+        fetched_at = datetime.fromtimestamp(now_ts, tz=timezone.utc).replace(tzinfo=None)
+
+        session = get_sync_session(self._shared_cache_db_url)
+        try:
+            row = session.execute(
+                select(OddsApiCache).where(OddsApiCache.cache_key == self._cache_key)
+            ).scalar_one_or_none()
+            if row is None:
+                row = OddsApiCache(
+                    cache_key=self._cache_key,
+                    payload=payload,
+                    credits_remaining=snapshot.usage.remaining,
+                    credits_used=snapshot.usage.used,
+                    credits_last_call=snapshot.usage.last,
+                    fetched_at=fetched_at,
+                )
+                session.add(row)
+            else:
+                row.payload = payload
+                row.credits_remaining = snapshot.usage.remaining
+                row.credits_used = snapshot.usage.used
+                row.credits_last_call = snapshot.usage.last
+                row.fetched_at = fetched_at
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _apply_snapshot(
+        self,
+        snapshot: OddsApiSnapshot,
+        raw_markets: list[dict[str, Any]],
+    ) -> None:
+        self._events_by_id = {event.event_id: event for event in snapshot.events}
+        matches = self._matcher.match_all(raw_markets, snapshot.events)
+        self._matches_by_condition = {match.condition_id: match for match in matches}
+        self._stats = ExternalFairStats(
+            odds_events=len(snapshot.events),
+            matched_conditions=len(matches),
+            applied_conditions=0,
+            credits_remaining=snapshot.usage.remaining,
+            credits_used=snapshot.usage.used,
+            credits_last_call=snapshot.usage.last,
+        )
 
     async def refresh_if_needed(
         self,
@@ -230,6 +403,22 @@ class ExternalFairRuntime:
         if not needs_refresh and self._events_by_id:
             return
 
+        cached = self._load_shared_snapshot_with_usage(now_ts)
+        if cached is not None:
+            self._last_refresh_ts = now_ts
+            self._apply_snapshot(cached, raw_markets)
+            logger.info(
+                "external_fair_refreshed",
+                source="db_cache",
+                sports=self._sports,
+                odds_events=self._stats.odds_events,
+                matched_conditions=self._stats.matched_conditions,
+                credits_remaining=self._stats.credits_remaining,
+                credits_used=self._stats.credits_used,
+                credits_last_call=self._stats.credits_last_call,
+            )
+            return
+
         snapshot: OddsApiSnapshot = await self._odds.fetch_events(
             client=client,
             sports=self._sports,
@@ -237,27 +426,17 @@ class ExternalFairRuntime:
             markets=self._markets,
         )
         self._last_refresh_ts = now_ts
-        self._events_by_id = {event.event_id: event for event in snapshot.events}
-
-        matches = self._matcher.match_all(raw_markets, snapshot.events)
-        self._matches_by_condition = {match.condition_id: match for match in matches}
-        self._stats = ExternalFairStats(
-            odds_events=len(snapshot.events),
-            matched_conditions=len(matches),
-            applied_conditions=0,
-            credits_remaining=snapshot.usage.remaining,
-            credits_used=snapshot.usage.used,
-            credits_last_call=snapshot.usage.last,
-        )
-
+        self._store_shared_snapshot(snapshot, now_ts)
+        self._apply_snapshot(snapshot, raw_markets)
         logger.info(
             "external_fair_refreshed",
+            source="api",
             sports=self._sports,
-            odds_events=len(snapshot.events),
-            matched_conditions=len(matches),
-            credits_remaining=snapshot.usage.remaining,
-            credits_used=snapshot.usage.used,
-            credits_last_call=snapshot.usage.last,
+            odds_events=self._stats.odds_events,
+            matched_conditions=self._stats.matched_conditions,
+            credits_remaining=self._stats.credits_remaining,
+            credits_used=self._stats.credits_used,
+            credits_last_call=self._stats.credits_last_call,
         )
 
     def fair_for_snapshot(
@@ -310,8 +489,20 @@ class ExternalFairRuntime:
 class TwoSidedPaperRecorder:
     """Persist and replay two-sided paper fills using existing dashboard tables."""
 
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        strategy_tag: str,
+        run_id: str,
+        min_edge_pct: float,
+        exit_edge_pct: float,
+    ) -> None:
         self._database_url = _ensure_sync_db_url(database_url)
+        self._strategy_tag = strategy_tag
+        self._run_id = run_id
+        self._min_edge_pct = min_edge_pct
+        self._exit_edge_pct = exit_edge_pct
 
     def bootstrap(self) -> None:
         init_db(self._database_url)
@@ -332,6 +523,9 @@ class TwoSidedPaperRecorder:
         restored = 0
         for trade, observation in rows:
             game_state = observation.game_state if isinstance(observation.game_state, dict) else {}
+            strategy_tag = str(game_state.get("strategy_tag") or "default")
+            if strategy_tag != self._strategy_tag:
+                continue
             condition_id = str(game_state.get("condition_id") or observation.match_id or "")
             outcome = str(game_state.get("outcome") or "")
             token_id = str(game_state.get("token_id") or "")
@@ -390,6 +584,10 @@ class TwoSidedPaperRecorder:
 
         game_state = {
             "strategy": "two_sided_inventory",
+            "strategy_tag": self._strategy_tag,
+            "run_id": self._run_id,
+            "min_edge_pct": self._min_edge_pct,
+            "exit_edge_pct": self._exit_edge_pct,
             "condition_id": intent.condition_id,
             "title": intent.title,
             "slug": snapshot.slug if snapshot else "",
@@ -951,6 +1149,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum event match confidence for external fair.",
     )
     parser.add_argument(
+        "--odds-shared-cache",
+        action=argparse.BooleanOptionalAction,
+        default=settings.ODDS_SHARED_CACHE_ENABLED,
+        help="Share Odds API snapshots through DB cache across daemon instances.",
+    )
+    parser.add_argument(
+        "--odds-shared-cache-ttl-seconds",
+        type=float,
+        default=settings.ODDS_SHARED_CACHE_TTL_SECONDS,
+        help="TTL for shared Odds API cache (0 = use --odds-refresh-seconds).",
+    )
+    parser.add_argument(
         "--fair-blend",
         type=float,
         default=settings.TWO_SIDED_EXTERNAL_FAIR_BLEND,
@@ -1027,6 +1237,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Replay persisted two-sided fills at startup to restore inventory state.",
     )
+    parser.add_argument(
+        "--strategy-tag",
+        type=str,
+        default="default",
+        help="Experiment tag for this run (used for DB grouping and replay isolation).",
+    )
+    parser.add_argument(
+        "--db-url",
+        type=str,
+        default=settings.DATABASE_URL,
+        help="Override database URL for paper persistence/reporting.",
+    )
     return parser
 
 
@@ -1051,6 +1273,8 @@ def build_executor_if_needed(autopilot: bool) -> Optional[PolymarketExecutor]:
 async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    strategy_tag = args.strategy_tag.strip() or "default"
+    run_id = f"{strategy_tag}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
     engine = TwoSidedInventoryEngine(
         min_edge_pct=args.min_edge,
@@ -1068,6 +1292,11 @@ async def main() -> None:
     if args.external_fair:
         if not settings.ODDS_API_KEY:
             raise RuntimeError("External fair requires ODDS_API_KEY in .env")
+        shared_cache_ttl = (
+            args.odds_shared_cache_ttl_seconds
+            if args.odds_shared_cache_ttl_seconds > 0
+            else args.odds_refresh_seconds
+        )
         fair_runtime = ExternalFairRuntime(
             api_key=settings.ODDS_API_KEY,
             base_url=settings.ODDS_API_BASE_URL,
@@ -1077,11 +1306,19 @@ async def main() -> None:
             min_refresh_seconds=args.odds_refresh_seconds,
             min_match_confidence=args.odds_min_confidence,
             blend=args.fair_blend,
+            shared_cache_db_url=args.db_url if args.odds_shared_cache else "",
+            shared_cache_ttl_seconds=shared_cache_ttl,
         )
     signal_memory: dict[tuple[str, str, str, int], float] = {}
     paper_recorder: Optional[TwoSidedPaperRecorder] = None
     if args.persist_paper:
-        paper_recorder = TwoSidedPaperRecorder(settings.DATABASE_URL)
+        paper_recorder = TwoSidedPaperRecorder(
+            args.db_url,
+            strategy_tag=strategy_tag,
+            run_id=run_id,
+            min_edge_pct=args.min_edge,
+            exit_edge_pct=args.exit_edge,
+        )
         paper_recorder.bootstrap()
         if args.resume_paper and args.paper_fill and not args.autopilot:
             restored = paper_recorder.replay_into_engine(engine)
@@ -1091,6 +1328,14 @@ async def main() -> None:
                     fills=restored,
                     realized_pnl=engine.get_realized_pnl(),
                 )
+    logger.info(
+        "runner_configuration",
+        strategy_tag=strategy_tag,
+        run_id=run_id,
+        db_url=args.db_url,
+        min_edge_pct=args.min_edge,
+        exit_edge_pct=args.exit_edge,
+    )
 
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:

@@ -274,3 +274,21 @@ class PaperTrade(Base):
 
     def __repr__(self) -> str:
         return f"<PaperTrade(id={self.id}, side={self.side}, size={self.size}, pnl={self.pnl})>"
+
+
+class OddsApiCache(Base):
+    """Shared cache for external odds snapshots across daemon processes."""
+
+    __tablename__ = "odds_api_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cache_key = Column(String(255), nullable=False, unique=True, index=True)
+    payload = Column(JSON, nullable=False, default=list)
+    credits_remaining = Column(Integer, nullable=True)
+    credits_used = Column(Integer, nullable=True)
+    credits_last_call = Column(Integer, nullable=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<OddsApiCache(id={self.id}, key={self.cache_key[:24]}...)>"

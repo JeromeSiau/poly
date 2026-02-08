@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from typing import Any, Optional
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -15,6 +16,8 @@ from sqlalchemy.orm import sessionmaker
 from src.db.models import LiveObservation, PaperTrade
 from src.ml.validation.calibration import reliability_diagram_data
 from src.paper_trading.metrics import PaperTradingMetrics, TradeRecord
+
+TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
 
 
 def load_data(db_path: str = "data/arb.db"):
@@ -35,6 +38,170 @@ def load_data(db_path: str = "data/arb.db"):
 
     session.close()
     return observations, trades
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _observation_game_state(observation: LiveObservation) -> dict[str, Any]:
+    if isinstance(observation.game_state, dict):
+        return observation.game_state
+    return {}
+
+
+def extract_two_sided_trade_rows(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> list[dict[str, Any]]:
+    """Build normalized rows for two-sided experiment analysis."""
+    obs_by_id = {obs.id: obs for obs in observations}
+    rows: list[dict[str, Any]] = []
+
+    for trade in trades:
+        obs = obs_by_id.get(trade.observation_id)
+        if obs is None or obs.event_type != TWO_SIDED_EVENT_TYPE:
+            continue
+
+        state = _observation_game_state(obs)
+        strategy_tag = str(state.get("strategy_tag") or "default")
+        condition_id = str(state.get("condition_id") or obs.match_id or "")
+        if not condition_id:
+            continue
+
+        fill_price = _safe_float(
+            trade.simulated_fill_price if trade.simulated_fill_price is not None else trade.entry_price,
+            default=0.0,
+        )
+        size_usd = _safe_float(trade.size, default=0.0)
+        shares = _safe_float(state.get("shares"), default=0.0)
+        if shares <= 0 and fill_price > 0:
+            shares = size_usd / fill_price
+
+        side = str(trade.side or state.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            continue
+        signed_shares = shares if side == "BUY" else -shares
+
+        rows.append(
+            {
+                "observation_id": obs.id,
+                "trade_id": trade.id,
+                "timestamp": trade.created_at or obs.timestamp,
+                "strategy_tag": strategy_tag,
+                "condition_id": condition_id,
+                "title": str(state.get("title") or condition_id),
+                "outcome": str(state.get("outcome") or ""),
+                "side": side,
+                "shares": shares,
+                "signed_shares": signed_shares,
+                "size_usd": size_usd,
+                "edge_theoretical": _safe_float(trade.edge_theoretical),
+                "edge_realized": _safe_float(trade.edge_realized),
+                "pnl": _safe_float(trade.pnl),
+            }
+        )
+    return rows
+
+
+def available_two_sided_tags(rows: list[dict[str, Any]]) -> list[str]:
+    tags = sorted({str(row.get("strategy_tag", "")).strip() for row in rows if row.get("strategy_tag")})
+    return [tag for tag in tags if tag]
+
+
+def filter_scope_by_strategy_tag(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+    strategy_tag: str,
+) -> tuple[list[LiveObservation], list[PaperTrade]]:
+    if strategy_tag == "All":
+        return observations, trades
+
+    obs_ids: set[int] = set()
+    filtered_observations: list[LiveObservation] = []
+    for obs in observations:
+        if obs.event_type != TWO_SIDED_EVENT_TYPE:
+            continue
+        state = _observation_game_state(obs)
+        tag = str(state.get("strategy_tag") or "default")
+        if tag == strategy_tag:
+            filtered_observations.append(obs)
+            if obs.id is not None:
+                obs_ids.add(int(obs.id))
+
+    filtered_trades = [trade for trade in trades if int(trade.observation_id) in obs_ids]
+    return filtered_observations, filtered_trades
+
+
+def summarize_two_sided_pairs(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Aggregate two-sided rows by strategy tag and condition."""
+    if not rows:
+        return pd.DataFrame()
+
+    buckets: dict[tuple[str, str, str], dict[str, float]] = {}
+    for row in rows:
+        key = (
+            str(row.get("strategy_tag") or "default"),
+            str(row.get("condition_id") or ""),
+            str(row.get("title") or ""),
+        )
+        cur = buckets.get(key)
+        if cur is None:
+            cur = {
+                "trades": 0.0,
+                "sells": 0.0,
+                "win_sells": 0.0,
+                "realized_pnl": 0.0,
+                "gross_notional": 0.0,
+                "net_shares": 0.0,
+                "sum_edge_theoretical": 0.0,
+                "sum_edge_realized_sells": 0.0,
+            }
+            buckets[key] = cur
+
+        side = str(row.get("side") or "")
+        pnl = _safe_float(row.get("pnl"))
+        cur["trades"] += 1
+        cur["realized_pnl"] += pnl
+        cur["gross_notional"] += _safe_float(row.get("size_usd"))
+        cur["net_shares"] += _safe_float(row.get("signed_shares"))
+        cur["sum_edge_theoretical"] += _safe_float(row.get("edge_theoretical"))
+        if side == "SELL":
+            cur["sells"] += 1
+            cur["sum_edge_realized_sells"] += _safe_float(row.get("edge_realized"))
+            if pnl > 0:
+                cur["win_sells"] += 1
+
+    summary_rows: list[dict[str, Any]] = []
+    for (tag, condition_id, title), cur in buckets.items():
+        sells = int(cur["sells"])
+        trades = int(cur["trades"])
+        win_rate = (cur["win_sells"] / sells) if sells > 0 else 0.0
+        avg_edge_theoretical = (cur["sum_edge_theoretical"] / trades) if trades > 0 else 0.0
+        avg_edge_realized_sells = (cur["sum_edge_realized_sells"] / sells) if sells > 0 else 0.0
+        summary_rows.append(
+            {
+                "strategy_tag": tag,
+                "condition_id": condition_id,
+                "title": title,
+                "trades": trades,
+                "sells": sells,
+                "win_rate_sells": win_rate,
+                "realized_pnl": cur["realized_pnl"],
+                "gross_notional": cur["gross_notional"],
+                "net_shares": cur["net_shares"],
+                "avg_edge_theoretical": avg_edge_theoretical,
+                "avg_edge_realized_sells": avg_edge_realized_sells,
+            }
+        )
+
+    return pd.DataFrame(summary_rows).sort_values(
+        ["strategy_tag", "realized_pnl"],
+        ascending=[True, False],
+    )
 
 
 def create_pnl_chart(trades: list[PaperTrade]) -> go.Figure:
@@ -299,8 +466,27 @@ def main():
         observations = []
         trades = []
 
+    two_sided_rows = extract_two_sided_trade_rows(observations, trades)
+    two_sided_tags = available_two_sided_tags(two_sided_rows)
+    selected_tag = st.sidebar.selectbox(
+        "Strategy Tag",
+        ["All"] + two_sided_tags,
+        help="Filter dashboard to one two-sided experiment tag.",
+    )
+
+    observations_view, trades_view = filter_scope_by_strategy_tag(
+        observations=observations,
+        trades=trades,
+        strategy_tag=selected_tag,
+    )
+    two_sided_rows_view = [
+        row for row in two_sided_rows
+        if selected_tag == "All" or row.get("strategy_tag") == selected_tag
+    ]
+    two_sided_summary_df = summarize_two_sided_pairs(two_sided_rows_view)
+
     # Calculate metrics
-    metrics = calculate_metrics(trades)
+    metrics = calculate_metrics(trades_view)
 
     # Overview metrics
     st.header("Overview")
@@ -334,34 +520,65 @@ def main():
 
     with col_left:
         st.subheader("P&L Over Time")
-        if trades:
-            fig_pnl = create_pnl_chart(trades)
+        if trades_view:
+            fig_pnl = create_pnl_chart(trades_view)
             st.plotly_chart(fig_pnl, use_container_width=True)
         else:
             st.info("No trades yet")
 
     with col_right:
         st.subheader("Edge Analysis")
-        fig_edge = create_edge_analysis_chart(trades)
+        fig_edge = create_edge_analysis_chart(trades_view)
         st.plotly_chart(fig_edge, use_container_width=True)
 
     st.divider()
 
     # Calibration
     st.subheader("Model Calibration")
-    fig_calibration = create_reliability_diagram(observations)
+    fig_calibration = create_reliability_diagram(observations_view)
     st.plotly_chart(fig_calibration, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("Two-Sided P&L By Pair")
+    if two_sided_summary_df.empty:
+        st.info("No two-sided rows for current filter.")
+    else:
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric("Pairs", int(two_sided_summary_df.shape[0]))
+        col_b.metric("Two-Sided Trades", int(len(two_sided_rows_view)))
+        col_c.metric("Realized P&L", f"${two_sided_summary_df['realized_pnl'].sum():,.2f}")
+        open_pairs = int((two_sided_summary_df["net_shares"].abs() > 1e-9).sum())
+        col_d.metric("Open Pairs", open_pairs)
+
+        st.caption("Best pairs (realized P&L)")
+        top_pairs = two_sided_summary_df.nlargest(20, "realized_pnl").copy()
+        top_pairs["win_rate_sells"] = top_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
+        top_pairs["avg_edge_theoretical"] = top_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
+        top_pairs["avg_edge_realized_sells"] = top_pairs["avg_edge_realized_sells"].map(lambda x: f"{x:.2%}")
+        st.dataframe(top_pairs, use_container_width=True, hide_index=True)
+
+        st.caption("Worst pairs (realized P&L)")
+        worst_pairs = two_sided_summary_df.nsmallest(20, "realized_pnl").copy()
+        worst_pairs["win_rate_sells"] = worst_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
+        worst_pairs["avg_edge_theoretical"] = worst_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
+        worst_pairs["avg_edge_realized_sells"] = worst_pairs["avg_edge_realized_sells"].map(lambda x: f"{x:.2%}")
+        st.dataframe(worst_pairs, use_container_width=True, hide_index=True)
 
     st.divider()
 
     # Recent Trades table
     st.subheader("Recent Trades")
 
-    if trades:
-        recent = sorted(trades, key=lambda t: t.created_at, reverse=True)[:20]
+    if trades_view:
+        recent = sorted(trades_view, key=lambda t: t.created_at, reverse=True)[:20]
+        obs_by_id = {obs.id: obs for obs in observations}
         trade_df = pd.DataFrame([
             {
                 "Time": t.created_at.strftime("%Y-%m-%d %H:%M") if t.created_at else "N/A",
+                "Tag": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("strategy_tag") or "")
+                if obs_by_id.get(t.observation_id) is not None
+                else "",
                 "Side": t.side,
                 "Entry Price": f"{t.entry_price:.2%}" if t.entry_price else "N/A",
                 "Fill Price": f"{t.simulated_fill_price:.2%}" if t.simulated_fill_price else "N/A",
@@ -379,12 +596,13 @@ def main():
     # Recent Observations
     st.subheader("Recent Observations")
 
-    if observations:
-        recent_obs = sorted(observations, key=lambda o: o.created_at, reverse=True)[:20]
+    if observations_view:
+        recent_obs = sorted(observations_view, key=lambda o: o.created_at, reverse=True)[:20]
         obs_df = pd.DataFrame([
             {
                 "Time": o.timestamp.strftime("%Y-%m-%d %H:%M") if o.timestamp else "N/A",
                 "Match": o.match_id[:20] + "..." if len(o.match_id) > 20 else o.match_id,
+                "Tag": str(_observation_game_state(o).get("strategy_tag") or ""),
                 "Event": o.event_type,
                 "Model Pred": f"{o.model_prediction:.2%}" if o.model_prediction else "N/A",
                 "Market Price": f"{o.polymarket_price:.2%}" if o.polymarket_price else "N/A",

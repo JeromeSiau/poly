@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     ODDS_API_MARKETS: str = "h2h"
     ODDS_API_MIN_REFRESH_SECONDS: float = 14400.0
     ODDS_MATCH_MIN_CONFIDENCE: float = 0.68
+    ODDS_SHARED_CACHE_ENABLED: bool = True
+    ODDS_SHARED_CACHE_TTL_SECONDS: float = 0.0
 
     # === Telegram ===
     TELEGRAM_BOT_TOKEN: str = ""
