@@ -10,6 +10,7 @@ from src.analysis.rn1_comparison import (
     DEFAULT_RN1_WALLET,
     build_comparison_report,
     build_rn1_transaction_report,
+    build_rn1_vs_local_condition_report,
 )
 
 app = FastAPI(title="RN1 Comparison API", version="1.0.0")
@@ -72,3 +73,27 @@ def compare_rn1_transactions(
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"transactions_analysis_failed: {exc}") from exc
+
+
+@app.get("/compare/rn1/conditions-vs-local")
+def compare_rn1_conditions_vs_local(
+    db: str = Query(default="data/arb.db", description="SQLite path or SQLAlchemy URL."),
+    hours: float = Query(default=6.0, ge=0.1, le=168.0, description="Analysis window in hours."),
+    strategy_tag: Optional[str] = Query(default=None, description="Optional local strategy tag filter."),
+    rn1_wallet: str = Query(default=DEFAULT_RN1_WALLET, description="RN1 wallet (or another benchmark wallet)."),
+    page_limit: int = Query(default=500, ge=50, le=500, description="Rows per RN1 activity page."),
+    max_pages: int = Query(default=7, ge=1, le=20, description="Max RN1 activity pages to fetch."),
+    top_conditions: int = Query(default=100, ge=5, le=500, description="Rows kept for each top table."),
+) -> dict:
+    try:
+        return build_rn1_vs_local_condition_report(
+            db_url=db,
+            window_hours=hours,
+            strategy_tag=strategy_tag,
+            rn1_wallet=rn1_wallet,
+            page_limit=page_limit,
+            max_pages=max_pages,
+            top_conditions=top_conditions,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"conditions_vs_local_failed: {exc}") from exc

@@ -440,6 +440,15 @@ def _ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    qq = max(0.0, min(1.0, q))
+    ordered = sorted(values)
+    idx = int(round((len(ordered) - 1) * qq))
+    return float(ordered[idx])
+
+
 def build_gaps(local: dict[str, Any], rn1: dict[str, Any]) -> dict[str, float]:
     """Compute key behavior gaps between local strategy and RN1."""
     return {
@@ -786,6 +795,28 @@ def build_rn1_transaction_report(
     end_ts = int(rows[-1]["timestamp"])
     span_seconds = max(1, end_ts - start_ts)
 
+    trade_usdc_values = [
+        _safe_float(row.get("usdc_size"))
+        for row in rows
+        if str(row.get("type")) == "TRADE"
+    ]
+    pair_cost_values = [
+        _safe_float(item.get("pair_cost_est"))
+        for item in condition_rows
+        if item.get("pair_cost_est") is not None
+    ]
+    locked_edge_values = [
+        _safe_float(item.get("locked_edge_est"))
+        for item in condition_rows
+        if _safe_float(item.get("locked_edge_est")) > 0
+    ]
+    merge_lag_values = [
+        _safe_float(item.get("merge_lag_sec_median"))
+        for item in condition_rows
+        if item.get("merge_lag_sec_median") is not None
+    ]
+    trade_count_values = [int(item.get("trade_count") or 0) for item in condition_rows]
+
     summary = {
         "events_total": len(rows),
         "trade_count": int(type_counts.get("TRADE", 0)),
@@ -807,20 +838,61 @@ def build_rn1_transaction_report(
             sum(1 for item in condition_rows if bool(item.get("is_multi_outcome"))),
             len(cond_stats),
         ),
-        "trade_usdc_median": median(
-            [_safe_float(row.get("usdc_size")) for row in rows if str(row.get("type")) == "TRADE"]
-        ) if type_counts.get("TRADE", 0) > 0 else 0.0,
-        "trade_usdc_p90": sorted(
-            [_safe_float(row.get("usdc_size")) for row in rows if str(row.get("type")) == "TRADE"]
-        )[max(0, int(math.ceil(type_counts.get("TRADE", 0) * 0.9)) - 1)]
-        if type_counts.get("TRADE", 0) > 0
-        else 0.0,
+        "trade_usdc_median": median(trade_usdc_values) if trade_usdc_values else 0.0,
+        "trade_usdc_p90": _quantile(trade_usdc_values, 0.90),
         "events_per_minute_window": len(rows) / (safe_window * 60.0),
         "events_per_minute_active": len(rows) / (span_seconds / 60.0),
         "max_events_per_minute": max(per_minute_counts.values()) if per_minute_counts else 0,
         "window_start_ts": start_ts,
         "window_end_ts": end_ts,
         "active_span_seconds": span_seconds,
+    }
+
+    league_buy_usdc: Counter[str] = Counter()
+    market_type_buy_usdc: Counter[str] = Counter()
+    for item in condition_rows:
+        buy_usdc = _safe_float(item.get("buy_usdc"))
+        league_buy_usdc[str(item.get("league_prefix") or "unknown")] += buy_usdc
+        market_type_buy_usdc[str(item.get("market_type") or "other")] += buy_usdc
+
+    total_buy_usdc = sum(league_buy_usdc.values())
+    dominant_leagues = league_buy_usdc.most_common(8)
+    dominant_market_types = market_type_buy_usdc.most_common(8)
+    inferred_league_filter = [
+        league
+        for league, amt in dominant_leagues
+        if total_buy_usdc > 0 and (amt / total_buy_usdc) >= 0.05
+    ]
+    inferred_market_filter = [
+        market_type
+        for market_type, amt in dominant_market_types
+        if total_buy_usdc > 0 and (amt / total_buy_usdc) >= 0.08
+    ]
+    method_inference = {
+        "dominant_leagues_by_buy_usdc": dict(dominant_leagues),
+        "dominant_market_types_by_buy_usdc": dict(dominant_market_types),
+        "pair_cost_est_median": median(pair_cost_values) if pair_cost_values else 0.0,
+        "pair_cost_est_p25": _quantile(pair_cost_values, 0.25),
+        "pair_cost_est_p75": _quantile(pair_cost_values, 0.75),
+        "locked_edge_est_median": median(locked_edge_values) if locked_edge_values else 0.0,
+        "locked_edge_est_p75": _quantile(locked_edge_values, 0.75),
+        "merge_lag_sec_median": median(merge_lag_values) if merge_lag_values else 0.0,
+        "condition_trade_count_median": median(trade_count_values) if trade_count_values else 0.0,
+        "condition_trade_count_p75": _quantile([float(v) for v in trade_count_values], 0.75),
+        "inferred_filters": {
+            "league_prefix_in": inferred_league_filter,
+            "market_type_in": inferred_market_filter,
+            "pair_cost_est_max": _quantile(pair_cost_values, 0.75) if pair_cost_values else 1.0,
+            "trade_usdc_median_band": {
+                "min": _quantile(trade_usdc_values, 0.25),
+                "max": _quantile(trade_usdc_values, 0.75),
+            },
+        },
+        "notes": [
+            "RN1 est quasi exclusivement BUY puis MERGE/REDEEM.",
+            "Les conditions multi-outcome sont prioritaires pour constituer des complete sets.",
+            "Les merges sont utilises pour realiser le lock-in sur le spread Yes+No.",
+        ],
     }
 
     return {
@@ -842,8 +914,225 @@ def build_rn1_transaction_report(
             "price_bucket_counts": dict(price_bucket_counts),
             "outcome_top": dict(outcome_counts.most_common(20)),
         },
+        "method_inference": method_inference,
         "conditions": condition_rows[: max(1, int(top_conditions))],
         "transactions": enriched_rows,
+    }
+
+
+def aggregate_local_conditions(
+    *,
+    db_url: str,
+    window_hours: float,
+    strategy_tag: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Aggregate local two-sided events per condition."""
+    events = load_local_two_sided_events(
+        db_url=db_url,
+        window_hours=window_hours,
+        strategy_tag=strategy_tag,
+    )
+    by_condition: dict[str, dict[str, Any]] = {}
+    for item in events:
+        cid = str(item.condition_id or "")
+        if not cid:
+            continue
+        cur = by_condition.get(cid)
+        if cur is None:
+            cur = {
+                "condition_id": cid,
+                "events": 0,
+                "buy_count": 0,
+                "sell_count": 0,
+                "buy_usdc": 0.0,
+                "sell_usdc": 0.0,
+                "total_usdc": 0.0,
+                "outcomes_seen": set(),
+                "reasons": Counter(),
+                "strategy_tags": Counter(),
+            }
+            by_condition[cid] = cur
+        cur["events"] += 1
+        cur["total_usdc"] += _safe_float(item.size_usd)
+        cur["outcomes_seen"].add(item.outcome or "__unknown__")
+        cur["reasons"][item.reason or "unknown"] += 1
+        cur["strategy_tags"][item.strategy_tag or "default"] += 1
+        if item.side == "BUY":
+            cur["buy_count"] += 1
+            cur["buy_usdc"] += _safe_float(item.size_usd)
+        elif item.side == "SELL":
+            cur["sell_count"] += 1
+            cur["sell_usdc"] += _safe_float(item.size_usd)
+
+    rows: list[dict[str, Any]] = []
+    for cur in by_condition.values():
+        rows.append(
+            {
+                "condition_id": cur["condition_id"],
+                "events": int(cur["events"]),
+                "buy_count": int(cur["buy_count"]),
+                "sell_count": int(cur["sell_count"]),
+                "buy_usdc": float(cur["buy_usdc"]),
+                "sell_usdc": float(cur["sell_usdc"]),
+                "total_usdc": float(cur["total_usdc"]),
+                "outcomes_seen_count": int(len(cur["outcomes_seen"])),
+                "reasons": dict(cur["reasons"]),
+                "strategy_tags": dict(cur["strategy_tags"]),
+            }
+        )
+    rows.sort(key=lambda item: (item.get("events") or 0, item.get("total_usdc") or 0), reverse=True)
+    return rows
+
+
+def build_rn1_vs_local_condition_report(
+    *,
+    db_url: str,
+    window_hours: float = 6.0,
+    strategy_tag: Optional[str] = None,
+    rn1_wallet: str = DEFAULT_RN1_WALLET,
+    page_limit: int = 500,
+    max_pages: int = 7,
+    top_conditions: int = 100,
+) -> dict[str, Any]:
+    """Compare RN1 conditions with local conditions by exact condition_id."""
+    safe_window = max(0.1, float(window_hours))
+    rn1_report = build_rn1_transaction_report(
+        window_hours=safe_window,
+        rn1_wallet=rn1_wallet,
+        page_limit=page_limit,
+        max_pages=max_pages,
+        include_transactions=False,
+        top_conditions=5000,
+    )
+    rn1_conditions = rn1_report.get("conditions", [])
+    local_conditions = aggregate_local_conditions(
+        db_url=db_url,
+        window_hours=safe_window,
+        strategy_tag=strategy_tag,
+    )
+
+    rn1_by_cid = {str(item.get("condition_id")): item for item in rn1_conditions}
+    local_by_cid = {str(item.get("condition_id")): item for item in local_conditions}
+    rn1_ids = set(rn1_by_cid.keys())
+    local_ids = set(local_by_cid.keys())
+    overlap_ids = rn1_ids & local_ids
+    rn1_only_ids = rn1_ids - local_ids
+    local_only_ids = local_ids - rn1_ids
+
+    overlap: list[dict[str, Any]] = []
+    for cid in overlap_ids:
+        r = rn1_by_cid[cid]
+        l = local_by_cid[cid]
+        overlap.append(
+            {
+                "condition_id": cid,
+                "title": r.get("title"),
+                "event_slug": r.get("event_slug"),
+                "league_prefix": r.get("league_prefix"),
+                "market_type": r.get("market_type"),
+                "rn1_trade_count": int(r.get("trade_count") or 0),
+                "rn1_merge_count": int(r.get("merge_count") or 0),
+                "rn1_buy_usdc": float(r.get("buy_usdc") or 0.0),
+                "rn1_locked_edge_est": float(r.get("locked_edge_est") or 0.0),
+                "rn1_locked_pnl_est": float(r.get("locked_pnl_est") or 0.0),
+                "local_events": int(l.get("events") or 0),
+                "local_buy_count": int(l.get("buy_count") or 0),
+                "local_sell_count": int(l.get("sell_count") or 0),
+                "local_buy_usdc": float(l.get("buy_usdc") or 0.0),
+                "local_sell_usdc": float(l.get("sell_usdc") or 0.0),
+                "local_total_usdc": float(l.get("total_usdc") or 0.0),
+                "local_reason_top": dict(sorted((l.get("reasons") or {}).items(), key=lambda kv: kv[1], reverse=True)[:5]),
+                "activity_ratio_local_vs_rn1": _ratio(
+                    float(l.get("events") or 0.0),
+                    float(r.get("events") or 0.0),
+                ),
+                "buy_usdc_ratio_local_vs_rn1": _ratio(
+                    float(l.get("buy_usdc") or 0.0),
+                    float(r.get("buy_usdc") or 0.0),
+                ),
+            }
+        )
+    overlap.sort(
+        key=lambda item: (item.get("rn1_buy_usdc") or 0.0, item.get("rn1_trade_count") or 0),
+        reverse=True,
+    )
+
+    rn1_only = [
+        {
+            "condition_id": cid,
+            "title": rn1_by_cid[cid].get("title"),
+            "event_slug": rn1_by_cid[cid].get("event_slug"),
+            "league_prefix": rn1_by_cid[cid].get("league_prefix"),
+            "market_type": rn1_by_cid[cid].get("market_type"),
+            "rn1_trade_count": int(rn1_by_cid[cid].get("trade_count") or 0),
+            "rn1_merge_count": int(rn1_by_cid[cid].get("merge_count") or 0),
+            "rn1_buy_usdc": float(rn1_by_cid[cid].get("buy_usdc") or 0.0),
+            "rn1_locked_edge_est": float(rn1_by_cid[cid].get("locked_edge_est") or 0.0),
+            "rn1_locked_pnl_est": float(rn1_by_cid[cid].get("locked_pnl_est") or 0.0),
+        }
+        for cid in rn1_only_ids
+    ]
+    rn1_only.sort(
+        key=lambda item: (item.get("rn1_buy_usdc") or 0.0, item.get("rn1_trade_count") or 0),
+        reverse=True,
+    )
+
+    local_only = [
+        {
+            "condition_id": cid,
+            "local_events": int(local_by_cid[cid].get("events") or 0),
+            "local_buy_count": int(local_by_cid[cid].get("buy_count") or 0),
+            "local_sell_count": int(local_by_cid[cid].get("sell_count") or 0),
+            "local_buy_usdc": float(local_by_cid[cid].get("buy_usdc") or 0.0),
+            "local_total_usdc": float(local_by_cid[cid].get("total_usdc") or 0.0),
+            "local_reason_top": dict(
+                sorted((local_by_cid[cid].get("reasons") or {}).items(), key=lambda kv: kv[1], reverse=True)[:5]
+            ),
+        }
+        for cid in local_only_ids
+    ]
+    local_only.sort(
+        key=lambda item: (item.get("local_events") or 0, item.get("local_total_usdc") or 0.0),
+        reverse=True,
+    )
+
+    overlap_ratio_vs_rn1 = _ratio(len(overlap_ids), len(rn1_ids))
+    recos: list[str] = []
+    if overlap_ratio_vs_rn1 < 0.15:
+        recos.append(
+            "Tu joues trop peu de conditions RN1 (overlap faible). Priorite: reproduire son universe de conditions avant d'ajuster les edges."
+        )
+    if overlap:
+        median_activity_ratio = median([_safe_float(item.get("activity_ratio_local_vs_rn1")) for item in overlap])
+        if median_activity_ratio < 0.20:
+            recos.append(
+                "Sur les conditions communes, ton intensite est beaucoup plus faible. Augmente la frequence d'execution sur les memes conditions."
+            )
+    if not recos:
+        recos.append("Overlap et intensite deviennent proches. Prochaine etape: comparer la qualite de prix et la latence condition par condition.")
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": safe_window,
+        "filters": {
+            "db_url": db_url,
+            "strategy_tag": strategy_tag,
+            "rn1_wallet": rn1_wallet,
+            "page_limit": int(page_limit),
+            "max_pages": int(max_pages),
+        },
+        "summary": {
+            "rn1_conditions": len(rn1_ids),
+            "local_conditions": len(local_ids),
+            "overlap_conditions": len(overlap_ids),
+            "rn1_only_conditions": len(rn1_only_ids),
+            "local_only_conditions": len(local_only_ids),
+            "overlap_ratio_vs_rn1": overlap_ratio_vs_rn1,
+        },
+        "recommendations": recos,
+        "overlap_top": overlap[: max(1, int(top_conditions))],
+        "rn1_only_top": rn1_only[: max(1, int(top_conditions))],
+        "local_only_top": local_only[: max(1, int(top_conditions))],
     }
 
 

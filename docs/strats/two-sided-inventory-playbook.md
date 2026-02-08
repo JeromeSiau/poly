@@ -160,6 +160,12 @@ Sorties:
 - `reports/rn1/rn1_conditions_*.csv`
 - `reports/rn1/rn1_transactions_*.csv`
 
+Comparaison des conditions RN1 vs tes conditions:
+
+```bash
+uv run python scripts/compare_rn1_conditions_vs_local.py --db data/arb.db --hours 6 --strategy-tag edge_1p5_0p3
+```
+
 ### 9.2 Endpoint API (pour dashboard externe / automation)
 
 Lancer:
@@ -173,6 +179,7 @@ Endpoints:
 - `GET /health`
 - `GET /compare/rn1?db=data/arb.db&hours=6&strategy_tag=edge_1p5_0p3`
 - `GET /compare/rn1/transactions?hours=6&include_transactions=true`
+- `GET /compare/rn1/conditions-vs-local?db=data/arb.db&hours=6&strategy_tag=edge_1p5_0p3`
 
 Exemple:
 

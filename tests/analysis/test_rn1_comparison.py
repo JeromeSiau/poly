@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.analysis.rn1_comparison import (
     ActivityEvent,
     build_rn1_transaction_report,
+    build_rn1_vs_local_condition_report,
     build_gaps,
     build_recommendations,
     fetch_rn1_activity,
@@ -313,3 +314,88 @@ def test_build_rn1_transaction_report_enriches_conditions(monkeypatch: pytest.Mo
     assert len(tx_rows) == 3
     assert tx_rows[-1]["type"] == "MERGE"
     assert tx_rows[-1]["seconds_since_last_trade_same_condition"] == 50
+
+
+def test_build_rn1_vs_local_condition_report_computes_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.analysis.rn1_comparison.build_rn1_transaction_report",
+        lambda **kwargs: {
+            "conditions": [
+                {
+                    "condition_id": "cond-a",
+                    "title": "A vs B",
+                    "event_slug": "epl-a-b-2026",
+                    "league_prefix": "epl",
+                    "market_type": "winner",
+                    "events": 20,
+                    "trade_count": 18,
+                    "merge_count": 2,
+                    "buy_usdc": 180.0,
+                    "locked_edge_est": 0.05,
+                    "locked_pnl_est": 9.0,
+                },
+                {
+                    "condition_id": "cond-b",
+                    "title": "C vs D",
+                    "event_slug": "fl1-c-d-2026",
+                    "league_prefix": "fl1",
+                    "market_type": "draw",
+                    "events": 30,
+                    "trade_count": 30,
+                    "merge_count": 0,
+                    "buy_usdc": 300.0,
+                    "locked_edge_est": 0.0,
+                    "locked_pnl_est": 0.0,
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "src.analysis.rn1_comparison.aggregate_local_conditions",
+        lambda **kwargs: [
+            {
+                "condition_id": "cond-a",
+                "events": 10,
+                "buy_count": 6,
+                "sell_count": 4,
+                "buy_usdc": 60.0,
+                "sell_usdc": 40.0,
+                "total_usdc": 100.0,
+                "reasons": {"under_fair": 6, "over_fair": 4},
+                "strategy_tags": {"edge_1p5_0p3": 10},
+            },
+            {
+                "condition_id": "cond-local-only",
+                "events": 5,
+                "buy_count": 3,
+                "sell_count": 2,
+                "buy_usdc": 20.0,
+                "sell_usdc": 10.0,
+                "total_usdc": 30.0,
+                "reasons": {"under_fair": 3},
+                "strategy_tags": {"edge_1p5_0p3": 5},
+            },
+        ],
+    )
+
+    report = build_rn1_vs_local_condition_report(
+        db_url="data/arb.db",
+        window_hours=6.0,
+        strategy_tag="edge_1p5_0p3",
+        top_conditions=20,
+    )
+    summary = report["summary"]
+    assert summary["rn1_conditions"] == 2
+    assert summary["local_conditions"] == 2
+    assert summary["overlap_conditions"] == 1
+    assert summary["rn1_only_conditions"] == 1
+    assert summary["local_only_conditions"] == 1
+    assert summary["overlap_ratio_vs_rn1"] == pytest.approx(0.5, rel=1e-9)
+
+    overlap = report["overlap_top"][0]
+    assert overlap["condition_id"] == "cond-a"
+    assert overlap["activity_ratio_local_vs_rn1"] == pytest.approx(0.5, rel=1e-9)
+    assert overlap["buy_usdc_ratio_local_vs_rn1"] == pytest.approx(60.0 / 180.0, rel=1e-9)
+
+    rn1_only = report["rn1_only_top"][0]
+    assert rn1_only["condition_id"] == "cond-b"
