@@ -16,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from src.db.models import LiveObservation, PaperTrade
 
 DATA_API_ACTIVITY = "https://data-api.polymarket.com/activity"
+DATA_API_ACTIVITY_MAX_OFFSET = 3000
 DEFAULT_RN1_WALLET = "0x2005d16a84ceefa912d4e380cd32e7ff827875ea"
 TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
 
@@ -139,7 +140,7 @@ def fetch_rn1_activity(
     wallet: str,
     window_hours: float,
     page_limit: int = 500,
-    max_pages: int = 8,
+    max_pages: int = 7,
     timeout_seconds: float = 25.0,
 ) -> list[ActivityEvent]:
     """Fetch RN1 activity from Polymarket data API."""
@@ -149,15 +150,24 @@ def fetch_rn1_activity(
     with httpx.Client(timeout=timeout_seconds) as client:
         for page in range(max(1, max_pages)):
             offset = page * page_limit
-            resp = client.get(
-                DATA_API_ACTIVITY,
-                params={
-                    "user": wallet,
-                    "limit": max(1, page_limit),
-                    "offset": max(0, offset),
-                },
-            )
-            resp.raise_for_status()
+            if offset > DATA_API_ACTIVITY_MAX_OFFSET:
+                break
+            try:
+                resp = client.get(
+                    DATA_API_ACTIVITY,
+                    params={
+                        "user": wallet,
+                        "limit": max(1, page_limit),
+                        "offset": max(0, offset),
+                    },
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                # Activity pagination currently hard-fails (400) beyond a max offset.
+                # Stop gracefully and keep data collected so far.
+                if exc.response is not None and exc.response.status_code == 400:
+                    break
+                raise
             payload = resp.json()
             if not isinstance(payload, list) or not payload:
                 break
@@ -378,7 +388,7 @@ def build_comparison_report(
     strategy_tag: Optional[str] = None,
     rn1_wallet: str = DEFAULT_RN1_WALLET,
     page_limit: int = 500,
-    max_pages: int = 8,
+    max_pages: int = 7,
 ) -> dict[str, Any]:
     """Build a local-vs-RN1 comparison report."""
     safe_window = max(0.1, float(window_hours))
@@ -413,4 +423,3 @@ def build_comparison_report(
         "gaps": gaps,
         "recommendations": recos,
     }
-

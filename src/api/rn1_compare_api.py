@@ -23,7 +23,7 @@ def compare_rn1(
     strategy_tag: Optional[str] = Query(default=None, description="Optional local strategy tag filter."),
     rn1_wallet: str = Query(default=DEFAULT_RN1_WALLET, description="RN1 wallet (or another benchmark wallet)."),
     page_limit: int = Query(default=500, ge=50, le=500, description="Rows per RN1 activity page."),
-    max_pages: int = Query(default=8, ge=1, le=20, description="Max RN1 activity pages to fetch."),
+    max_pages: int = Query(default=7, ge=1, le=20, description="Max RN1 activity pages to fetch."),
 ) -> dict:
     try:
         return build_comparison_report(
@@ -36,4 +36,3 @@ def compare_rn1(
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"comparison_failed: {exc}") from exc
-

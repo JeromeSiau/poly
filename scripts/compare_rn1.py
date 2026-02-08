@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy-tag", type=str, default=None, help="Optional local strategy_tag filter.")
     parser.add_argument("--rn1-wallet", type=str, default=DEFAULT_RN1_WALLET, help="Benchmark wallet address.")
     parser.add_argument("--page-limit", type=int, default=500, help="Rows fetched per page for RN1 activity.")
-    parser.add_argument("--max-pages", type=int, default=8, help="Maximum pages fetched for RN1 activity.")
+    parser.add_argument("--max-pages", type=int, default=7, help="Maximum pages fetched for RN1 activity.")
     parser.add_argument("--json-out", type=str, default=None, help="Optional path to save JSON report.")
     return parser
 
@@ -107,4 +107,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

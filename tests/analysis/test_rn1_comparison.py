@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -9,6 +10,7 @@ from src.analysis.rn1_comparison import (
     ActivityEvent,
     build_gaps,
     build_recommendations,
+    fetch_rn1_activity,
     summarize_behavior,
 )
 
@@ -102,3 +104,61 @@ def test_build_gaps_and_recommendations_flag_main_gaps() -> None:
     assert "deux-cotes" in joined
     assert "sorties" in joined
     assert "ticket" in joined
+
+
+def test_fetch_rn1_activity_stops_gracefully_on_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Resp:
+        def __init__(self, payload, status_code: int = 200):
+            self._payload = payload
+            self.status_code = status_code
+            self.request = httpx.Request("GET", "https://data-api.polymarket.com/activity")
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"{self.status_code}",
+                    request=self.request,
+                    response=httpx.Response(self.status_code, request=self.request),
+                )
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, params=None):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    [
+                        {
+                            "timestamp": 1770570981,
+                            "conditionId": "cond-1",
+                            "type": "TRADE",
+                            "usdcSize": 12.0,
+                            "side": "BUY",
+                            "outcome": "Yes",
+                        }
+                    ],
+                    status_code=200,
+                )
+            return _Resp([], status_code=400)
+
+    monkeypatch.setattr("src.analysis.rn1_comparison.httpx.Client", _Client)
+
+    rows = fetch_rn1_activity(
+        wallet="0xabc",
+        window_hours=48.0,
+        page_limit=500,
+        max_pages=8,
+    )
+    assert len(rows) == 1
+    assert rows[0].condition_id == "cond-1"
