@@ -228,6 +228,108 @@ def summarize_two_sided_pairs(rows: list[dict[str, Any]]) -> pd.DataFrame:
     )
 
 
+def summarize_two_sided_by_tag(
+    rows: list[dict[str, Any]],
+    open_inventory_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Aggregate strategy performance by experiment tag."""
+    if not rows:
+        return pd.DataFrame()
+
+    buckets: dict[str, dict[str, float]] = {}
+    for row in rows:
+        tag = str(row.get("strategy_tag") or "default")
+        cur = buckets.get(tag)
+        if cur is None:
+            cur = {
+                "trades": 0.0,
+                "sells": 0.0,
+                "win_sells": 0.0,
+                "realized_pnl": 0.0,
+                "gross_notional": 0.0,
+                "sum_edge_theoretical": 0.0,
+                "sum_edge_realized_sells": 0.0,
+            }
+            buckets[tag] = cur
+
+        side = str(row.get("side") or "").upper()
+        pnl = _safe_float(row.get("pnl"))
+        cur["trades"] += 1
+        cur["realized_pnl"] += pnl
+        cur["gross_notional"] += _safe_float(row.get("size_usd"))
+        cur["sum_edge_theoretical"] += _safe_float(row.get("edge_theoretical"))
+        if side == "SELL":
+            cur["sells"] += 1
+            cur["sum_edge_realized_sells"] += _safe_float(row.get("edge_realized"))
+            if pnl > 0:
+                cur["win_sells"] += 1
+
+    summary_rows: list[dict[str, Any]] = []
+    for tag, cur in buckets.items():
+        trades = int(cur["trades"])
+        sells = int(cur["sells"])
+        summary_rows.append(
+            {
+                "strategy_tag": tag,
+                "trades": trades,
+                "sells": sells,
+                "win_rate_sells": (cur["win_sells"] / sells) if sells > 0 else 0.0,
+                "realized_pnl": cur["realized_pnl"],
+                "gross_notional": cur["gross_notional"],
+                "avg_edge_theoretical": (cur["sum_edge_theoretical"] / trades) if trades > 0 else 0.0,
+                "avg_edge_realized_sells": (cur["sum_edge_realized_sells"] / sells) if sells > 0 else 0.0,
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    if summary_df.empty:
+        return summary_df
+
+    if not open_inventory_df.empty:
+        inv = (
+            open_inventory_df
+            .groupby("strategy_tag", as_index=False)
+            .agg(
+                open_outcomes=("outcome", "count"),
+                open_notional=("open_notional", "sum"),
+                unrealized_conservative=("unrealized_conservative", "sum"),
+                unrealized_pnl_mark=("unrealized_pnl_mark", "sum"),
+                ready_to_sell=("sell_block_reason", lambda s: int((s == "ready_to_sell").sum())),
+                blocked_missing_bid=("sell_block_reason", lambda s: int((s == "missing_bid_mark").sum())),
+                max_mark_age_minutes=("mark_age_minutes", "max"),
+            )
+        )
+        summary_df = summary_df.merge(inv, on="strategy_tag", how="left")
+    else:
+        summary_df["open_outcomes"] = 0
+        summary_df["open_notional"] = 0.0
+        summary_df["unrealized_conservative"] = 0.0
+        summary_df["unrealized_pnl_mark"] = 0.0
+        summary_df["ready_to_sell"] = 0
+        summary_df["blocked_missing_bid"] = 0
+        summary_df["max_mark_age_minutes"] = 0.0
+
+    for col, default in [
+        ("open_outcomes", 0),
+        ("open_notional", 0.0),
+        ("unrealized_conservative", 0.0),
+        ("unrealized_pnl_mark", 0.0),
+        ("ready_to_sell", 0),
+        ("blocked_missing_bid", 0),
+        ("max_mark_age_minutes", 0.0),
+    ]:
+        if col in summary_df.columns:
+            summary_df[col] = summary_df[col].fillna(default)
+
+    summary_df["open_outcomes"] = summary_df["open_outcomes"].astype(int)
+    summary_df["ready_to_sell"] = summary_df["ready_to_sell"].astype(int)
+    summary_df["blocked_missing_bid"] = summary_df["blocked_missing_bid"].astype(int)
+    summary_df["total_pnl"] = summary_df["realized_pnl"] + summary_df["unrealized_conservative"]
+    summary_df["total_pnl_mark"] = summary_df["realized_pnl"] + summary_df["unrealized_pnl_mark"]
+
+    return summary_df.sort_values("total_pnl", ascending=False)
+
+
 def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
     """Estimate open inventory and unrealized P&L from stored two-sided rows."""
     if not rows:
@@ -737,8 +839,13 @@ def main():
         row for row in two_sided_rows
         if selected_tag == "All" or row.get("strategy_tag") == selected_tag
     ]
+    two_sided_open_inventory_all_df = build_two_sided_open_inventory(two_sided_rows)
     two_sided_summary_df = summarize_two_sided_pairs(two_sided_rows_view)
     two_sided_open_inventory_df = build_two_sided_open_inventory(two_sided_rows_view)
+    two_sided_tag_summary_df = summarize_two_sided_by_tag(
+        two_sided_rows if selected_tag == "All" else two_sided_rows_view,
+        two_sided_open_inventory_all_df if selected_tag == "All" else two_sided_open_inventory_df,
+    )
     if not two_sided_summary_df.empty:
         if not two_sided_open_inventory_df.empty:
             pair_unrealized = (
@@ -932,6 +1039,58 @@ def main():
                 lambda x: "n/a" if x is None else f"{float(x):.1f}"
             )
             st.dataframe(inv_view, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.subheader("Two-Sided Strategy Comparison")
+    if two_sided_tag_summary_df.empty:
+        st.info("No two-sided strategy data for current filter.")
+    else:
+        compare_cols = st.columns(4)
+        compare_cols[0].metric("Tags", int(two_sided_tag_summary_df["strategy_tag"].nunique()))
+        compare_cols[1].metric("Total Trades", int(two_sided_tag_summary_df["trades"].sum()))
+        compare_cols[2].metric("Realized P&L", f"${two_sided_tag_summary_df['realized_pnl'].sum():,.2f}")
+        compare_cols[3].metric("Total (Conservative)", f"${two_sided_tag_summary_df['total_pnl'].sum():,.2f}")
+
+        by_tag_view = two_sided_tag_summary_df.copy()
+        if "max_mark_age_minutes" in by_tag_view.columns:
+            by_tag_view["max_mark_age_minutes"] = by_tag_view["max_mark_age_minutes"].fillna(0.0)
+        by_tag_view = by_tag_view[
+            [
+                "strategy_tag",
+                "trades",
+                "sells",
+                "win_rate_sells",
+                "realized_pnl",
+                "unrealized_conservative",
+                "total_pnl",
+                "unrealized_pnl_mark",
+                "total_pnl_mark",
+                "open_outcomes",
+                "ready_to_sell",
+                "blocked_missing_bid",
+                "max_mark_age_minutes",
+                "avg_edge_theoretical",
+                "avg_edge_realized_sells",
+                "gross_notional",
+            ]
+        ]
+        by_tag_view["win_rate_sells"] = by_tag_view["win_rate_sells"].map(lambda x: f"{float(x):.1%}")
+        by_tag_view["avg_edge_theoretical"] = by_tag_view["avg_edge_theoretical"].map(lambda x: f"{float(x):.2%}")
+        by_tag_view["avg_edge_realized_sells"] = by_tag_view["avg_edge_realized_sells"].map(
+            lambda x: f"{float(x):.2%}"
+        )
+        by_tag_view["max_mark_age_minutes"] = by_tag_view["max_mark_age_minutes"].map(lambda x: f"{float(x):.1f}")
+        for col in [
+            "realized_pnl",
+            "unrealized_conservative",
+            "total_pnl",
+            "unrealized_pnl_mark",
+            "total_pnl_mark",
+            "gross_notional",
+        ]:
+            by_tag_view[col] = by_tag_view[col].map(lambda x: f"${float(x):,.2f}")
+        st.dataframe(by_tag_view, use_container_width=True, hide_index=True)
 
     st.divider()
 

@@ -60,6 +60,9 @@ DEFAULT_SETTLEMENT_WINNER_MIN_PRICE = 0.985
 DEFAULT_SETTLEMENT_LOSER_MAX_PRICE = 0.015
 DEFAULT_SETTLEMENT_FETCH_CHUNK = 40
 DEFAULT_SETTLEMENT_ENDDATE_GRACE_SECONDS = 300.0
+DEFAULT_PAIR_MERGE_PRICE = 0.5
+DEFAULT_PAIR_MERGE_MIN_EDGE = 0.002
+PAIR_BUNDLE_REASONS = {"pair_arb_entry", "pair_arb_exit", "pair_merge"}
 
 SPORT_HINT_PATTERNS = (
     r"\bmap\s+\d+\b",
@@ -706,13 +709,15 @@ class TwoSidedPaperRecorder:
         }
         if intent.reason.startswith("settlement_"):
             game_state["is_settlement"] = True
+        if intent.reason == "pair_merge":
+            game_state["is_pair_merge"] = True
 
         edge_realized: Optional[float] = None
         pnl: Optional[float] = None
         exit_price: Optional[float] = None
         if intent.side == "SELL":
             pnl = fill.realized_pnl_delta
-            if not intent.reason.startswith("settlement_"):
+            if not intent.reason.startswith("settlement_") and intent.reason != "pair_merge":
                 edge_realized = pnl / intent.size_usd if intent.size_usd > 0 else 0.0
             exit_price = fill.fill_price
 
@@ -1113,6 +1118,156 @@ def settle_resolved_inventory(
     return settled
 
 
+def paper_merge_binary_pairs(
+    engine: TwoSidedInventoryEngine,
+    snapshots_by_condition: dict[str, MarketSnapshot],
+    *,
+    paper_recorder: Optional[TwoSidedPaperRecorder],
+    now_ts: float,
+    min_edge_pct: float,
+    max_pair_notional_usd: float,
+) -> int:
+    """Paper-only merge for binary complete sets.
+
+    When both outcomes are held, merge equal shares and realize pair value at $1.
+    We model this as two synthetic SELL fills at 0.5 (one per leg), which preserves:
+        pnl_pair = 1 - (avg_yes + avg_no)
+    """
+    merged_pairs = 0
+    open_inventory = engine.get_open_inventory()
+
+    for condition_id, by_outcome in open_inventory.items():
+        snapshot = snapshots_by_condition.get(condition_id)
+        if snapshot is None or len(snapshot.outcome_order) != 2:
+            continue
+
+        out_a, out_b = snapshot.outcome_order
+        state_a = by_outcome.get(out_a)
+        state_b = by_outcome.get(out_b)
+        if state_a is None or state_b is None:
+            continue
+        if state_a.shares <= 0 or state_b.shares <= 0:
+            continue
+
+        pair_cost = state_a.avg_price + state_b.avg_price
+        merge_edge = 1.0 - pair_cost
+        if merge_edge < min_edge_pct:
+            continue
+
+        merge_shares = min(state_a.shares, state_b.shares)
+        if max_pair_notional_usd > 0:
+            # One complete set (Yes+No) settles to $1.
+            merge_shares = min(merge_shares, max_pair_notional_usd)
+        if merge_shares <= 1e-9:
+            continue
+
+        leg_size_usd = merge_shares * DEFAULT_PAIR_MERGE_PRICE
+        realized_total = 0.0
+        for outcome in (out_a, out_b):
+            quote = snapshot.outcomes.get(outcome)
+            intent = TradeIntent(
+                condition_id=condition_id,
+                title=snapshot.title,
+                outcome=outcome,
+                token_id=quote.token_id if quote else "",
+                side="SELL",
+                price=DEFAULT_PAIR_MERGE_PRICE,
+                size_usd=leg_size_usd,
+                edge_pct=merge_edge,
+                reason="pair_merge",
+                timestamp=now_ts,
+            )
+            fill = engine.apply_fill(intent)
+            if fill.shares <= 0:
+                continue
+            realized_total += fill.realized_pnl_delta
+
+            if paper_recorder is None:
+                continue
+            try:
+                paper_recorder.persist_fill(
+                    intent=intent,
+                    fill=fill,
+                    snapshot=snapshot,
+                    fair_prices={
+                        out_a: DEFAULT_PAIR_MERGE_PRICE,
+                        out_b: DEFAULT_PAIR_MERGE_PRICE,
+                    },
+                    execution_mode="paper_merge",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "paper_db_persist_failed",
+                    condition_id=condition_id,
+                    outcome=outcome,
+                    side="SELL",
+                    reason="pair_merge",
+                    error=repr(exc),
+                )
+
+        merged_pairs += 1
+        logger.info(
+            "paper_pair_merged",
+            condition_id=condition_id,
+            title=snapshot.title,
+            merge_shares=merge_shares,
+            pair_cost=pair_cost,
+            merge_edge=merge_edge,
+            realized_pnl=realized_total,
+        )
+
+    return merged_pairs
+
+
+def select_intents_for_execution(intents: list[TradeIntent], max_orders_per_cycle: int) -> list[TradeIntent]:
+    """Pick intents while keeping pair bundles together.
+
+    If a pair bundle has two legs, executing only one leg creates inventory drift.
+    This selector keeps same-condition pair intents atomic, even when cap is small.
+    """
+    cap = max(0, int(max_orders_per_cycle))
+    if cap <= 0 or not intents:
+        return []
+
+    pair_groups: dict[tuple[str, str, str], list[int]] = {}
+    for idx, intent in enumerate(intents):
+        reason = str(intent.reason or "")
+        if reason in PAIR_BUNDLE_REASONS:
+            key = (intent.condition_id, intent.side, reason)
+            pair_groups.setdefault(key, []).append(idx)
+
+    selected: list[TradeIntent] = []
+    used: set[int] = set()
+
+    for idx, intent in enumerate(intents):
+        if idx in used:
+            continue
+
+        reason = str(intent.reason or "")
+        group_idxs = [idx]
+        if reason in PAIR_BUNDLE_REASONS:
+            key = (intent.condition_id, intent.side, reason)
+            group_idxs = sorted(pair_groups.get(key, [idx]), key=lambda i: intents[i].outcome)
+
+        needed = len(group_idxs)
+        remaining = cap - len(selected)
+        allow_pair_overflow = len(selected) == 0 and needed > remaining and needed <= 2
+        if needed <= remaining or allow_pair_overflow:
+            for gi in group_idxs:
+                if gi in used:
+                    continue
+                selected.append(intents[gi])
+                used.add(gi)
+            if len(selected) >= cap and not allow_pair_overflow:
+                break
+            continue
+
+        if len(selected) >= cap:
+            break
+
+    return selected
+
+
 def signal_key(intent: TradeIntent) -> tuple[str, str, str, int]:
     return (
         intent.condition_id,
@@ -1171,7 +1326,9 @@ async def run_cycle(
     )
 
     now = time.time()
+    snapshots_by_condition = {s.condition_id: s for s in snapshots}
     settled = 0
+    merged = 0
     if args.settle_resolved and args.paper_fill:
         open_inventory = engine.get_open_inventory()
         if open_inventory:
@@ -1191,6 +1348,15 @@ async def run_cycle(
                 paper_recorder=paper_recorder if args.persist_paper else None,
                 now_ts=now,
             )
+    if args.paper_fill and args.pair_merge:
+        merged = paper_merge_binary_pairs(
+            engine=engine,
+            snapshots_by_condition=snapshots_by_condition,
+            paper_recorder=paper_recorder if args.persist_paper else None,
+            now_ts=now,
+            min_edge_pct=args.pair_merge_min_edge,
+            max_pair_notional_usd=args.max_order,
+        )
 
     if fair_runtime is not None:
         await fair_runtime.refresh_if_needed(client=client, raw_markets=raw_markets, now_ts=now)
@@ -1219,7 +1385,7 @@ async def run_cycle(
 
     print(
         f"\n[{time.strftime('%H:%M:%S')}] markets={len(raw_markets)} "
-        f"snapshots={len(snapshots)} intents={len(all_intents)} settled={settled}"
+        f"snapshots={len(snapshots)} intents={len(all_intents)} settled={settled} merged={merged}"
     )
     if fair_runtime is not None:
         stats = fair_runtime.stats
@@ -1238,13 +1404,21 @@ async def run_cycle(
         return
 
     print_intents(all_intents, fair_cache=fair_cache, top_n=args.top)
-    snapshots_by_condition = {s.condition_id: s for s in snapshots}
 
     executed = 0
     failures = 0
 
-    for intent in all_intents[: args.max_orders_per_cycle]:
+    intents_to_execute = select_intents_for_execution(all_intents, args.max_orders_per_cycle)
+    for intent in intents_to_execute:
         if args.autopilot and executor is not None:
+            if intent.reason == "pair_merge":
+                logger.warning(
+                    "pair_merge_skipped_in_autopilot",
+                    condition_id=intent.condition_id,
+                    outcome=intent.outcome,
+                    reason=intent.reason,
+                )
+                continue
             response = await executor.place_order(
                 token_id=intent.token_id,
                 side=intent.side,
@@ -1316,7 +1490,7 @@ async def run_cycle(
 
     inv = inventory_mark_summary(engine, snapshots, fair_cache=fair_cache)
     print(
-        f"Executed this cycle: {executed} (failures={failures}, settled={settled}) | "
+        f"Executed this cycle: {executed} (failures={failures}, settled={settled}, merged={merged}) | "
         f"Inventory open={int(inv['open_positions'])} marked=${inv['marked_notional']:,.2f} "
         f"realized=${inv['realized_pnl']:,.2f}"
     )
@@ -1473,6 +1647,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=settings.TWO_SIDED_MAX_HOLD_SECONDS,
         help="Max hold age before stale exit.",
+    )
+    parser.add_argument(
+        "--pair-merge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Paper-only: merge binary complete sets (Yes+No) into $1 when pair edge is positive enough.",
+    )
+    parser.add_argument(
+        "--pair-merge-min-edge",
+        type=float,
+        default=DEFAULT_PAIR_MERGE_MIN_EDGE,
+        help="Minimum pair merge edge (1 - avg_yes - avg_no) to trigger paper merge.",
     )
     parser.add_argument(
         "--settle-resolved",

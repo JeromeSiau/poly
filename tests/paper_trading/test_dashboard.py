@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from src.db.models import LiveObservation, PaperTrade
@@ -9,6 +10,7 @@ from src.paper_trading.dashboard import (
     available_two_sided_tags,
     build_two_sided_open_inventory,
     extract_two_sided_trade_rows,
+    summarize_two_sided_by_tag,
     summarize_two_sided_pairs,
 )
 
@@ -290,3 +292,73 @@ def test_build_two_sided_open_inventory_conservative_zero_when_bid_stale() -> No
     assert item["conservative_mark_price"] == pytest.approx(0.0, abs=1e-9)
     assert item["unrealized_conservative"] == pytest.approx(-40.0, rel=1e-9)
     assert item["conservative_mark_reason"] == "stale_or_missing_bid_zero"
+
+
+def test_summarize_two_sided_by_tag_includes_open_inventory_rollup() -> None:
+    rows = [
+        {
+            "strategy_tag": "edge_1p5_0p3",
+            "side": "BUY",
+            "pnl": 0.0,
+            "size_usd": 20.0,
+            "edge_theoretical": 0.02,
+            "edge_realized": 0.0,
+        },
+        {
+            "strategy_tag": "edge_1p5_0p3",
+            "side": "SELL",
+            "pnl": 8.0,
+            "size_usd": 16.0,
+            "edge_theoretical": 0.01,
+            "edge_realized": 0.12,
+        },
+        {
+            "strategy_tag": "edge_1p2_0p2",
+            "side": "BUY",
+            "pnl": 0.0,
+            "size_usd": 15.0,
+            "edge_theoretical": 0.03,
+            "edge_realized": 0.0,
+        },
+    ]
+    open_inventory_rows = [
+        {
+            "strategy_tag": "edge_1p5_0p3",
+            "outcome": "Yes",
+            "open_notional": 10.0,
+            "unrealized_conservative": -2.5,
+            "unrealized_pnl_mark": 3.0,
+            "sell_block_reason": "ready_to_sell",
+            "mark_age_minutes": 4.0,
+        },
+        {
+            "strategy_tag": "edge_1p2_0p2",
+            "outcome": "No",
+            "open_notional": 12.0,
+            "unrealized_conservative": -5.0,
+            "unrealized_pnl_mark": 1.0,
+            "sell_block_reason": "missing_bid_mark",
+            "mark_age_minutes": 31.0,
+        },
+    ]
+
+    summary = summarize_two_sided_by_tag(rows, open_inventory_df=pd.DataFrame(open_inventory_rows))
+    assert summary.shape[0] == 2
+
+    a = summary.loc[summary["strategy_tag"] == "edge_1p5_0p3"].iloc[0]
+    assert a["trades"] == 2
+    assert a["sells"] == 1
+    assert a["realized_pnl"] == pytest.approx(8.0, rel=1e-9)
+    assert a["unrealized_conservative"] == pytest.approx(-2.5, rel=1e-9)
+    assert a["total_pnl"] == pytest.approx(5.5, rel=1e-9)
+    assert a["ready_to_sell"] == 1
+    assert a["blocked_missing_bid"] == 0
+
+    b = summary.loc[summary["strategy_tag"] == "edge_1p2_0p2"].iloc[0]
+    assert b["trades"] == 1
+    assert b["sells"] == 0
+    assert b["realized_pnl"] == pytest.approx(0.0, abs=1e-9)
+    assert b["unrealized_conservative"] == pytest.approx(-5.0, rel=1e-9)
+    assert b["total_pnl"] == pytest.approx(-5.0, rel=1e-9)
+    assert b["ready_to_sell"] == 0
+    assert b["blocked_missing_bid"] == 1

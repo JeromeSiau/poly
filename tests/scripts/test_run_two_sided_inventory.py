@@ -14,12 +14,21 @@ from scripts.run_two_sided_inventory import (
     _best_orderbook_level,
     _resolve_probability,
     fetch_resolved_conditions,
+    paper_merge_binary_pairs,
+    select_intents_for_execution,
     settle_resolved_inventory,
 )
 from src.arb.two_sided_inventory import MarketSnapshot, OutcomeQuote, TradeIntent, TwoSidedInventoryEngine
-from src.db.database import get_sync_session
+from src.db.database import get_sync_session, reset_engines
 from src.db.models import LiveObservation, PaperTrade
 from src.feeds.odds_api import OddsApiSnapshot, OddsApiUsage
+
+
+@pytest.fixture(autouse=True)
+def _reset_global_db_engines():
+    reset_engines()
+    yield
+    reset_engines()
 
 
 def test_best_orderbook_level_uses_real_top_of_book() -> None:
@@ -144,6 +153,53 @@ def test_parse_resolved_binary_market_accepts_ended_open_when_enabled() -> None:
     assert blocked is None
 
 
+def test_select_intents_for_execution_keeps_pair_bundle_when_cap_is_one() -> None:
+    now = time.time()
+    intents = [
+        TradeIntent(
+            condition_id="cond-1",
+            title="Will Team A win?",
+            outcome="Yes",
+            token_id="tok-yes",
+            side="BUY",
+            price=0.48,
+            size_usd=48.0,
+            edge_pct=0.02,
+            reason="pair_arb_entry",
+            timestamp=now,
+        ),
+        TradeIntent(
+            condition_id="cond-1",
+            title="Will Team A win?",
+            outcome="No",
+            token_id="tok-no",
+            side="BUY",
+            price=0.49,
+            size_usd=49.0,
+            edge_pct=0.02,
+            reason="pair_arb_entry",
+            timestamp=now,
+        ),
+        TradeIntent(
+            condition_id="cond-2",
+            title="Will Team B win?",
+            outcome="Yes",
+            token_id="tok-yes-2",
+            side="BUY",
+            price=0.40,
+            size_usd=40.0,
+            edge_pct=0.03,
+            reason="under_fair",
+            timestamp=now,
+        ),
+    ]
+
+    selected = select_intents_for_execution(intents, max_orders_per_cycle=1)
+    pair_legs = [i for i in selected if i.reason == "pair_arb_entry"]
+    assert len(pair_legs) == 2
+    assert {i.outcome for i in pair_legs} == {"Yes", "No"}
+
+
 @pytest.mark.asyncio
 async def test_fetch_resolved_conditions_uses_repeated_condition_ids_params() -> None:
     class _DummyResponse:
@@ -191,6 +247,110 @@ async def test_fetch_resolved_conditions_uses_repeated_condition_ids_params() ->
     assert len(client.calls) == 1
     _, params = client.calls[0]
     assert params == [("condition_ids", "cond-a"), ("condition_ids", "cond-b")]
+
+
+def test_paper_merge_binary_pairs_persists_and_replays(tmp_path) -> None:
+    db_path = tmp_path / "two_sided_merge_test.db"
+    if db_path.exists():
+        db_path.unlink()
+    db_url = f"sqlite+aiosqlite:///{db_path}"
+    recorder = TwoSidedPaperRecorder(
+        db_url,
+        strategy_tag="edge_merge_case",
+        run_id="edge_merge_case-test",
+        min_edge_pct=0.015,
+        exit_edge_pct=0.003,
+    )
+    recorder.bootstrap()
+
+    engine = TwoSidedInventoryEngine()
+    snapshot = MarketSnapshot(
+        condition_id="cond-merge",
+        title="Will Team A win?",
+        outcome_order=["Yes", "No"],
+        timestamp=time.time(),
+        outcomes={
+            "Yes": OutcomeQuote(
+                outcome="Yes",
+                token_id="tok-yes",
+                bid=0.51,
+                ask=0.52,
+                bid_size=500.0,
+                ask_size=500.0,
+            ),
+            "No": OutcomeQuote(
+                outcome="No",
+                token_id="tok-no",
+                bid=0.47,
+                ask=0.48,
+                bid_size=500.0,
+                ask_size=500.0,
+            ),
+        },
+        liquidity=3000.0,
+        volume_24h=1500.0,
+    )
+
+    buy_yes = TradeIntent(
+        condition_id="cond-merge",
+        title="Will Team A win?",
+        outcome="Yes",
+        token_id="tok-yes",
+        side="BUY",
+        price=0.40,
+        size_usd=40.0,  # 100 shares
+        edge_pct=0.02,
+        reason="under_fair",
+        timestamp=time.time(),
+    )
+    buy_no = TradeIntent(
+        condition_id="cond-merge",
+        title="Will Team A win?",
+        outcome="No",
+        token_id="tok-no",
+        side="BUY",
+        price=0.45,
+        size_usd=45.0,  # 100 shares
+        edge_pct=0.02,
+        reason="under_fair",
+        timestamp=time.time(),
+    )
+    fill_yes = engine.apply_fill(buy_yes)
+    fill_no = engine.apply_fill(buy_no)
+    recorder.persist_fill(
+        intent=buy_yes,
+        fill=fill_yes,
+        snapshot=snapshot,
+        fair_prices={"Yes": 0.50, "No": 0.50},
+        execution_mode="paper",
+    )
+    recorder.persist_fill(
+        intent=buy_no,
+        fill=fill_no,
+        snapshot=snapshot,
+        fair_prices={"Yes": 0.50, "No": 0.50},
+        execution_mode="paper",
+    )
+
+    merged = paper_merge_binary_pairs(
+        engine=engine,
+        snapshots_by_condition={"cond-merge": snapshot},
+        paper_recorder=recorder,
+        now_ts=time.time() + 10.0,
+        min_edge_pct=0.01,
+        max_pair_notional_usd=1000.0,
+    )
+    assert merged == 1
+    assert engine.get_state("cond-merge", "Yes").shares == pytest.approx(0.0, abs=1e-9)
+    assert engine.get_state("cond-merge", "No").shares == pytest.approx(0.0, abs=1e-9)
+    assert engine.get_realized_pnl() == pytest.approx(15.0, rel=1e-9)
+
+    replay_engine = TwoSidedInventoryEngine()
+    restored = recorder.replay_into_engine(replay_engine)
+    assert restored == 4
+    assert replay_engine.get_state("cond-merge", "Yes").shares == pytest.approx(0.0, abs=1e-9)
+    assert replay_engine.get_state("cond-merge", "No").shares == pytest.approx(0.0, abs=1e-9)
+    assert replay_engine.get_realized_pnl() == pytest.approx(15.0, rel=1e-9)
 
 
 def test_paper_recorder_persists_and_replays_inventory(tmp_path) -> None:
