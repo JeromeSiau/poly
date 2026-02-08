@@ -71,13 +71,17 @@ def test_parse_resolved_binary_market_requires_closed_and_decisive() -> None:
         "conditionId": "cond-1",
         "question": "Will Team A win?",
         "closed": True,
+        "endDate": "2026-02-08T12:00:00Z",
         "outcomes": '["Yes","No"]',
         "outcomePrices": '["0.999","0.001"]',
     }
     parsed = _parse_resolved_binary_market(
         raw,
+        now_ts=0.0,
         winner_min_price=0.985,
         loser_max_price=0.015,
+        allow_ended_open=True,
+        enddate_grace_seconds=300.0,
     )
     assert parsed is not None
     assert parsed.condition_id == "cond-1"
@@ -89,16 +93,54 @@ def test_parse_resolved_binary_market_requires_closed_and_decisive() -> None:
     }
     assert _parse_resolved_binary_market(
         not_decisive,
+        now_ts=0.0,
         winner_min_price=0.985,
         loser_max_price=0.015,
+        allow_ended_open=True,
+        enddate_grace_seconds=300.0,
     ) is None
 
-    not_closed = {**raw, "closed": False}
+    not_closed = {**raw, "closed": False, "endDate": "2126-02-08T12:00:00Z"}
     assert _parse_resolved_binary_market(
         not_closed,
+        now_ts=0.0,
         winner_min_price=0.985,
         loser_max_price=0.015,
+        allow_ended_open=True,
+        enddate_grace_seconds=300.0,
     ) is None
+
+
+def test_parse_resolved_binary_market_accepts_ended_open_when_enabled() -> None:
+    raw = {
+        "conditionId": "cond-2",
+        "question": "Will Team B win?",
+        "closed": False,
+        "endDate": "2026-02-08T12:00:00Z",
+        "outcomes": '["Yes","No"]',
+        "outcomePrices": '["0.0005","0.9995"]',
+    }
+
+    parsed = _parse_resolved_binary_market(
+        raw,
+        now_ts=1_770_854_400.0,  # 2026-02-08T13:20:00Z
+        winner_min_price=0.985,
+        loser_max_price=0.015,
+        allow_ended_open=True,
+        enddate_grace_seconds=300.0,
+    )
+    assert parsed is not None
+    assert parsed.condition_id == "cond-2"
+
+    blocked = _parse_resolved_binary_market(
+        raw,
+        now_ts=1_770_854_400.0,
+        winner_min_price=0.985,
+        loser_max_price=0.015,
+        allow_ended_open=False,
+        enddate_grace_seconds=300.0,
+    )
+    assert blocked is None
 
 
 def test_paper_recorder_persists_and_replays_inventory(tmp_path) -> None:

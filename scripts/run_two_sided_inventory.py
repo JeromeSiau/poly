@@ -59,6 +59,7 @@ TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
 DEFAULT_SETTLEMENT_WINNER_MIN_PRICE = 0.985
 DEFAULT_SETTLEMENT_LOSER_MAX_PRICE = 0.015
 DEFAULT_SETTLEMENT_FETCH_CHUNK = 40
+DEFAULT_SETTLEMENT_ENDDATE_GRACE_SECONDS = 300.0
 
 SPORT_HINT_PATTERNS = (
     r"\bmap\s+\d+\b",
@@ -214,9 +215,23 @@ def _parse_resolved_binary_market(
     *,
     winner_min_price: float,
     loser_max_price: float,
+    now_ts: float,
+    allow_ended_open: bool,
+    enddate_grace_seconds: float,
 ) -> Optional[ResolvedCondition]:
     condition_id = str(raw.get("conditionId") or "")
-    if not condition_id or not _to_bool(raw.get("closed")):
+    if not condition_id:
+        return None
+
+    is_closed = _to_bool(raw.get("closed"))
+    is_ended_open = False
+    if not is_closed and allow_ended_open:
+        end_dt = _parse_datetime(raw.get("endDate"))
+        if end_dt is not None:
+            grace = max(0.0, enddate_grace_seconds)
+            is_ended_open = now_ts >= (end_dt.timestamp() + grace)
+
+    if not is_closed and not is_ended_open:
         return None
 
     outcomes = [str(item) for item in parse_json_list(raw.get("outcomes", []))]
@@ -964,8 +979,11 @@ async def fetch_resolved_conditions(
     client: httpx.AsyncClient,
     condition_ids: list[str],
     *,
+    now_ts: float,
     winner_min_price: float,
     loser_max_price: float,
+    allow_ended_open: bool,
+    enddate_grace_seconds: float,
     fetch_chunk_size: int,
 ) -> dict[str, ResolvedCondition]:
     resolved: dict[str, ResolvedCondition] = {}
@@ -1001,6 +1019,9 @@ async def fetch_resolved_conditions(
                 raw,
                 winner_min_price=winner_min_price,
                 loser_max_price=loser_max_price,
+                now_ts=now_ts,
+                allow_ended_open=allow_ended_open,
+                enddate_grace_seconds=enddate_grace_seconds,
             )
             if parsed is not None:
                 resolved[parsed.condition_id] = parsed
@@ -1156,8 +1177,11 @@ async def run_cycle(
             resolved_conditions = await fetch_resolved_conditions(
                 client=client,
                 condition_ids=list(open_inventory.keys()),
+                now_ts=now,
                 winner_min_price=args.settlement_winner_min_price,
                 loser_max_price=args.settlement_loser_max_price,
+                allow_ended_open=args.settlement_allow_ended_open,
+                enddate_grace_seconds=args.settlement_enddate_grace_seconds,
                 fetch_chunk_size=args.settlement_fetch_chunk,
             )
             settled = settle_resolved_inventory(
@@ -1453,7 +1477,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--settle-resolved",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Settle open paper inventory when market is closed with decisive 0/1 outcome prices.",
+        help="Settle open paper inventory when market has decisive 0/1 outcome prices (closed or ended-open).",
     )
     parser.add_argument(
         "--settlement-winner-min-price",
@@ -1465,7 +1489,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--settlement-loser-max-price",
         type=float,
         default=DEFAULT_SETTLEMENT_LOSER_MAX_PRICE,
-        help="Maximum loser price to treat closed market as resolved.",
+        help="Maximum loser price to treat market as resolved.",
+    )
+    parser.add_argument(
+        "--settlement-allow-ended-open",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow settlement when market endDate is passed even if Gamma still reports closed=false.",
+    )
+    parser.add_argument(
+        "--settlement-enddate-grace-seconds",
+        type=float,
+        default=DEFAULT_SETTLEMENT_ENDDATE_GRACE_SECONDS,
+        help="Grace delay after endDate before settling ended-open markets.",
     )
     parser.add_argument(
         "--settlement-fetch-chunk",
