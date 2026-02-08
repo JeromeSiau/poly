@@ -63,7 +63,7 @@ Fichier: `run_dashboard.sh`
 - `max_order = 4.0% wallet`
 - `max_outcome_inv = 12.5% wallet` (min `2 * max_order`)
 - `max_market_net = 6.0% wallet` (min `1.2 * max_order`)
-- `max_orders_per_cycle = 1` (conservateur)
+- `max_orders_per_cycle = 4` (defaut)
 
 Avec wallet 200, ordre de grandeur:
 
@@ -125,7 +125,49 @@ Params utiles:
 
 Donc plusieurs daemons peuvent reutiliser le meme snapshot au lieu de reconsommer des credits a chaque cycle.
 
-## 9) Reset propre de l'historique
+## 9) Comparaison continue vs RN1
+
+### 9.1 Script CLI
+
+Commande:
+
+```bash
+uv run python scripts/compare_rn1.py --db data/arb.db --hours 6
+```
+
+Filtrer un tag:
+
+```bash
+uv run python scripts/compare_rn1.py --db data/arb.db --hours 24 --strategy-tag edge_1p5_0p3
+```
+
+Le rapport donne:
+
+- cadence locale vs RN1,
+- ratio de marches joues sur plusieurs outcomes,
+- taille mediane des tickets,
+- gaps + recommandations actionnables.
+
+### 9.2 Endpoint API (pour dashboard externe / automation)
+
+Lancer:
+
+```bash
+/bin/bash /home/ploi/orb.lvlup-dev.com/run_rn1_compare_api.sh
+```
+
+Endpoints:
+
+- `GET /health`
+- `GET /compare/rn1?db=data/arb.db&hours=6&strategy_tag=edge_1p5_0p3`
+
+Exemple:
+
+```bash
+curl -s "http://127.0.0.1:8787/compare/rn1?db=data/arb.db&hours=6" | jq '.gaps,.recommendations'
+```
+
+## 10) Reset propre de l'historique
 
 Backup:
 
@@ -154,7 +196,7 @@ sqlite3 data/arb.db "SELECT COUNT(*) FROM live_observations;"
 sqlite3 data/arb.db "SELECT COUNT(*) FROM odds_api_cache;"
 ```
 
-## 10) Checklist quotidienne
+## 11) Checklist quotidienne
 
 1. verifier daemon up (`ps` + logs),
 2. verifier que le tag attendu est bien utilise,
