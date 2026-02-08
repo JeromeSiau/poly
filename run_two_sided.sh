@@ -80,12 +80,27 @@ case "$STRATEGY_STYLE" in
   rn1_mimic)
     # RN1-like profile: avoid classic SELL/settlement loop, keep BUY pressure.
     STYLE_FLAGS+=("--buy-only" "--no-settle-resolved")
+    # More RN1-like market coverage/cadence defaults.
+    if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
+    if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="1"; fi
+    if [[ "$MAX_ORDERS_PER_CYCLE" == "4" ]]; then MAX_ORDERS_PER_CYCLE="12"; fi
+    if [[ "$PAIR_MERGE_MIN_EDGE" == "0.003" ]]; then PAIR_MERGE_MIN_EDGE="0.001"; fi
+    if [[ "$MIN_LIQUIDITY" == "500" ]]; then MIN_LIQUIDITY="100"; fi
+    if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="20"; fi
+    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="3"; fi
+    if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="1"; fi
     ;;
   *)
     echo "Invalid STRATEGY_STYLE: $STRATEGY_STYLE (expected default|rn1_mimic)" >&2
     exit 1
     ;;
 esac
+
+# Rebuild universe flags after strategy-style overrides.
+UNIVERSE_FLAGS=()
+if [[ "$INCLUDE_NONSPORTS" == "1" ]]; then
+  UNIVERSE_FLAGS+=("--include-nonsports")
+fi
 
 exec >> "$LOG_FILE" 2>&1
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start tag=$TAG mode=$MODE wallet_usd=$WALLET_USD fair_mode=$FAIR_MODE fair_blend=$FAIR_BLEND strategy_style=$STRATEGY_STYLE min_edge=$MIN_EDGE exit_edge=$EXIT_EDGE min_order=$MIN_ORDER max_order=$MAX_ORDER max_outcome_inv=$MAX_OUTCOME_INV max_market_net=$MAX_MARKET_NET interval=$WATCH_INTERVAL signal_cooldown=$SIGNAL_COOLDOWN max_orders_per_cycle=$MAX_ORDERS_PER_CYCLE pair_merge_min_edge=$PAIR_MERGE_MIN_EDGE min_liquidity=$MIN_LIQUIDITY min_volume_24h=$MIN_VOLUME_24H max_days_to_end=$MAX_DAYS_TO_END include_nonsports=$INCLUDE_NONSPORTS"
