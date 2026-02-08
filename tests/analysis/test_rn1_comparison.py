@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.analysis.rn1_comparison import (
     ActivityEvent,
+    build_rn1_transaction_report,
     build_gaps,
     build_recommendations,
     fetch_rn1_activity,
@@ -162,3 +163,153 @@ def test_fetch_rn1_activity_stops_gracefully_on_400(monkeypatch: pytest.MonkeyPa
     )
     assert len(rows) == 1
     assert rows[0].condition_id == "cond-1"
+
+
+def test_fetch_rn1_activity_treats_missing_type_as_trade(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Resp:
+        def __init__(self, payload, status_code: int = 200):
+            self._payload = payload
+            self.status_code = status_code
+            self.request = httpx.Request("GET", "https://data-api.polymarket.com/activity")
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"{self.status_code}",
+                    request=self.request,
+                    response=httpx.Response(self.status_code, request=self.request),
+                )
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, params=None):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    [
+                        {
+                            "timestamp": 1770570981,
+                            "conditionId": "cond-2",
+                            # no `type` field on purpose
+                            "side": "BUY",
+                            "price": 0.4,
+                            "usdcSize": 8.0,
+                            "outcome": "Yes",
+                            "title": "Will Team B win on 2026-02-08?",
+                            "eventSlug": "epl-a-b-2026-02-08",
+                            "transactionHash": "0xabc",
+                        }
+                    ],
+                    status_code=200,
+                )
+            return _Resp([], status_code=200)
+
+    monkeypatch.setattr("src.analysis.rn1_comparison.httpx.Client", _Client)
+
+    rows = fetch_rn1_activity(
+        wallet="0xabc",
+        window_hours=48.0,
+        page_limit=500,
+        max_pages=2,
+    )
+    assert len(rows) == 1
+    assert rows[0].reason == "trade"
+    assert rows[0].side == "BUY"
+
+
+def test_build_rn1_transaction_report_enriches_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    sample_rows = [
+        {
+            "timestamp": 1000,
+            "datetime_utc": "2026-02-08T10:00:00+00:00",
+            "type": "TRADE",
+            "side": "BUY",
+            "condition_id": "cond-a",
+            "title": "Will Team A win on 2026-02-08?",
+            "slug": "a-b",
+            "event_slug": "epl-a-b-2026-02-08",
+            "league_prefix": "epl",
+            "market_type": "winner",
+            "outcome": "Yes",
+            "price": 0.45,
+            "price_bucket": "0.40-0.60",
+            "usdc_size": 9.0,
+            "shares": 20.0,
+            "tx_hash": "0xtx1",
+        },
+        {
+            "timestamp": 1010,
+            "datetime_utc": "2026-02-08T10:00:10+00:00",
+            "type": "TRADE",
+            "side": "BUY",
+            "condition_id": "cond-a",
+            "title": "Will Team A win on 2026-02-08?",
+            "slug": "a-b",
+            "event_slug": "epl-a-b-2026-02-08",
+            "league_prefix": "epl",
+            "market_type": "winner",
+            "outcome": "No",
+            "price": 0.48,
+            "price_bucket": "0.40-0.60",
+            "usdc_size": 9.6,
+            "shares": 20.0,
+            "tx_hash": "0xtx2",
+        },
+        {
+            "timestamp": 1060,
+            "datetime_utc": "2026-02-08T10:01:00+00:00",
+            "type": "MERGE",
+            "side": "MERGE",
+            "condition_id": "cond-a",
+            "title": "Will Team A win on 2026-02-08?",
+            "slug": "a-b",
+            "event_slug": "epl-a-b-2026-02-08",
+            "league_prefix": "epl",
+            "market_type": "winner",
+            "outcome": "",
+            "price": 0.0,
+            "price_bucket": "n/a",
+            "usdc_size": 20.0,
+            "shares": 0.0,
+            "tx_hash": "0xtx3",
+        },
+    ]
+
+    monkeypatch.setattr(
+        "src.analysis.rn1_comparison.fetch_rn1_raw_activity",
+        lambda **kwargs: sample_rows,
+    )
+
+    report = build_rn1_transaction_report(
+        window_hours=6.0,
+        include_transactions=True,
+        transaction_limit=100,
+        top_conditions=10,
+    )
+    summary = report["summary"]
+    assert summary["events_total"] == 3
+    assert summary["trade_count"] == 2
+    assert summary["merge_count"] == 1
+    assert summary["multi_outcome_conditions"] == 1
+
+    cond = report["conditions"][0]
+    assert cond["condition_id"] == "cond-a"
+    assert cond["is_multi_outcome"] is True
+    assert cond["pair_cost_est"] == pytest.approx(0.93, rel=1e-9)
+    assert cond["locked_edge_est"] == pytest.approx(0.07, rel=1e-9)
+
+    tx_rows = report["transactions"]
+    assert len(tx_rows) == 3
+    assert tx_rows[-1]["type"] == "MERGE"
+    assert tx_rows[-1]["seconds_since_last_trade_same_condition"] == 50

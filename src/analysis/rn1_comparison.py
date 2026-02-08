@@ -82,6 +82,168 @@ def _rolling_max_events_per_minute(events: Sequence[ActivityEvent]) -> int:
     return best
 
 
+def _normalize_rn1_row_type(row: dict[str, Any]) -> str:
+    row_type = str(row.get("type") or "").upper()
+    if row_type:
+        return row_type
+    side = str(row.get("side") or "").upper()
+    price = _safe_float(row.get("price"), default=0.0)
+    if side in {"BUY", "SELL"} and price > 0:
+        return "TRADE"
+    return "UNKNOWN"
+
+
+def _normalize_rn1_side(row: dict[str, Any], row_type: str) -> str:
+    if row_type == "MERGE":
+        return "MERGE"
+    side = str(row.get("side") or "").upper()
+    if side in {"BUY", "SELL"}:
+        return side
+    if row_type == "REDEEM":
+        return "REDEEM"
+    return "UNKNOWN"
+
+
+def _market_type_from_title(title: str) -> str:
+    t = (title or "").lower()
+    if "both teams to score" in t:
+        return "btts"
+    if "o/u" in t or "over" in t or "under" in t:
+        return "over_under"
+    if "draw" in t:
+        return "draw"
+    if "map " in t:
+        return "map"
+    if "set " in t:
+        return "set"
+    if "will " in t and " win on " in t:
+        return "winner"
+    return "other"
+
+
+def _league_prefix_from_event_slug(event_slug: str) -> str:
+    raw = (event_slug or "").strip()
+    if not raw:
+        return "unknown"
+    return raw.split("-", 1)[0]
+
+
+def _price_bucket(price: float) -> str:
+    if price <= 0:
+        return "n/a"
+    if price < 0.1:
+        return "<0.10"
+    if price < 0.2:
+        return "0.10-0.20"
+    if price < 0.4:
+        return "0.20-0.40"
+    if price < 0.6:
+        return "0.40-0.60"
+    if price < 0.8:
+        return "0.60-0.80"
+    if price < 0.9:
+        return "0.80-0.90"
+    return ">=0.90"
+
+
+def fetch_rn1_raw_activity(
+    *,
+    wallet: str,
+    window_hours: float,
+    page_limit: int = 500,
+    max_pages: int = 7,
+    timeout_seconds: float = 25.0,
+) -> list[dict[str, Any]]:
+    """Fetch and normalize RN1 activity rows (TRADE/MERGE/REDEEM)."""
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=max(0.1, window_hours))).timestamp())
+    rows: list[dict[str, Any]] = []
+
+    with httpx.Client(timeout=timeout_seconds) as client:
+        for page in range(max(1, max_pages)):
+            offset = page * page_limit
+            if offset > DATA_API_ACTIVITY_MAX_OFFSET:
+                break
+            try:
+                resp = client.get(
+                    DATA_API_ACTIVITY,
+                    params={
+                        "user": wallet,
+                        "limit": max(1, page_limit),
+                        "offset": max(0, offset),
+                    },
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                # Activity pagination currently hard-fails (400) beyond a max offset.
+                # Stop gracefully and keep data collected so far.
+                if exc.response is not None and exc.response.status_code == 400:
+                    break
+                raise
+            payload = resp.json()
+            if not isinstance(payload, list) or not payload:
+                break
+
+            stop = False
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                ts = _parse_ts(row.get("timestamp"))
+                if ts <= 0:
+                    continue
+                if ts < cutoff_ts:
+                    stop = True
+                    continue
+                row_type = _normalize_rn1_row_type(row)
+                side = _normalize_rn1_side(row, row_type)
+                if row_type == "UNKNOWN":
+                    continue
+                usdc_size = _safe_float(row.get("usdcSize") or row.get("size"))
+                price = _safe_float(row.get("price"))
+                shares = (usdc_size / price) if (row_type == "TRADE" and price > 0 and usdc_size > 0) else 0.0
+                rows.append(
+                    {
+                        "timestamp": ts,
+                        "datetime_utc": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+                        "type": row_type,
+                        "side": side,
+                        "condition_id": str(row.get("conditionId") or ""),
+                        "title": str(row.get("title") or ""),
+                        "slug": str(row.get("slug") or ""),
+                        "event_slug": str(row.get("eventSlug") or ""),
+                        "league_prefix": _league_prefix_from_event_slug(str(row.get("eventSlug") or "")),
+                        "market_type": _market_type_from_title(str(row.get("title") or "")),
+                        "outcome": str(row.get("outcome") or ""),
+                        "price": price,
+                        "price_bucket": _price_bucket(price),
+                        "usdc_size": usdc_size,
+                        "shares": shares,
+                        "tx_hash": str(row.get("transactionHash") or ""),
+                    }
+                )
+
+            if stop or len(payload) < page_limit:
+                break
+
+    # Deduplicate by tx + condition + type + timestamp + outcome + size + price.
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in sorted(rows, key=lambda item: item["timestamp"]):
+        key = (
+            row.get("tx_hash"),
+            row.get("condition_id"),
+            row.get("type"),
+            row.get("timestamp"),
+            row.get("outcome"),
+            row.get("usdc_size"),
+            row.get("price"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
 def load_local_two_sided_events(
     *,
     db_url: str,
@@ -144,66 +306,32 @@ def fetch_rn1_activity(
     timeout_seconds: float = 25.0,
 ) -> list[ActivityEvent]:
     """Fetch RN1 activity from Polymarket data API."""
-    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=max(0.1, window_hours))).timestamp())
     out: list[ActivityEvent] = []
-
-    with httpx.Client(timeout=timeout_seconds) as client:
-        for page in range(max(1, max_pages)):
-            offset = page * page_limit
-            if offset > DATA_API_ACTIVITY_MAX_OFFSET:
-                break
-            try:
-                resp = client.get(
-                    DATA_API_ACTIVITY,
-                    params={
-                        "user": wallet,
-                        "limit": max(1, page_limit),
-                        "offset": max(0, offset),
-                    },
-                )
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                # Activity pagination currently hard-fails (400) beyond a max offset.
-                # Stop gracefully and keep data collected so far.
-                if exc.response is not None and exc.response.status_code == 400:
-                    break
-                raise
-            payload = resp.json()
-            if not isinstance(payload, list) or not payload:
-                break
-
-            stop = False
-            for row in payload:
-                if not isinstance(row, dict):
-                    continue
-                ts = _parse_ts(row.get("timestamp"))
-                if ts <= 0:
-                    continue
-                if ts < cutoff_ts:
-                    stop = True
-                    continue
-                row_type = str(row.get("type") or "").upper()
-                if row_type not in {"TRADE", "MERGE"}:
-                    continue
-                side = str(row.get("side") or "").upper()
-                if row_type == "MERGE":
-                    side = "MERGE"
-                if side not in {"BUY", "SELL", "MERGE"}:
-                    continue
-                out.append(
-                    ActivityEvent(
-                        timestamp=ts,
-                        condition_id=str(row.get("conditionId") or ""),
-                        outcome=str(row.get("outcome") or ""),
-                        side=side,
-                        size_usd=_safe_float(row.get("usdcSize") or row.get("size")),
-                        reason=row_type.lower(),
-                        strategy_tag="RN1",
-                    )
-                )
-
-            if stop or len(payload) < page_limit:
-                break
+    rows = fetch_rn1_raw_activity(
+        wallet=wallet,
+        window_hours=window_hours,
+        page_limit=page_limit,
+        max_pages=max_pages,
+        timeout_seconds=timeout_seconds,
+    )
+    for row in rows:
+        row_type = str(row.get("type") or "").upper()
+        side = str(row.get("side") or "").upper()
+        if row_type not in {"TRADE", "MERGE"}:
+            continue
+        if side not in {"BUY", "SELL", "MERGE"}:
+            continue
+        out.append(
+            ActivityEvent(
+                timestamp=int(row.get("timestamp") or 0),
+                condition_id=str(row.get("condition_id") or ""),
+                outcome=str(row.get("outcome") or ""),
+                side=side,
+                size_usd=_safe_float(row.get("usdc_size")),
+                reason=row_type.lower(),
+                strategy_tag="RN1",
+            )
+        )
     return out
 
 
@@ -379,6 +507,344 @@ def build_recommendations(local: dict[str, Any], rn1: dict[str, Any], gaps: dict
     if not recos:
         recos.append("Les gaps principaux sont reduits. Continue a optimiser la qualite des fills et la vitesse d'execution.")
     return recos
+
+
+def build_rn1_transaction_report(
+    *,
+    window_hours: float = 6.0,
+    rn1_wallet: str = DEFAULT_RN1_WALLET,
+    page_limit: int = 500,
+    max_pages: int = 7,
+    include_transactions: bool = False,
+    transaction_limit: int = 2000,
+    top_conditions: int = 50,
+) -> dict[str, Any]:
+    """Build a deep RN1 transaction-level report."""
+    safe_window = max(0.1, float(window_hours))
+    rows = fetch_rn1_raw_activity(
+        wallet=rn1_wallet,
+        window_hours=safe_window,
+        page_limit=page_limit,
+        max_pages=max_pages,
+    )
+    if not rows:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "window_hours": safe_window,
+            "filters": {
+                "rn1_wallet": rn1_wallet,
+                "page_limit": int(page_limit),
+                "max_pages": int(max_pages),
+            },
+            "summary": {
+                "events_total": 0,
+                "trade_count": 0,
+                "merge_count": 0,
+                "redeem_count": 0,
+            },
+            "conditions": [],
+            "transactions": [],
+        }
+
+    type_counts: Counter[str] = Counter()
+    side_counts: Counter[str] = Counter()
+    league_counts: Counter[str] = Counter()
+    market_type_counts: Counter[str] = Counter()
+    price_bucket_counts: Counter[str] = Counter()
+    outcome_counts: Counter[str] = Counter()
+    tx_batch_sizes: Counter[str] = Counter(row.get("tx_hash") for row in rows if row.get("tx_hash"))
+    per_minute_counts: Counter[int] = Counter(int(row["timestamp"]) // 60 for row in rows)
+
+    cond_stats: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        row_type = str(row.get("type") or "UNKNOWN")
+        side = str(row.get("side") or "UNKNOWN")
+        condition_id = str(row.get("condition_id") or "")
+        price = _safe_float(row.get("price"))
+        usdc_size = _safe_float(row.get("usdc_size"))
+        shares = _safe_float(row.get("shares"))
+        outcome = str(row.get("outcome") or "")
+
+        type_counts[row_type] += 1
+        side_counts[side] += 1
+        league_counts[str(row.get("league_prefix") or "unknown")] += 1
+        market_type_counts[str(row.get("market_type") or "other")] += 1
+        price_bucket_counts[str(row.get("price_bucket") or "n/a")] += 1
+        if outcome:
+            outcome_counts[outcome] += 1
+
+        if not condition_id:
+            continue
+        stats = cond_stats.get(condition_id)
+        if stats is None:
+            stats = {
+                "condition_id": condition_id,
+                "title": str(row.get("title") or ""),
+                "event_slug": str(row.get("event_slug") or ""),
+                "league_prefix": str(row.get("league_prefix") or "unknown"),
+                "market_type": str(row.get("market_type") or "other"),
+                "events": 0,
+                "trade_count": 0,
+                "merge_count": 0,
+                "redeem_count": 0,
+                "buy_count": 0,
+                "sell_count": 0,
+                "buy_usdc": 0.0,
+                "sell_usdc": 0.0,
+                "merge_usdc": 0.0,
+                "redeem_usdc": 0.0,
+                "trade_prices": [],
+                "trade_sizes": [],
+                "outcomes_seen": set(),
+                "outcome_acc": defaultdict(lambda: {"shares": 0.0, "cost": 0.0, "trades": 0}),
+                "last_trade_ts": 0,
+                "merge_lags": [],
+            }
+            cond_stats[condition_id] = stats
+
+        stats["events"] += 1
+        if row_type == "TRADE":
+            stats["trade_count"] += 1
+            if side == "BUY":
+                stats["buy_count"] += 1
+                stats["buy_usdc"] += usdc_size
+            elif side == "SELL":
+                stats["sell_count"] += 1
+                stats["sell_usdc"] += usdc_size
+            if usdc_size > 0:
+                stats["trade_sizes"].append(usdc_size)
+            if price > 0:
+                stats["trade_prices"].append(price)
+            if outcome:
+                stats["outcomes_seen"].add(outcome)
+                if shares > 0:
+                    slot = stats["outcome_acc"][outcome]
+                    slot["shares"] += shares
+                    slot["cost"] += usdc_size
+                    slot["trades"] += 1
+            stats["last_trade_ts"] = int(row.get("timestamp") or 0)
+        elif row_type == "MERGE":
+            stats["merge_count"] += 1
+            stats["merge_usdc"] += usdc_size
+            ts = int(row.get("timestamp") or 0)
+            last_trade_ts = int(stats.get("last_trade_ts") or 0)
+            if ts > 0 and last_trade_ts > 0 and ts >= last_trade_ts:
+                stats["merge_lags"].append(ts - last_trade_ts)
+        elif row_type == "REDEEM":
+            stats["redeem_count"] += 1
+            stats["redeem_usdc"] += usdc_size
+
+    condition_rows: list[dict[str, Any]] = []
+    for condition_id, stats in cond_stats.items():
+        outcomes_seen = set(stats["outcomes_seen"])
+        is_multi_outcome = len(outcomes_seen) >= 2
+        pair_cost_est = None
+        complete_set_shares_est = 0.0
+        locked_edge_est = 0.0
+        locked_pnl_est = 0.0
+
+        if is_multi_outcome:
+            # Use two largest-share outcomes to estimate complete-set economics.
+            outcomes_by_shares = sorted(
+                (
+                    (outcome, data["shares"], data["cost"])
+                    for outcome, data in stats["outcome_acc"].items()
+                    if data["shares"] > 0
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if len(outcomes_by_shares) >= 2:
+                (_, s1, c1), (_, s2, c2) = outcomes_by_shares[:2]
+                avg1 = (c1 / s1) if s1 > 0 else 0.0
+                avg2 = (c2 / s2) if s2 > 0 else 0.0
+                pair_cost_est = avg1 + avg2
+                complete_set_shares_est = min(s1, s2)
+                locked_edge_est = max(0.0, 1.0 - pair_cost_est)
+                locked_pnl_est = complete_set_shares_est * locked_edge_est
+
+        trade_prices = stats["trade_prices"]
+        trade_sizes = stats["trade_sizes"]
+        merge_lags = stats["merge_lags"]
+        condition_rows.append(
+            {
+                "condition_id": condition_id,
+                "title": stats["title"],
+                "event_slug": stats["event_slug"],
+                "league_prefix": stats["league_prefix"],
+                "market_type": stats["market_type"],
+                "events": int(stats["events"]),
+                "trade_count": int(stats["trade_count"]),
+                "merge_count": int(stats["merge_count"]),
+                "redeem_count": int(stats["redeem_count"]),
+                "buy_count": int(stats["buy_count"]),
+                "sell_count": int(stats["sell_count"]),
+                "buy_usdc": float(stats["buy_usdc"]),
+                "sell_usdc": float(stats["sell_usdc"]),
+                "merge_usdc": float(stats["merge_usdc"]),
+                "redeem_usdc": float(stats["redeem_usdc"]),
+                "outcomes_seen": sorted(outcomes_seen),
+                "is_multi_outcome": bool(is_multi_outcome),
+                "median_trade_price": median(trade_prices) if trade_prices else 0.0,
+                "median_trade_usdc": median(trade_sizes) if trade_sizes else 0.0,
+                "pair_cost_est": pair_cost_est,
+                "complete_set_shares_est": float(complete_set_shares_est),
+                "locked_edge_est": float(locked_edge_est),
+                "locked_pnl_est": float(locked_pnl_est),
+                "merge_lag_sec_median": median(merge_lags) if merge_lags else None,
+            }
+        )
+
+    condition_rows.sort(
+        key=lambda item: (item.get("locked_pnl_est") or 0.0, item.get("buy_usdc") or 0.0),
+        reverse=True,
+    )
+
+    enriched_rows: list[dict[str, Any]] = []
+    if include_transactions:
+        prev_ts: Optional[int] = None
+        prev_cond_ts: dict[str, int] = {}
+        cond_event_idx: Counter[str] = Counter()
+        cond_trade_idx: Counter[str] = Counter()
+        cond_trade_usdc_cum: defaultdict[str, float] = defaultdict(float)
+        cond_outcomes_seen_cum: dict[str, set[str]] = defaultdict(set)
+        cond_last_trade_ts: dict[str, int] = {}
+        multi_cond_set = {
+            str(item["condition_id"])
+            for item in condition_rows
+            if bool(item.get("is_multi_outcome"))
+        }
+
+        for idx, row in enumerate(rows, start=1):
+            condition_id = str(row.get("condition_id") or "")
+            row_type = str(row.get("type") or "UNKNOWN")
+            side = str(row.get("side") or "UNKNOWN")
+            ts = int(row.get("timestamp") or 0)
+            usdc_size = _safe_float(row.get("usdc_size"))
+            outcome = str(row.get("outcome") or "")
+
+            cond_event_idx[condition_id] += 1
+            if row_type == "TRADE":
+                cond_trade_idx[condition_id] += 1
+                cond_trade_usdc_cum[condition_id] += usdc_size
+                if outcome:
+                    cond_outcomes_seen_cum[condition_id].add(outcome)
+
+            seconds_since_prev_event = (ts - prev_ts) if (prev_ts is not None and ts >= prev_ts) else None
+            prev_same_cond = prev_cond_ts.get(condition_id)
+            seconds_since_prev_condition = (
+                (ts - prev_same_cond)
+                if (prev_same_cond is not None and ts >= prev_same_cond)
+                else None
+            )
+            prev_ts = ts
+            if condition_id:
+                prev_cond_ts[condition_id] = ts
+
+            seconds_since_last_trade_same_condition = None
+            if row_type == "MERGE" and condition_id in cond_last_trade_ts:
+                last_trade_ts = cond_last_trade_ts[condition_id]
+                if ts >= last_trade_ts:
+                    seconds_since_last_trade_same_condition = ts - last_trade_ts
+            if row_type == "TRADE":
+                cond_last_trade_ts[condition_id] = ts
+
+            enriched_rows.append(
+                {
+                    "global_index": idx,
+                    "timestamp": ts,
+                    "datetime_utc": row.get("datetime_utc"),
+                    "type": row_type,
+                    "side": side,
+                    "condition_id": condition_id,
+                    "title": row.get("title"),
+                    "event_slug": row.get("event_slug"),
+                    "league_prefix": row.get("league_prefix"),
+                    "market_type": row.get("market_type"),
+                    "outcome": outcome,
+                    "price": _safe_float(row.get("price")),
+                    "price_bucket": row.get("price_bucket"),
+                    "usdc_size": usdc_size,
+                    "shares": _safe_float(row.get("shares")),
+                    "tx_hash": row.get("tx_hash"),
+                    "tx_batch_size": int(tx_batch_sizes.get(str(row.get("tx_hash") or ""), 0)),
+                    "condition_event_index": int(cond_event_idx[condition_id]),
+                    "condition_trade_index": int(cond_trade_idx[condition_id]),
+                    "condition_trade_usdc_cum": float(cond_trade_usdc_cum[condition_id]),
+                    "condition_outcomes_seen_cum": int(len(cond_outcomes_seen_cum[condition_id])),
+                    "is_multi_outcome_condition": bool(condition_id in multi_cond_set),
+                    "seconds_since_prev_event": seconds_since_prev_event,
+                    "seconds_since_prev_condition_event": seconds_since_prev_condition,
+                    "seconds_since_last_trade_same_condition": seconds_since_last_trade_same_condition,
+                }
+            )
+
+        if transaction_limit > 0 and len(enriched_rows) > transaction_limit:
+            enriched_rows = enriched_rows[-transaction_limit:]
+
+    start_ts = int(rows[0]["timestamp"])
+    end_ts = int(rows[-1]["timestamp"])
+    span_seconds = max(1, end_ts - start_ts)
+
+    summary = {
+        "events_total": len(rows),
+        "trade_count": int(type_counts.get("TRADE", 0)),
+        "merge_count": int(type_counts.get("MERGE", 0)),
+        "redeem_count": int(type_counts.get("REDEEM", 0)),
+        "buy_count": int(side_counts.get("BUY", 0)),
+        "sell_count": int(side_counts.get("SELL", 0)),
+        "buy_share_of_trades": _ratio(
+            _safe_float(side_counts.get("BUY", 0)),
+            _safe_float(type_counts.get("TRADE", 0)),
+        ),
+        "merge_share_of_events": _ratio(
+            _safe_float(type_counts.get("MERGE", 0)),
+            _safe_float(len(rows)),
+        ),
+        "unique_conditions": len(cond_stats),
+        "multi_outcome_conditions": sum(1 for item in condition_rows if bool(item.get("is_multi_outcome"))),
+        "multi_outcome_ratio": _ratio(
+            sum(1 for item in condition_rows if bool(item.get("is_multi_outcome"))),
+            len(cond_stats),
+        ),
+        "trade_usdc_median": median(
+            [_safe_float(row.get("usdc_size")) for row in rows if str(row.get("type")) == "TRADE"]
+        ) if type_counts.get("TRADE", 0) > 0 else 0.0,
+        "trade_usdc_p90": sorted(
+            [_safe_float(row.get("usdc_size")) for row in rows if str(row.get("type")) == "TRADE"]
+        )[max(0, int(math.ceil(type_counts.get("TRADE", 0) * 0.9)) - 1)]
+        if type_counts.get("TRADE", 0) > 0
+        else 0.0,
+        "events_per_minute_window": len(rows) / (safe_window * 60.0),
+        "events_per_minute_active": len(rows) / (span_seconds / 60.0),
+        "max_events_per_minute": max(per_minute_counts.values()) if per_minute_counts else 0,
+        "window_start_ts": start_ts,
+        "window_end_ts": end_ts,
+        "active_span_seconds": span_seconds,
+    }
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": safe_window,
+        "filters": {
+            "rn1_wallet": rn1_wallet,
+            "page_limit": int(page_limit),
+            "max_pages": int(max_pages),
+            "include_transactions": bool(include_transactions),
+            "transaction_limit": int(transaction_limit),
+        },
+        "summary": summary,
+        "distribution": {
+            "type_counts": dict(type_counts),
+            "side_counts": dict(side_counts),
+            "league_prefix_top": dict(league_counts.most_common(20)),
+            "market_type_counts": dict(market_type_counts),
+            "price_bucket_counts": dict(price_bucket_counts),
+            "outcome_top": dict(outcome_counts.most_common(20)),
+        },
+        "conditions": condition_rows[: max(1, int(top_conditions))],
+        "transactions": enriched_rows,
+    }
 
 
 def build_comparison_report(

@@ -148,6 +148,18 @@ Le rapport donne:
 - taille mediane des tickets,
 - gaps + recommandations actionnables.
 
+Analyse transaction par transaction RN1:
+
+```bash
+uv run python scripts/analyze_rn1_transactions.py --hours 6 --include-transactions
+```
+
+Sorties:
+
+- `reports/rn1/rn1_deep_report_*.json`
+- `reports/rn1/rn1_conditions_*.csv`
+- `reports/rn1/rn1_transactions_*.csv`
+
 ### 9.2 Endpoint API (pour dashboard externe / automation)
 
 Lancer:
@@ -160,6 +172,7 @@ Endpoints:
 
 - `GET /health`
 - `GET /compare/rn1?db=data/arb.db&hours=6&strategy_tag=edge_1p5_0p3`
+- `GET /compare/rn1/transactions?hours=6&include_transactions=true`
 
 Exemple:
 
