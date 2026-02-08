@@ -85,7 +85,16 @@ case "$STRATEGY_STYLE" in
     ;;
   rn1_sport)
     # RN1-like profile for sports focus (exclude esports/non-sports by default).
-    STYLE_FLAGS+=("--buy-only" "--no-settle-resolved" "--entry-require-ended" "--entry-min-seconds-since-end" "$ENTRY_MIN_SECONDS_SINCE_END")
+    STYLE_FLAGS+=(
+      "--buy-only"
+      "--no-settle-resolved"
+      "--entry-require-ended"
+      "--entry-min-seconds-since-end" "$ENTRY_MIN_SECONDS_SINCE_END"
+      "--timing-gamma-proxy"
+      "--timing-gamma-proxy-min-prob" "0.80"
+      "--timing-gamma-proxy-min-gap" "0.25"
+      "--timing-gamma-proxy-require-ended"
+    )
     FORCE_TIMING_ONLY=1
     if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
     if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="0"; fi

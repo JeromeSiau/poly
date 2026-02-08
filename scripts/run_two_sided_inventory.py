@@ -168,6 +168,59 @@ def _parse_csv_values(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _extract_outcome_price_map(raw: dict[str, Any]) -> dict[str, float]:
+    outcomes = [str(o) for o in parse_json_list(raw.get("outcomes", []))]
+    prices_raw = parse_json_list(raw.get("outcomePrices", []))
+    if len(outcomes) < 2 or len(prices_raw) < 2:
+        return {}
+
+    out: dict[str, float] = {}
+    for idx, outcome in enumerate(outcomes):
+        if idx >= len(prices_raw):
+            break
+        value = _to_float(prices_raw[idx], default=-1.0)
+        if 0.0 <= value <= 1.0:
+            out[outcome] = value
+    return out
+
+
+def _build_gamma_timing_fair(
+    *,
+    snapshot: MarketSnapshot,
+    raw_market: Optional[dict[str, Any]],
+    now_ts: float,
+    min_prob: float,
+    min_gap: float,
+    require_ended: bool,
+) -> Optional[dict[str, float]]:
+    if raw_market is None:
+        return None
+
+    if require_ended:
+        end_dt = _parse_datetime(raw_market.get("endDate"))
+        if end_dt is None or now_ts < end_dt.timestamp():
+            return None
+
+    probs = _extract_outcome_price_map(raw_market)
+    if len(probs) < 2:
+        return None
+
+    out_a, out_b = snapshot.outcome_order[:2]
+    p_a = probs.get(out_a)
+    p_b = probs.get(out_b)
+    if p_a is None or p_b is None:
+        return None
+
+    max_p = max(p_a, p_b)
+    gap = abs(p_a - p_b)
+    if max_p < min_prob or gap < min_gap:
+        return None
+
+    winner = out_a if p_a >= p_b else out_b
+    loser = out_b if winner == out_a else out_a
+    return {winner: 0.999, loser: 0.001}
+
+
 def _find_market_by_id(event: BookmakerEvent, market_id: str) -> Optional[BookmakerMarket]:
     for market in event.markets:
         if market.market_id == market_id:
@@ -1376,6 +1429,11 @@ async def run_cycle(
         markets=raw_markets,
         max_concurrency=args.max_book_concurrency,
     )
+    raw_market_by_condition = {
+        str(raw.get("conditionId", "")): raw
+        for raw in raw_markets
+        if raw.get("conditionId")
+    }
 
     now = time.time()
     snapshots_by_condition = {s.condition_id: s for s in snapshots}
@@ -1423,6 +1481,17 @@ async def run_cycle(
             external = fair_runtime.fair_for_snapshot(snapshot=snapshot, market_fair=market_fair)
             if external is not None:
                 fair = external
+        if args.timing_gamma_proxy and fair_runtime is None:
+            proxy_fair = _build_gamma_timing_fair(
+                snapshot=snapshot,
+                raw_market=raw_market_by_condition.get(snapshot.condition_id),
+                now_ts=now,
+                min_prob=args.timing_gamma_proxy_min_prob,
+                min_gap=args.timing_gamma_proxy_min_gap,
+                require_ended=args.timing_gamma_proxy_require_ended,
+            )
+            if proxy_fair is not None:
+                fair = proxy_fair
         fair_cache[snapshot.condition_id] = fair
         intents = engine.evaluate_market(snapshot, fair_prices=fair, now_ts=now)
         for intent in intents:
@@ -1667,6 +1736,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=settings.TWO_SIDED_EXTERNAL_FAIR_BLEND,
         help="Blend weight for external fair vs market fair (1.0=external only).",
+    )
+    parser.add_argument(
+        "--timing-gamma-proxy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Gamma outcomePrices as winner-proxy fair on strong post-event dislocations.",
+    )
+    parser.add_argument(
+        "--timing-gamma-proxy-min-prob",
+        type=float,
+        default=0.80,
+        help="Minimum top outcome probability in Gamma outcomePrices to activate timing proxy.",
+    )
+    parser.add_argument(
+        "--timing-gamma-proxy-min-gap",
+        type=float,
+        default=0.25,
+        help="Minimum probability gap between outcomes to activate timing proxy.",
+    )
+    parser.add_argument(
+        "--timing-gamma-proxy-require-ended",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require endDate to be passed before using timing gamma proxy fair.",
     )
 
     # Engine parameters
