@@ -188,6 +188,92 @@ class TestSignals:
         assert len(pair_sells) == 2
         assert {i.outcome for i in pair_sells} == {"Yes", "No"}
 
+    def test_buy_only_disables_all_sell_intents(self):
+        engine = TwoSidedInventoryEngine(
+            min_edge_pct=0.01,
+            exit_edge_pct=0.005,
+            max_order_usd=500.0,
+            min_order_usd=10.0,
+            enable_sells=False,
+            allow_pair_exit=False,
+        )
+        now = time.time()
+        engine.apply_fill(
+            TradeIntent(
+                condition_id="cond-1",
+                title="Will Team A win?",
+                outcome="Yes",
+                token_id="tok-yes",
+                side="BUY",
+                price=0.45,
+                size_usd=180.0,
+                edge_pct=0.02,
+                reason="seed",
+                timestamp=now - 900,
+            )
+        )
+        engine.apply_fill(
+            TradeIntent(
+                condition_id="cond-1",
+                title="Will Team A win?",
+                outcome="No",
+                token_id="tok-no",
+                side="BUY",
+                price=0.44,
+                size_usd=176.0,
+                edge_pct=0.02,
+                reason="seed",
+                timestamp=now - 900,
+            )
+        )
+
+        snapshot = make_snapshot(yes_bid=0.62, yes_ask=0.63, no_bid=0.55, no_ask=0.56)
+        intents = engine.evaluate_market(snapshot)
+        assert all(i.side == "BUY" for i in intents)
+
+    def test_allow_pair_exit_false_blocks_pair_arb_exit(self):
+        engine = TwoSidedInventoryEngine(
+            min_edge_pct=0.01,
+            exit_edge_pct=0.005,
+            max_order_usd=500.0,
+            min_order_usd=10.0,
+            allow_pair_exit=False,
+        )
+        now = time.time()
+        engine.apply_fill(
+            TradeIntent(
+                condition_id="cond-1",
+                title="Will Team A win?",
+                outcome="Yes",
+                token_id="tok-yes",
+                side="BUY",
+                price=0.45,
+                size_usd=180.0,
+                edge_pct=0.02,
+                reason="seed",
+                timestamp=now - 600,
+            )
+        )
+        engine.apply_fill(
+            TradeIntent(
+                condition_id="cond-1",
+                title="Will Team A win?",
+                outcome="No",
+                token_id="tok-no",
+                side="BUY",
+                price=0.44,
+                size_usd=176.0,
+                edge_pct=0.02,
+                reason="seed",
+                timestamp=now - 600,
+            )
+        )
+
+        snapshot = make_snapshot(yes_bid=0.53, yes_ask=0.54, no_bid=0.49, no_ask=0.50)
+        intents = engine.evaluate_market(snapshot)
+        pair_sells = [i for i in intents if i.side == "SELL" and i.reason == "pair_arb_exit"]
+        assert not pair_sells
+
 
 class TestFillAccounting:
     def test_fill_updates_avg_price_and_realized_pnl(self):

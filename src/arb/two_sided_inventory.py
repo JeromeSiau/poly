@@ -124,6 +124,8 @@ class TwoSidedInventoryEngine:
         inventory_skew_pct: float = 0.02,
         max_hold_seconds: float = 24 * 3600.0,
         fee_bps: int = 0,
+        enable_sells: bool = True,
+        allow_pair_exit: bool = True,
     ) -> None:
         self.min_edge_pct = min_edge_pct
         self.exit_edge_pct = exit_edge_pct
@@ -134,6 +136,8 @@ class TwoSidedInventoryEngine:
         self.inventory_skew_pct = inventory_skew_pct
         self.max_hold_seconds = max_hold_seconds
         self.fee_bps = fee_bps
+        self.enable_sells = enable_sells
+        self.allow_pair_exit = allow_pair_exit
 
         self._inventory: dict[tuple[str, str], InventoryState] = {}
 
@@ -318,7 +322,13 @@ class TwoSidedInventoryEngine:
                             market_net += sign_b * size_b if sign_b != 0 else 0.0
 
         # Pair exit arb: sell matched shares from both legs if rich enough.
-        if q_a.bid is not None and q_b.bid is not None and s_a.shares > 0 and s_b.shares > 0:
+        if (
+            self.allow_pair_exit
+            and q_a.bid is not None
+            and q_b.bid is not None
+            and s_a.shares > 0
+            and s_b.shares > 0
+        ):
             pair_exit_edge = (q_a.bid + q_b.bid) - 1.0 - 2 * self.fee_pct
             if pair_exit_edge >= self.exit_edge_pct:
                 shares_cap = min(
@@ -395,73 +405,74 @@ class TwoSidedInventoryEngine:
             consumed_outcomes.update(combo_consumed)
 
         # 1) Unwind / inventory-control sells first.
-        for outcome in snapshot.outcome_order:
-            if outcome in consumed_outcomes:
-                continue
-            quote = snapshot.outcomes[outcome]
-            state = self.get_state(snapshot.condition_id, outcome)
-            if not state.is_open() or quote.bid is None:
-                continue
+        if self.enable_sells:
+            for outcome in snapshot.outcome_order:
+                if outcome in consumed_outcomes:
+                    continue
+                quote = snapshot.outcomes[outcome]
+                state = self.get_state(snapshot.condition_id, outcome)
+                if not state.is_open() or quote.bid is None:
+                    continue
 
-            fair_price = fair[outcome]
-            inv_value = state.notional(fair_price)
-            hold_age = (now - state.opened_at) if state.opened_at else 0.0
+                fair_price = fair[outcome]
+                inv_value = state.notional(fair_price)
+                hold_age = (now - state.opened_at) if state.opened_at else 0.0
 
-            edge_sell = quote.bid - fair_price - self.fee_pct
-            stale_exit = (
-                hold_age >= self.max_hold_seconds
-                and quote.bid >= state.avg_price + self.fee_pct
-            )
-            risk_exit = inv_value > self.max_outcome_inventory_usd
-
-            if edge_sell < self.exit_edge_pct and not stale_exit and not risk_exit:
-                continue
-
-            available_notional = state.shares * quote.bid
-            if available_notional <= 0:
-                continue
-
-            size_cap = min(
-                self.max_order_usd,
-                available_notional,
-                (quote.bid_size or (available_notional / quote.bid)) * quote.bid,
-            )
-            if risk_exit:
-                excess = inv_value - self.max_outcome_inventory_usd
-                size_cap = max(size_cap, min(excess, available_notional))
-
-            sign = self._outcome_sign(snapshot, outcome)
-            net_room = self._room_by_market_net(market_net, side="SELL", sign=sign)
-            size_usd = min(size_cap, net_room if sign != 0 else size_cap)
-
-            if size_usd < self.min_order_usd:
-                continue
-
-            reason_bits: list[str] = []
-            if edge_sell >= self.exit_edge_pct:
-                reason_bits.append("over_fair")
-            if stale_exit:
-                reason_bits.append("max_hold")
-            if risk_exit:
-                reason_bits.append("inv_cap")
-
-            intents.append(
-                TradeIntent(
-                    condition_id=snapshot.condition_id,
-                    title=snapshot.title,
-                    outcome=outcome,
-                    token_id=quote.token_id,
-                    side="SELL",
-                    price=quote.bid,
-                    size_usd=size_usd,
-                    edge_pct=edge_sell,
-                    reason="+".join(reason_bits) if reason_bits else "rebalance",
-                    timestamp=now,
+                edge_sell = quote.bid - fair_price - self.fee_pct
+                stale_exit = (
+                    hold_age >= self.max_hold_seconds
+                    and quote.bid >= state.avg_price + self.fee_pct
                 )
-            )
-            consumed_outcomes.add(outcome)
-            if sign != 0:
-                market_net -= sign * size_usd
+                risk_exit = inv_value > self.max_outcome_inventory_usd
+
+                if edge_sell < self.exit_edge_pct and not stale_exit and not risk_exit:
+                    continue
+
+                available_notional = state.shares * quote.bid
+                if available_notional <= 0:
+                    continue
+
+                size_cap = min(
+                    self.max_order_usd,
+                    available_notional,
+                    (quote.bid_size or (available_notional / quote.bid)) * quote.bid,
+                )
+                if risk_exit:
+                    excess = inv_value - self.max_outcome_inventory_usd
+                    size_cap = max(size_cap, min(excess, available_notional))
+
+                sign = self._outcome_sign(snapshot, outcome)
+                net_room = self._room_by_market_net(market_net, side="SELL", sign=sign)
+                size_usd = min(size_cap, net_room if sign != 0 else size_cap)
+
+                if size_usd < self.min_order_usd:
+                    continue
+
+                reason_bits: list[str] = []
+                if edge_sell >= self.exit_edge_pct:
+                    reason_bits.append("over_fair")
+                if stale_exit:
+                    reason_bits.append("max_hold")
+                if risk_exit:
+                    reason_bits.append("inv_cap")
+
+                intents.append(
+                    TradeIntent(
+                        condition_id=snapshot.condition_id,
+                        title=snapshot.title,
+                        outcome=outcome,
+                        token_id=quote.token_id,
+                        side="SELL",
+                        price=quote.bid,
+                        size_usd=size_usd,
+                        edge_pct=edge_sell,
+                        reason="+".join(reason_bits) if reason_bits else "rebalance",
+                        timestamp=now,
+                    )
+                )
+                consumed_outcomes.add(outcome)
+                if sign != 0:
+                    market_net -= sign * size_usd
 
         # 2) New entries / adds.
         for outcome in snapshot.outcome_order:

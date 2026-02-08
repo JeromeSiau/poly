@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -13,6 +14,7 @@ from src.analysis.rn1_comparison import (
     build_gaps,
     build_recommendations,
     fetch_rn1_activity,
+    load_local_two_sided_events,
     summarize_behavior,
 )
 
@@ -399,3 +401,66 @@ def test_build_rn1_vs_local_condition_report_computes_overlap(monkeypatch: pytes
 
     rn1_only = report["rn1_only_top"][0]
     assert rn1_only["condition_id"] == "cond-b"
+
+
+def test_load_local_two_sided_events_maps_pair_merge_to_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DummyQuery:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def join(self, *args, **kwargs):
+            return self
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return self._rows
+
+    class _DummySession:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def query(self, *args, **kwargs):
+            return _DummyQuery(self._rows)
+
+        def close(self):
+            return None
+
+    class _DummyTrade:
+        side = "SELL"
+        size = 5.0
+        created_at = datetime(2026, 2, 8, 19, 0, 0)
+        observation_id = 1
+
+    class _DummyObs:
+        id = 1
+        event_type = "two_sided_inventory"
+        match_id = "cond-1"
+        timestamp = datetime(2026, 2, 8, 19, 0, 0)
+        game_state = {
+            "strategy_tag": "rn1_ext",
+            "condition_id": "cond-1",
+            "outcome": "Yes",
+            "reason": "pair_merge",
+        }
+
+    rows = [(_DummyTrade(), _DummyObs())]
+    monkeypatch.setattr("src.analysis.rn1_comparison.create_engine", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        "src.analysis.rn1_comparison.sessionmaker",
+        lambda bind=None: (lambda: _DummySession(rows)),
+    )
+
+    events = load_local_two_sided_events(
+        db_url="sqlite:///ignored.db",
+        window_hours=6.0,
+        strategy_tag="rn1_ext",
+    )
+
+    assert len(events) == 1
+    assert events[0].side == "MERGE"
+    assert events[0].reason == "pair_merge"

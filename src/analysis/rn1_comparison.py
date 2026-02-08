@@ -273,8 +273,6 @@ def load_local_two_sided_events(
         if strategy_tag and tag != strategy_tag:
             continue
         side = str(trade.side or state.get("side") or "").upper()
-        if side not in {"BUY", "SELL"}:
-            continue
         ts = _dt_to_ts(trade.created_at or observation.timestamp)
         if ts <= 0:
             continue
@@ -283,6 +281,10 @@ def load_local_two_sided_events(
             continue
         outcome = str(state.get("outcome") or "")
         reason = str(state.get("reason") or "")
+        if reason == "pair_merge":
+            side = "MERGE"
+        if side not in {"BUY", "SELL", "MERGE"}:
+            continue
         out.append(
             ActivityEvent(
                 timestamp=ts,

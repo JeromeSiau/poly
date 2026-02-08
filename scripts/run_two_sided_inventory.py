@@ -1680,6 +1680,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max hold age before stale exit.",
     )
     parser.add_argument(
+        "--buy-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable SELL intents from over-fair/max-hold/inventory logic and pair exits; keep BUY intents.",
+    )
+    parser.add_argument(
+        "--allow-pair-exit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow pair_arb_exit SELL intents when bid_yes + bid_no is rich enough.",
+    )
+    parser.add_argument(
         "--pair-merge",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1797,6 +1809,8 @@ async def main() -> None:
         inventory_skew_pct=args.inventory_skew,
         max_hold_seconds=args.max_hold_seconds,
         fee_bps=settings.POLYMARKET_FEE_BPS,
+        enable_sells=not args.buy_only,
+        allow_pair_exit=(args.allow_pair_exit and not args.buy_only),
     )
     executor = build_executor_if_needed(args.autopilot)
     fair_runtime: Optional[ExternalFairRuntime] = None
