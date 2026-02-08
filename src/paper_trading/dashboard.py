@@ -19,6 +19,7 @@ from src.ml.validation.calibration import reliability_diagram_data
 from src.paper_trading.metrics import PaperTradingMetrics, TradeRecord
 
 TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
+CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
 
 def load_data(db_path: str = "data/arb.db"):
@@ -260,6 +261,7 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "mark_timestamp": None,
                 "latest_fair_price": 0.0,
                 "latest_bid_price": 0.0,
+                "latest_bid_timestamp": None,
                 "exit_edge_pct": 0.0,
                 "min_order_usd": 0.0,
                 "max_hold_seconds": 0.0,
@@ -289,6 +291,7 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
         bid_price = _safe_float(row.get("market_bid"), default=0.0)
         if bid_price > 0:
             cur["latest_bid_price"] = bid_price
+            cur["latest_bid_timestamp"] = ts
         exit_edge_pct = _safe_float(row.get("exit_edge_pct"), default=0.0)
         if exit_edge_pct > 0:
             cur["exit_edge_pct"] = exit_edge_pct
@@ -353,6 +356,13 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
         fair = _safe_float(cur.get("latest_fair_price"), default=0.0)
         bid = _safe_float(cur.get("latest_bid_price"), default=0.0)
+        bid_ts = cur.get("latest_bid_timestamp")
+        bid_age_minutes: Optional[float] = None
+        if isinstance(bid_ts, datetime):
+            ts = bid_ts
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            bid_age_minutes = max(0.0, (now - ts).total_seconds() / 60.0)
         fee_pct = _safe_float(cur.get("fee_pct"), default=0.0)
         exit_edge = _safe_float(cur.get("exit_edge_pct"), default=0.0)
         min_order = _safe_float(cur.get("min_order_usd"), default=0.0)
@@ -371,6 +381,15 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
             edge_sell_est = bid - fair - fee_pct
         inv_value = open_shares * fair if fair > 0 else 0.0
         open_notional = open_shares * bid if bid > 0 else 0.0
+        fresh_bid = bool(
+            bid > 0
+            and bid_age_minutes is not None
+            and bid_age_minutes <= CONSERVATIVE_BID_MAX_AGE_MINUTES
+        )
+        conservative_mark = bid if fresh_bid else 0.0
+        conservative_mark_reason = "fresh_bid" if fresh_bid else ("stale_or_missing_bid_zero")
+        unrealized_conservative = open_shares * (conservative_mark - avg_entry)
+        open_notional_conservative = open_shares * conservative_mark
         stale_exit = bool(
             max_hold > 0
             and hold_age_seconds is not None
@@ -415,12 +434,18 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "avg_entry_price": avg_entry,
                 "mark_price": mark,
                 "unrealized_pnl": unrealized,
+                "unrealized_pnl_mark": unrealized,
+                "conservative_mark_price": conservative_mark,
+                "conservative_mark_reason": conservative_mark_reason,
+                "unrealized_conservative": unrealized_conservative,
                 "mark_timestamp": mark_ts,
                 "mark_age_minutes": mark_age_minutes,
+                "bid_age_minutes": bid_age_minutes,
                 "fair_price": fair,
                 "edge_sell_est": edge_sell_est,
                 "exit_edge_pct": exit_edge,
                 "open_notional": open_notional,
+                "open_notional_conservative": open_notional_conservative,
                 "hold_age_seconds": hold_age_seconds,
                 "sell_signal": sell_signal,
                 "sell_trigger": sell_trigger,
@@ -430,7 +455,7 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
     if not rows_out:
         return pd.DataFrame()
-    return pd.DataFrame(rows_out).sort_values(["strategy_tag", "unrealized_pnl"], ascending=[True, True])
+    return pd.DataFrame(rows_out).sort_values(["strategy_tag", "unrealized_conservative"], ascending=[True, True])
 
 
 def create_pnl_chart(trades: list[PaperTrade]) -> go.Figure:
@@ -720,7 +745,8 @@ def main():
                 two_sided_open_inventory_df
                 .groupby(["strategy_tag", "condition_id", "title"], as_index=False)
                 .agg(
-                    unrealized_pnl=("unrealized_pnl", "sum"),
+                    unrealized_pnl_mark=("unrealized_pnl_mark", "sum"),
+                    unrealized_conservative=("unrealized_conservative", "sum"),
                     open_outcomes=("outcome", "count"),
                     max_mark_age_minutes=("mark_age_minutes", "max"),
                 )
@@ -730,15 +756,23 @@ def main():
                 on=["strategy_tag", "condition_id", "title"],
                 how="left",
             )
-        if "unrealized_pnl" not in two_sided_summary_df.columns:
-            two_sided_summary_df["unrealized_pnl"] = 0.0
+        if "unrealized_pnl_mark" not in two_sided_summary_df.columns:
+            two_sided_summary_df["unrealized_pnl_mark"] = 0.0
+        if "unrealized_conservative" not in two_sided_summary_df.columns:
+            two_sided_summary_df["unrealized_conservative"] = 0.0
         if "open_outcomes" not in two_sided_summary_df.columns:
             two_sided_summary_df["open_outcomes"] = 0
         if "max_mark_age_minutes" not in two_sided_summary_df.columns:
             two_sided_summary_df["max_mark_age_minutes"] = 0.0
-        two_sided_summary_df["unrealized_pnl"] = two_sided_summary_df["unrealized_pnl"].fillna(0.0)
+        two_sided_summary_df["unrealized_pnl_mark"] = two_sided_summary_df["unrealized_pnl_mark"].fillna(0.0)
+        two_sided_summary_df["unrealized_conservative"] = two_sided_summary_df["unrealized_conservative"].fillna(0.0)
+        # Keep `unrealized_pnl` as the trusted conservative series for exports/tables.
+        two_sided_summary_df["unrealized_pnl"] = two_sided_summary_df["unrealized_conservative"]
         two_sided_summary_df["open_outcomes"] = two_sided_summary_df["open_outcomes"].fillna(0).astype(int)
         two_sided_summary_df["max_mark_age_minutes"] = two_sided_summary_df["max_mark_age_minutes"].fillna(0.0)
+        two_sided_summary_df["total_pnl_mark"] = (
+            two_sided_summary_df["realized_pnl"] + two_sided_summary_df["unrealized_pnl_mark"]
+        )
         two_sided_summary_df["total_pnl"] = (
             two_sided_summary_df["realized_pnl"] + two_sided_summary_df["unrealized_pnl"]
         )
@@ -774,12 +808,14 @@ def main():
     if not two_sided_summary_df.empty:
         st.caption("Two-sided risk view (current tag filter)")
         ts_realized = float(two_sided_summary_df["realized_pnl"].sum())
+        ts_unrealized_mark = float(two_sided_summary_df["unrealized_pnl_mark"].sum())
         ts_unrealized = float(two_sided_summary_df["unrealized_pnl"].sum())
         ts_total = float(two_sided_summary_df["total_pnl"].sum())
-        risk_cols = st.columns(3)
+        risk_cols = st.columns(4)
         risk_cols[0].metric("Two-Sided Realized", f"${ts_realized:,.2f}")
-        risk_cols[1].metric("Two-Sided Unrealized", f"${ts_unrealized:,.2f}")
-        risk_cols[2].metric("Two-Sided Total", f"${ts_total:,.2f}")
+        risk_cols[1].metric("Unrealized (Conservative)", f"${ts_unrealized:,.2f}")
+        risk_cols[2].metric("Total (Conservative)", f"${ts_total:,.2f}")
+        risk_cols[3].metric("Unrealized (Mark)", f"${ts_unrealized_mark:,.2f}")
 
     st.divider()
 
@@ -816,12 +852,12 @@ def main():
         col_a.metric("Pairs", int(two_sided_summary_df.shape[0]))
         col_b.metric("Two-Sided Trades", int(len(two_sided_rows_view)))
         col_c.metric("Realized P&L", f"${two_sided_summary_df['realized_pnl'].sum():,.2f}")
-        col_d.metric("Unrealized P&L", f"${two_sided_summary_df['unrealized_pnl'].sum():,.2f}")
+        col_d.metric("Unrealized (Conservative)", f"${two_sided_summary_df['unrealized_pnl'].sum():,.2f}")
         open_pairs = int((two_sided_summary_df["open_outcomes"] > 0).sum())
         col_e.metric("Total P&L", f"${two_sided_summary_df['total_pnl'].sum():,.2f}")
         col_f.metric("Open Pairs", open_pairs)
 
-        st.caption("Best pairs (total P&L = realized + unrealized)")
+        st.caption("Best pairs (conservative total P&L = realized + conservative unrealized)")
         top_pairs = two_sided_summary_df.nlargest(20, "total_pnl").copy()
         top_pairs["win_rate_sells"] = top_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
         top_pairs["avg_edge_theoretical"] = top_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
@@ -829,7 +865,7 @@ def main():
         top_pairs["max_mark_age_minutes"] = top_pairs["max_mark_age_minutes"].map(lambda x: f"{x:.1f}")
         st.dataframe(top_pairs, use_container_width=True, hide_index=True)
 
-        st.caption("Worst pairs (total P&L = realized + unrealized)")
+        st.caption("Worst pairs (conservative total P&L = realized + conservative unrealized)")
         worst_pairs = two_sided_summary_df.nsmallest(20, "total_pnl").copy()
         worst_pairs["win_rate_sells"] = worst_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
         worst_pairs["avg_edge_theoretical"] = worst_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
@@ -837,12 +873,12 @@ def main():
         worst_pairs["max_mark_age_minutes"] = worst_pairs["max_mark_age_minutes"].map(lambda x: f"{x:.1f}")
         st.dataframe(worst_pairs, use_container_width=True, hide_index=True)
 
-        st.caption("Open inventory by outcome (mark-based unrealized estimate)")
+        st.caption("Open inventory by outcome (conservative vs mark unrealized)")
         if two_sided_open_inventory_df.empty:
             st.info("No open two-sided inventory.")
         else:
             inv_view = two_sided_open_inventory_df.copy()
-            inv_view = inv_view.sort_values("unrealized_pnl")
+            inv_view = inv_view.sort_values("unrealized_conservative")
             inv_view = inv_view[
                 [
                     "strategy_tag",
@@ -851,7 +887,11 @@ def main():
                     "outcome",
                     "open_shares",
                     "avg_entry_price",
+                    "conservative_mark_price",
+                    "conservative_mark_reason",
+                    "unrealized_conservative",
                     "mark_price",
+                    "unrealized_pnl_mark",
                     "fair_price",
                     "edge_sell_est",
                     "exit_edge_pct",
@@ -859,12 +899,14 @@ def main():
                     "sell_trigger",
                     "sell_block_reason",
                     "open_notional",
+                    "open_notional_conservative",
                     "hold_age_seconds",
-                    "unrealized_pnl",
+                    "bid_age_minutes",
                     "mark_age_minutes",
                 ]
             ]
             inv_view["avg_entry_price"] = inv_view["avg_entry_price"].map(lambda x: f"{x:.3f}")
+            inv_view["conservative_mark_price"] = inv_view["conservative_mark_price"].map(lambda x: f"{x:.3f}")
             inv_view["mark_price"] = inv_view["mark_price"].map(lambda x: f"{x:.3f}")
             inv_view["fair_price"] = inv_view["fair_price"].map(lambda x: f"{x:.3f}")
             inv_view["edge_sell_est"] = inv_view["edge_sell_est"].map(
@@ -875,10 +917,17 @@ def main():
             inv_view["sell_signal"] = inv_view["sell_signal"].map(lambda x: "yes" if bool(x) else "no")
             inv_view["sell_block_reason"] = inv_view["sell_block_reason"].map(_format_sell_reason)
             inv_view["open_notional"] = inv_view["open_notional"].map(lambda x: f"${float(x):,.2f}")
+            inv_view["open_notional_conservative"] = inv_view["open_notional_conservative"].map(
+                lambda x: f"${float(x):,.2f}"
+            )
             inv_view["hold_age_seconds"] = inv_view["hold_age_seconds"].map(
                 lambda x: "n/a" if x is None else f"{float(x) / 60.0:.1f}m"
             )
-            inv_view["unrealized_pnl"] = inv_view["unrealized_pnl"].map(lambda x: f"${x:,.2f}")
+            inv_view["unrealized_conservative"] = inv_view["unrealized_conservative"].map(lambda x: f"${x:,.2f}")
+            inv_view["unrealized_pnl_mark"] = inv_view["unrealized_pnl_mark"].map(lambda x: f"${x:,.2f}")
+            inv_view["bid_age_minutes"] = inv_view["bid_age_minutes"].map(
+                lambda x: "n/a" if x is None else f"{float(x):.1f}"
+            )
             inv_view["mark_age_minutes"] = inv_view["mark_age_minutes"].map(
                 lambda x: "n/a" if x is None else f"{float(x):.1f}"
             )

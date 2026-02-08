@@ -1,6 +1,6 @@
 """Tests for dashboard helpers used by two-sided reporting."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -238,3 +238,55 @@ def test_build_two_sided_open_inventory_ready_to_sell_reason() -> None:
     assert item["sell_trigger"] == "edge"
     assert item["open_notional"] == pytest.approx(40.0, rel=1e-9)
     assert item["sell_block_reason"] == "ready_to_sell"
+
+
+def test_build_two_sided_open_inventory_conservative_uses_fresh_bid() -> None:
+    now = datetime.now()
+    rows = [
+        {
+            "trade_id": 1,
+            "timestamp": now,
+            "strategy_tag": "edge_cons_fresh",
+            "condition_id": "cond-cons-fresh",
+            "title": "Will Team E win?",
+            "outcome": "Yes",
+            "side": "BUY",
+            "shares": 100.0,
+            "fill_price": 0.40,
+            "fair_price": 0.42,
+            "market_bid": 0.45,
+        },
+    ]
+
+    inventory = build_two_sided_open_inventory(rows)
+    assert inventory.shape[0] == 1
+    item = inventory.iloc[0]
+    assert item["conservative_mark_price"] == pytest.approx(0.45, rel=1e-9)
+    assert item["unrealized_conservative"] == pytest.approx(5.0, rel=1e-9)
+    assert item["conservative_mark_reason"] == "fresh_bid"
+
+
+def test_build_two_sided_open_inventory_conservative_zero_when_bid_stale() -> None:
+    stale_ts = datetime.now() - timedelta(hours=2)
+    rows = [
+        {
+            "trade_id": 1,
+            "timestamp": stale_ts,
+            "strategy_tag": "edge_cons_stale",
+            "condition_id": "cond-cons-stale",
+            "title": "Will Team F win?",
+            "outcome": "Yes",
+            "side": "BUY",
+            "shares": 100.0,
+            "fill_price": 0.40,
+            "fair_price": 0.42,
+            "market_bid": 0.45,
+        },
+    ]
+
+    inventory = build_two_sided_open_inventory(rows)
+    assert inventory.shape[0] == 1
+    item = inventory.iloc[0]
+    assert item["conservative_mark_price"] == pytest.approx(0.0, abs=1e-9)
+    assert item["unrealized_conservative"] == pytest.approx(-40.0, rel=1e-9)
+    assert item["conservative_mark_reason"] == "stale_or_missing_bid_zero"
