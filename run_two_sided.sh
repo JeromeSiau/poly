@@ -45,6 +45,7 @@ MIN_LIQUIDITY="${MIN_LIQUIDITY:-500}"
 MIN_VOLUME_24H="${MIN_VOLUME_24H:-100}"
 MAX_DAYS_TO_END="${MAX_DAYS_TO_END:-1}"
 INCLUDE_NONSPORTS="${INCLUDE_NONSPORTS:-0}"
+EVENT_PREFIXES="${EVENT_PREFIXES:-}"
 
 UNIVERSE_FLAGS=()
 if [[ "$INCLUDE_NONSPORTS" == "1" ]]; then
@@ -89,6 +90,7 @@ case "$STRATEGY_STYLE" in
     if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="20"; fi
     if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="3"; fi
     if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="1"; fi
+    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="epl,cs2,lal,nba,fl1,sea,por,tur,cbb"; fi
     ;;
   *)
     echo "Invalid STRATEGY_STYLE: $STRATEGY_STYLE (expected default|rn1_mimic)" >&2
@@ -101,9 +103,12 @@ UNIVERSE_FLAGS=()
 if [[ "$INCLUDE_NONSPORTS" == "1" ]]; then
   UNIVERSE_FLAGS+=("--include-nonsports")
 fi
+if [[ -n "$EVENT_PREFIXES" ]]; then
+  UNIVERSE_FLAGS+=("--event-prefixes" "$EVENT_PREFIXES")
+fi
 
 exec >> "$LOG_FILE" 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start tag=$TAG mode=$MODE wallet_usd=$WALLET_USD fair_mode=$FAIR_MODE fair_blend=$FAIR_BLEND strategy_style=$STRATEGY_STYLE min_edge=$MIN_EDGE exit_edge=$EXIT_EDGE min_order=$MIN_ORDER max_order=$MAX_ORDER max_outcome_inv=$MAX_OUTCOME_INV max_market_net=$MAX_MARKET_NET interval=$WATCH_INTERVAL signal_cooldown=$SIGNAL_COOLDOWN max_orders_per_cycle=$MAX_ORDERS_PER_CYCLE pair_merge_min_edge=$PAIR_MERGE_MIN_EDGE min_liquidity=$MIN_LIQUIDITY min_volume_24h=$MIN_VOLUME_24H max_days_to_end=$MAX_DAYS_TO_END include_nonsports=$INCLUDE_NONSPORTS"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start tag=$TAG mode=$MODE wallet_usd=$WALLET_USD fair_mode=$FAIR_MODE fair_blend=$FAIR_BLEND strategy_style=$STRATEGY_STYLE min_edge=$MIN_EDGE exit_edge=$EXIT_EDGE min_order=$MIN_ORDER max_order=$MAX_ORDER max_outcome_inv=$MAX_OUTCOME_INV max_market_net=$MAX_MARKET_NET interval=$WATCH_INTERVAL signal_cooldown=$SIGNAL_COOLDOWN max_orders_per_cycle=$MAX_ORDERS_PER_CYCLE pair_merge_min_edge=$PAIR_MERGE_MIN_EDGE min_liquidity=$MIN_LIQUIDITY min_volume_24h=$MIN_VOLUME_24H max_days_to_end=$MAX_DAYS_TO_END include_nonsports=$INCLUDE_NONSPORTS event_prefixes=$EVENT_PREFIXES"
 
 exec "$BASE/.venv/bin/python" "$BASE/scripts/run_two_sided_inventory.py" \
   watch \

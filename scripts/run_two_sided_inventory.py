@@ -766,10 +766,12 @@ async def fetch_markets(
     min_volume_24h: float,
     sports_only: bool,
     max_days_to_end: float,
+    event_prefixes: list[str],
 ) -> list[dict[str, Any]]:
     all_markets: list[dict[str, Any]] = []
     offset = 0
     batch = 100
+    prefixes = [p.strip().lower() for p in event_prefixes if p.strip()]
 
     while len(all_markets) < limit:
         response = await client.get(
@@ -792,6 +794,7 @@ async def fetch_markets(
             question = str(raw.get("question", ""))
             liquidity = _to_float(raw.get("liquidityNum"))
             volume_24h = _to_float(raw.get("volume24hr"))
+            event_slug = _first_event_slug(raw).strip().lower()
 
             if len(outcomes) != 2 or len(clob_ids) < 2:
                 continue
@@ -799,6 +802,11 @@ async def fetch_markets(
                 continue
             if liquidity < min_liquidity or volume_24h < min_volume_24h:
                 continue
+            if prefixes:
+                if not event_slug:
+                    continue
+                if not any(event_slug == p or event_slug.startswith(f"{p}-") for p in prefixes):
+                    continue
             if sports_only and not _looks_sports(question, [str(o) for o in outcomes]):
                 continue
             if max_days_to_end > 0:
@@ -1349,6 +1357,7 @@ async def run_cycle(
         min_volume_24h=args.min_volume_24h,
         sports_only=not args.include_nonsports,
         max_days_to_end=args.max_days_to_end,
+        event_prefixes=_parse_csv_values(args.event_prefixes),
     )
     snapshots = await build_snapshots(
         client=client,
@@ -1557,6 +1566,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep markets ending within N days (0 disables the filter).",
     )
     parser.add_argument("--include-nonsports", action="store_true", help="Include non-sports markets.")
+    parser.add_argument(
+        "--event-prefixes",
+        type=str,
+        default="",
+        help="Optional comma-separated event slug prefixes filter (e.g. epl,cs2,lal).",
+    )
     parser.add_argument(
         "--max-book-concurrency",
         type=int,
