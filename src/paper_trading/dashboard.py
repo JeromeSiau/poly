@@ -1,6 +1,7 @@
 """Streamlit dashboard for paper trading monitoring."""
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -99,6 +100,10 @@ def extract_two_sided_trade_rows(
                 "shares": shares,
                 "signed_shares": signed_shares,
                 "size_usd": size_usd,
+                "fill_price": fill_price,
+                "fair_price": _safe_float(state.get("fair_price"), default=0.0),
+                "market_bid": _safe_float(state.get("market_bid"), default=0.0),
+                "market_ask": _safe_float(state.get("market_ask"), default=0.0),
                 "edge_theoretical": _safe_float(trade.edge_theoretical),
                 "edge_realized": _safe_float(trade.edge_realized),
                 "pnl": _safe_float(trade.pnl),
@@ -202,6 +207,115 @@ def summarize_two_sided_pairs(rows: list[dict[str, Any]]) -> pd.DataFrame:
         ["strategy_tag", "realized_pnl"],
         ascending=[True, False],
     )
+
+
+def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Estimate open inventory and unrealized P&L from stored two-sided rows."""
+    if not rows:
+        return pd.DataFrame()
+
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            row.get("timestamp") or datetime.min,
+            int(row.get("trade_id") or 0),
+        ),
+    )
+    state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for row in ordered:
+        key = (
+            str(row.get("strategy_tag") or "default"),
+            str(row.get("condition_id") or ""),
+            str(row.get("title") or ""),
+            str(row.get("outcome") or ""),
+        )
+        if not key[1] or not key[3]:
+            continue
+
+        cur = state.get(key)
+        if cur is None:
+            cur = {
+                "shares": 0.0,
+                "avg_entry_price": 0.0,
+                "mark_price": 0.0,
+                "mark_timestamp": None,
+            }
+            state[key] = cur
+
+        shares = _safe_float(row.get("shares"), default=0.0)
+        fill_price = _safe_float(row.get("fill_price"), default=0.0)
+        side = str(row.get("side") or "")
+
+        mark_price = _safe_float(row.get("market_bid"), default=0.0)
+        if mark_price <= 0:
+            mark_price = _safe_float(row.get("fair_price"), default=0.0)
+        if mark_price <= 0:
+            mark_price = fill_price
+        if mark_price > 0:
+            cur["mark_price"] = mark_price
+            cur["mark_timestamp"] = row.get("timestamp")
+
+        if shares <= 0 or fill_price <= 0:
+            continue
+
+        if side == "BUY":
+            prev_shares = _safe_float(cur["shares"], default=0.0)
+            total = prev_shares + shares
+            if total > 0:
+                if prev_shares > 0:
+                    cur["avg_entry_price"] = (
+                        _safe_float(cur["avg_entry_price"], default=0.0) * prev_shares
+                        + fill_price * shares
+                    ) / total
+                else:
+                    cur["avg_entry_price"] = fill_price
+                cur["shares"] = total
+        elif side == "SELL":
+            prev_shares = _safe_float(cur["shares"], default=0.0)
+            sold = min(prev_shares, shares)
+            remaining = prev_shares - sold
+            if remaining <= 1e-9:
+                cur["shares"] = 0.0
+                cur["avg_entry_price"] = 0.0
+            else:
+                cur["shares"] = remaining
+
+    now = datetime.now()
+    rows_out: list[dict[str, Any]] = []
+    for (tag, condition_id, title, outcome), cur in state.items():
+        open_shares = _safe_float(cur.get("shares"), default=0.0)
+        if open_shares <= 1e-9:
+            continue
+        avg_entry = _safe_float(cur.get("avg_entry_price"), default=0.0)
+        mark = _safe_float(cur.get("mark_price"), default=0.0)
+        unrealized = open_shares * (mark - avg_entry)
+        mark_ts = cur.get("mark_timestamp")
+        mark_age_minutes: Optional[float] = None
+        if isinstance(mark_ts, datetime):
+            ts = mark_ts
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            mark_age_minutes = max(0.0, (now - ts).total_seconds() / 60.0)
+
+        rows_out.append(
+            {
+                "strategy_tag": tag,
+                "condition_id": condition_id,
+                "title": title,
+                "outcome": outcome,
+                "open_shares": open_shares,
+                "avg_entry_price": avg_entry,
+                "mark_price": mark,
+                "unrealized_pnl": unrealized,
+                "mark_timestamp": mark_ts,
+                "mark_age_minutes": mark_age_minutes,
+            }
+        )
+
+    if not rows_out:
+        return pd.DataFrame()
+    return pd.DataFrame(rows_out).sort_values(["strategy_tag", "unrealized_pnl"], ascending=[True, True])
 
 
 def create_pnl_chart(trades: list[PaperTrade]) -> go.Figure:
@@ -484,6 +598,35 @@ def main():
         if selected_tag == "All" or row.get("strategy_tag") == selected_tag
     ]
     two_sided_summary_df = summarize_two_sided_pairs(two_sided_rows_view)
+    two_sided_open_inventory_df = build_two_sided_open_inventory(two_sided_rows_view)
+    if not two_sided_summary_df.empty:
+        if not two_sided_open_inventory_df.empty:
+            pair_unrealized = (
+                two_sided_open_inventory_df
+                .groupby(["strategy_tag", "condition_id", "title"], as_index=False)
+                .agg(
+                    unrealized_pnl=("unrealized_pnl", "sum"),
+                    open_outcomes=("outcome", "count"),
+                    max_mark_age_minutes=("mark_age_minutes", "max"),
+                )
+            )
+            two_sided_summary_df = two_sided_summary_df.merge(
+                pair_unrealized,
+                on=["strategy_tag", "condition_id", "title"],
+                how="left",
+            )
+        if "unrealized_pnl" not in two_sided_summary_df.columns:
+            two_sided_summary_df["unrealized_pnl"] = 0.0
+        if "open_outcomes" not in two_sided_summary_df.columns:
+            two_sided_summary_df["open_outcomes"] = 0
+        if "max_mark_age_minutes" not in two_sided_summary_df.columns:
+            two_sided_summary_df["max_mark_age_minutes"] = 0.0
+        two_sided_summary_df["unrealized_pnl"] = two_sided_summary_df["unrealized_pnl"].fillna(0.0)
+        two_sided_summary_df["open_outcomes"] = two_sided_summary_df["open_outcomes"].fillna(0).astype(int)
+        two_sided_summary_df["max_mark_age_minutes"] = two_sided_summary_df["max_mark_age_minutes"].fillna(0.0)
+        two_sided_summary_df["total_pnl"] = (
+            two_sided_summary_df["realized_pnl"] + two_sided_summary_df["unrealized_pnl"]
+        )
 
     # Calculate metrics
     metrics = calculate_metrics(trades_view)
@@ -512,6 +655,16 @@ def main():
         "Profit Factor",
         f"{metrics['profit_factor']:.2f}" if metrics['profit_factor'] != float('inf') else "N/A",
     )
+
+    if not two_sided_summary_df.empty:
+        st.caption("Two-sided risk view (current tag filter)")
+        ts_realized = float(two_sided_summary_df["realized_pnl"].sum())
+        ts_unrealized = float(two_sided_summary_df["unrealized_pnl"].sum())
+        ts_total = float(two_sided_summary_df["total_pnl"].sum())
+        risk_cols = st.columns(3)
+        risk_cols[0].metric("Two-Sided Realized", f"${ts_realized:,.2f}")
+        risk_cols[1].metric("Two-Sided Unrealized", f"${ts_unrealized:,.2f}")
+        risk_cols[2].metric("Two-Sided Total", f"${ts_total:,.2f}")
 
     st.divider()
 
@@ -544,26 +697,45 @@ def main():
     if two_sided_summary_df.empty:
         st.info("No two-sided rows for current filter.")
     else:
-        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a, col_b, col_c, col_d, col_e, col_f = st.columns(6)
         col_a.metric("Pairs", int(two_sided_summary_df.shape[0]))
         col_b.metric("Two-Sided Trades", int(len(two_sided_rows_view)))
         col_c.metric("Realized P&L", f"${two_sided_summary_df['realized_pnl'].sum():,.2f}")
-        open_pairs = int((two_sided_summary_df["net_shares"].abs() > 1e-9).sum())
-        col_d.metric("Open Pairs", open_pairs)
+        col_d.metric("Unrealized P&L", f"${two_sided_summary_df['unrealized_pnl'].sum():,.2f}")
+        open_pairs = int((two_sided_summary_df["open_outcomes"] > 0).sum())
+        col_e.metric("Total P&L", f"${two_sided_summary_df['total_pnl'].sum():,.2f}")
+        col_f.metric("Open Pairs", open_pairs)
 
-        st.caption("Best pairs (realized P&L)")
-        top_pairs = two_sided_summary_df.nlargest(20, "realized_pnl").copy()
+        st.caption("Best pairs (total P&L = realized + unrealized)")
+        top_pairs = two_sided_summary_df.nlargest(20, "total_pnl").copy()
         top_pairs["win_rate_sells"] = top_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
         top_pairs["avg_edge_theoretical"] = top_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
         top_pairs["avg_edge_realized_sells"] = top_pairs["avg_edge_realized_sells"].map(lambda x: f"{x:.2%}")
+        top_pairs["max_mark_age_minutes"] = top_pairs["max_mark_age_minutes"].map(lambda x: f"{x:.1f}")
         st.dataframe(top_pairs, use_container_width=True, hide_index=True)
 
-        st.caption("Worst pairs (realized P&L)")
-        worst_pairs = two_sided_summary_df.nsmallest(20, "realized_pnl").copy()
+        st.caption("Worst pairs (total P&L = realized + unrealized)")
+        worst_pairs = two_sided_summary_df.nsmallest(20, "total_pnl").copy()
         worst_pairs["win_rate_sells"] = worst_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
         worst_pairs["avg_edge_theoretical"] = worst_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
         worst_pairs["avg_edge_realized_sells"] = worst_pairs["avg_edge_realized_sells"].map(lambda x: f"{x:.2%}")
+        worst_pairs["max_mark_age_minutes"] = worst_pairs["max_mark_age_minutes"].map(lambda x: f"{x:.1f}")
         st.dataframe(worst_pairs, use_container_width=True, hide_index=True)
+
+        st.caption("Open inventory by outcome (mark-based unrealized estimate)")
+        if two_sided_open_inventory_df.empty:
+            st.info("No open two-sided inventory.")
+        else:
+            inv_view = two_sided_open_inventory_df.copy()
+            inv_view = inv_view.sort_values("unrealized_pnl")
+            inv_view["avg_entry_price"] = inv_view["avg_entry_price"].map(lambda x: f"{x:.3f}")
+            inv_view["mark_price"] = inv_view["mark_price"].map(lambda x: f"{x:.3f}")
+            inv_view["open_shares"] = inv_view["open_shares"].map(lambda x: f"{x:.2f}")
+            inv_view["unrealized_pnl"] = inv_view["unrealized_pnl"].map(lambda x: f"${x:,.2f}")
+            inv_view["mark_age_minutes"] = inv_view["mark_age_minutes"].map(
+                lambda x: "n/a" if x is None else f"{float(x):.1f}"
+            )
+            st.dataframe(inv_view, use_container_width=True, hide_index=True)
 
     st.divider()
 

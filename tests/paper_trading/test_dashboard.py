@@ -7,6 +7,7 @@ import pytest
 from src.db.models import LiveObservation, PaperTrade
 from src.paper_trading.dashboard import (
     available_two_sided_tags,
+    build_two_sided_open_inventory,
     extract_two_sided_trade_rows,
     summarize_two_sided_pairs,
 )
@@ -110,3 +111,45 @@ def test_summarize_two_sided_pairs_aggregates_metrics() -> None:
     assert item["realized_pnl"] == pytest.approx(12.0, rel=1e-9)
     assert item["net_shares"] == pytest.approx(120.0, rel=1e-9)
     assert item["win_rate_sells"] == pytest.approx(1.0, rel=1e-9)
+
+
+def test_build_two_sided_open_inventory_estimates_unrealized() -> None:
+    rows = [
+        {
+            "trade_id": 1,
+            "timestamp": datetime(2026, 2, 8, 10, 0, 0),
+            "strategy_tag": "edge_1p2_0p2",
+            "condition_id": "cond-1",
+            "title": "Will Team A win?",
+            "outcome": "Yes",
+            "side": "BUY",
+            "shares": 200.0,
+            "fill_price": 0.50,
+            "fair_price": 0.52,
+            "market_bid": 0.51,
+            "market_ask": 0.52,
+        },
+        {
+            "trade_id": 2,
+            "timestamp": datetime(2026, 2, 8, 10, 5, 0),
+            "strategy_tag": "edge_1p2_0p2",
+            "condition_id": "cond-1",
+            "title": "Will Team A win?",
+            "outcome": "Yes",
+            "side": "SELL",
+            "shares": 80.0,
+            "fill_price": 0.60,
+            "fair_price": 0.46,
+            "market_bid": 0.45,
+            "market_ask": 0.46,
+        },
+    ]
+
+    inventory = build_two_sided_open_inventory(rows)
+    assert inventory.shape[0] == 1
+    item = inventory.iloc[0]
+    assert item["strategy_tag"] == "edge_1p2_0p2"
+    assert item["open_shares"] == pytest.approx(120.0, rel=1e-9)
+    assert item["avg_entry_price"] == pytest.approx(0.50, rel=1e-9)
+    assert item["mark_price"] == pytest.approx(0.45, rel=1e-9)
+    assert item["unrealized_pnl"] == pytest.approx(-6.0, rel=1e-9)
