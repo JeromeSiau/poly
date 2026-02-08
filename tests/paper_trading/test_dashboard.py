@@ -153,3 +153,88 @@ def test_build_two_sided_open_inventory_estimates_unrealized() -> None:
     assert item["avg_entry_price"] == pytest.approx(0.50, rel=1e-9)
     assert item["mark_price"] == pytest.approx(0.45, rel=1e-9)
     assert item["unrealized_pnl"] == pytest.approx(-6.0, rel=1e-9)
+
+
+def test_build_two_sided_open_inventory_sets_edge_below_exit_reason() -> None:
+    rows = [
+        {
+            "trade_id": 1,
+            "timestamp": datetime(2026, 2, 8, 10, 0, 0),
+            "strategy_tag": "edge_1p5_0p3",
+            "condition_id": "cond-2",
+            "title": "Will Team B win?",
+            "outcome": "Yes",
+            "side": "BUY",
+            "shares": 50.0,
+            "fill_price": 0.50,
+            "fair_price": 0.52,
+            "market_bid": 0.53,
+            "exit_edge_pct": 0.03,
+            "fee_pct": 0.01,
+        },
+    ]
+
+    inventory = build_two_sided_open_inventory(rows)
+    assert inventory.shape[0] == 1
+    item = inventory.iloc[0]
+    assert bool(item["sell_signal"]) is False
+    assert item["sell_trigger"] == "none"
+    assert item["edge_sell_est"] == pytest.approx(0.0, rel=1e-9)
+    assert item["sell_block_reason"] == "edge_below_exit"
+
+
+def test_build_two_sided_open_inventory_sell_signal_and_min_order_block() -> None:
+    rows = [
+        {
+            "trade_id": 1,
+            "timestamp": datetime(2026, 2, 8, 10, 0, 0),
+            "strategy_tag": "edge_1p0_0p2",
+            "condition_id": "cond-3",
+            "title": "Will Team C win?",
+            "outcome": "Yes",
+            "side": "BUY",
+            "shares": 10.0,
+            "fill_price": 0.40,
+            "fair_price": 0.30,
+            "market_bid": 0.40,
+            "exit_edge_pct": 0.02,
+            "fee_pct": 0.0,
+            "min_order_usd": 10.0,
+        },
+    ]
+
+    inventory = build_two_sided_open_inventory(rows)
+    assert inventory.shape[0] == 1
+    item = inventory.iloc[0]
+    assert bool(item["sell_signal"]) is True
+    assert item["sell_trigger"] == "edge"
+    assert item["sell_block_reason"] == "below_min_order"
+
+
+def test_build_two_sided_open_inventory_ready_to_sell_reason() -> None:
+    rows = [
+        {
+            "trade_id": 1,
+            "timestamp": datetime(2026, 2, 8, 10, 0, 0),
+            "strategy_tag": "edge_1p0_0p2",
+            "condition_id": "cond-4",
+            "title": "Will Team D win?",
+            "outcome": "Yes",
+            "side": "BUY",
+            "shares": 100.0,
+            "fill_price": 0.40,
+            "fair_price": 0.30,
+            "market_bid": 0.40,
+            "exit_edge_pct": 0.02,
+            "fee_pct": 0.0,
+            "min_order_usd": 10.0,
+        },
+    ]
+
+    inventory = build_two_sided_open_inventory(rows)
+    assert inventory.shape[0] == 1
+    item = inventory.iloc[0]
+    assert bool(item["sell_signal"]) is True
+    assert item["sell_trigger"] == "edge"
+    assert item["open_notional"] == pytest.approx(40.0, rel=1e-9)
+    assert item["sell_block_reason"] == "ready_to_sell"

@@ -54,6 +54,19 @@ def _observation_game_state(observation: LiveObservation) -> dict[str, Any]:
     return {}
 
 
+def _format_sell_reason(reason: str) -> str:
+    labels = {
+        "ready_to_sell": "ready to sell",
+        "below_min_order": "blocked: below min order",
+        "missing_bid_mark": "blocked: missing bid",
+        "missing_fair_mark": "blocked: missing fair",
+        "edge_below_exit": "hold: edge below exit",
+        "hold_time_not_reached": "hold: max-hold not reached",
+        "waiting_rebalance": "hold: waiting rebalance",
+    }
+    return labels.get(reason, reason)
+
+
 def extract_two_sided_trade_rows(
     observations: list[LiveObservation],
     trades: list[PaperTrade],
@@ -104,6 +117,11 @@ def extract_two_sided_trade_rows(
                 "fair_price": _safe_float(state.get("fair_price"), default=0.0),
                 "market_bid": _safe_float(state.get("market_bid"), default=0.0),
                 "market_ask": _safe_float(state.get("market_ask"), default=0.0),
+                "exit_edge_pct": _safe_float(state.get("exit_edge_pct"), default=0.0),
+                "min_order_usd": _safe_float(state.get("min_order_usd"), default=0.0),
+                "max_hold_seconds": _safe_float(state.get("max_hold_seconds"), default=0.0),
+                "max_outcome_inventory_usd": _safe_float(state.get("max_outcome_inventory_usd"), default=0.0),
+                "fee_pct": _safe_float(state.get("fee_pct"), default=0.0),
                 "edge_theoretical": _safe_float(trade.edge_theoretical),
                 "edge_realized": _safe_float(trade.edge_realized),
                 "pnl": _safe_float(trade.pnl),
@@ -240,21 +258,54 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "avg_entry_price": 0.0,
                 "mark_price": 0.0,
                 "mark_timestamp": None,
+                "latest_fair_price": 0.0,
+                "latest_bid_price": 0.0,
+                "exit_edge_pct": 0.0,
+                "min_order_usd": 0.0,
+                "max_hold_seconds": 0.0,
+                "max_outcome_inventory_usd": 0.0,
+                "fee_pct": 0.0,
+                "first_buy_timestamp": None,
+                "latest_timestamp": None,
             }
             state[key] = cur
 
         shares = _safe_float(row.get("shares"), default=0.0)
         fill_price = _safe_float(row.get("fill_price"), default=0.0)
         side = str(row.get("side") or "")
+        ts = row.get("timestamp")
 
         mark_price = _safe_float(row.get("market_bid"), default=0.0)
+        fair_price = _safe_float(row.get("fair_price"), default=0.0)
         if mark_price <= 0:
-            mark_price = _safe_float(row.get("fair_price"), default=0.0)
+            mark_price = fair_price
         if mark_price <= 0:
             mark_price = fill_price
         if mark_price > 0:
             cur["mark_price"] = mark_price
-            cur["mark_timestamp"] = row.get("timestamp")
+            cur["mark_timestamp"] = ts
+        if fair_price > 0:
+            cur["latest_fair_price"] = fair_price
+        bid_price = _safe_float(row.get("market_bid"), default=0.0)
+        if bid_price > 0:
+            cur["latest_bid_price"] = bid_price
+        exit_edge_pct = _safe_float(row.get("exit_edge_pct"), default=0.0)
+        if exit_edge_pct > 0:
+            cur["exit_edge_pct"] = exit_edge_pct
+        min_order_usd = _safe_float(row.get("min_order_usd"), default=0.0)
+        if min_order_usd > 0:
+            cur["min_order_usd"] = min_order_usd
+        max_hold_seconds = _safe_float(row.get("max_hold_seconds"), default=0.0)
+        if max_hold_seconds > 0:
+            cur["max_hold_seconds"] = max_hold_seconds
+        max_outcome_inventory_usd = _safe_float(row.get("max_outcome_inventory_usd"), default=0.0)
+        if max_outcome_inventory_usd > 0:
+            cur["max_outcome_inventory_usd"] = max_outcome_inventory_usd
+        fee_pct = _safe_float(row.get("fee_pct"), default=0.0)
+        if fee_pct > 0:
+            cur["fee_pct"] = fee_pct
+        if isinstance(ts, datetime):
+            cur["latest_timestamp"] = ts
 
         if shares <= 0 or fill_price <= 0:
             continue
@@ -271,6 +322,8 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 else:
                     cur["avg_entry_price"] = fill_price
                 cur["shares"] = total
+            if isinstance(ts, datetime) and cur["first_buy_timestamp"] is None:
+                cur["first_buy_timestamp"] = ts
         elif side == "SELL":
             prev_shares = _safe_float(cur["shares"], default=0.0)
             sold = min(prev_shares, shares)
@@ -298,6 +351,60 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 ts = ts.replace(tzinfo=None)
             mark_age_minutes = max(0.0, (now - ts).total_seconds() / 60.0)
 
+        fair = _safe_float(cur.get("latest_fair_price"), default=0.0)
+        bid = _safe_float(cur.get("latest_bid_price"), default=0.0)
+        fee_pct = _safe_float(cur.get("fee_pct"), default=0.0)
+        exit_edge = _safe_float(cur.get("exit_edge_pct"), default=0.0)
+        min_order = _safe_float(cur.get("min_order_usd"), default=0.0)
+        max_hold = _safe_float(cur.get("max_hold_seconds"), default=0.0)
+        max_outcome_inv = _safe_float(cur.get("max_outcome_inventory_usd"), default=0.0)
+        first_buy_ts = cur.get("first_buy_timestamp")
+        hold_age_seconds: Optional[float] = None
+        if isinstance(first_buy_ts, datetime):
+            ts = first_buy_ts
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            hold_age_seconds = max(0.0, (now - ts).total_seconds())
+
+        edge_sell_est: Optional[float] = None
+        if bid > 0 and fair > 0:
+            edge_sell_est = bid - fair - fee_pct
+        inv_value = open_shares * fair if fair > 0 else 0.0
+        open_notional = open_shares * bid if bid > 0 else 0.0
+        stale_exit = bool(
+            max_hold > 0
+            and hold_age_seconds is not None
+            and hold_age_seconds >= max_hold
+            and bid > 0
+            and bid >= (avg_entry + fee_pct)
+        )
+        risk_exit = bool(max_outcome_inv > 0 and inv_value > max_outcome_inv)
+        edge_ready = bool(edge_sell_est is not None and edge_sell_est >= exit_edge)
+        sell_signal = edge_ready or stale_exit or risk_exit
+        sell_trigger_parts: list[str] = []
+        if edge_ready:
+            sell_trigger_parts.append("edge")
+        if stale_exit:
+            sell_trigger_parts.append("max_hold")
+        if risk_exit:
+            sell_trigger_parts.append("max_inventory")
+        sell_trigger = "+".join(sell_trigger_parts) if sell_trigger_parts else "none"
+
+        if sell_signal and min_order > 0 and open_notional > 0 and open_notional < min_order:
+            sell_block_reason = "below_min_order"
+        elif sell_signal:
+            sell_block_reason = "ready_to_sell"
+        elif bid <= 0:
+            sell_block_reason = "missing_bid_mark"
+        elif fair <= 0:
+            sell_block_reason = "missing_fair_mark"
+        elif edge_sell_est is not None and edge_sell_est < exit_edge:
+            sell_block_reason = "edge_below_exit"
+        elif max_hold > 0 and hold_age_seconds is not None and hold_age_seconds < max_hold:
+            sell_block_reason = "hold_time_not_reached"
+        else:
+            sell_block_reason = "waiting_rebalance"
+
         rows_out.append(
             {
                 "strategy_tag": tag,
@@ -310,6 +417,14 @@ def build_two_sided_open_inventory(rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "unrealized_pnl": unrealized,
                 "mark_timestamp": mark_ts,
                 "mark_age_minutes": mark_age_minutes,
+                "fair_price": fair,
+                "edge_sell_est": edge_sell_est,
+                "exit_edge_pct": exit_edge,
+                "open_notional": open_notional,
+                "hold_age_seconds": hold_age_seconds,
+                "sell_signal": sell_signal,
+                "sell_trigger": sell_trigger,
+                "sell_block_reason": sell_block_reason,
             }
         )
 
@@ -728,9 +843,41 @@ def main():
         else:
             inv_view = two_sided_open_inventory_df.copy()
             inv_view = inv_view.sort_values("unrealized_pnl")
+            inv_view = inv_view[
+                [
+                    "strategy_tag",
+                    "condition_id",
+                    "title",
+                    "outcome",
+                    "open_shares",
+                    "avg_entry_price",
+                    "mark_price",
+                    "fair_price",
+                    "edge_sell_est",
+                    "exit_edge_pct",
+                    "sell_signal",
+                    "sell_trigger",
+                    "sell_block_reason",
+                    "open_notional",
+                    "hold_age_seconds",
+                    "unrealized_pnl",
+                    "mark_age_minutes",
+                ]
+            ]
             inv_view["avg_entry_price"] = inv_view["avg_entry_price"].map(lambda x: f"{x:.3f}")
             inv_view["mark_price"] = inv_view["mark_price"].map(lambda x: f"{x:.3f}")
+            inv_view["fair_price"] = inv_view["fair_price"].map(lambda x: f"{x:.3f}")
+            inv_view["edge_sell_est"] = inv_view["edge_sell_est"].map(
+                lambda x: "n/a" if x is None else f"{float(x):.2%}"
+            )
+            inv_view["exit_edge_pct"] = inv_view["exit_edge_pct"].map(lambda x: f"{float(x):.2%}")
             inv_view["open_shares"] = inv_view["open_shares"].map(lambda x: f"{x:.2f}")
+            inv_view["sell_signal"] = inv_view["sell_signal"].map(lambda x: "yes" if bool(x) else "no")
+            inv_view["sell_block_reason"] = inv_view["sell_block_reason"].map(_format_sell_reason)
+            inv_view["open_notional"] = inv_view["open_notional"].map(lambda x: f"${float(x):,.2f}")
+            inv_view["hold_age_seconds"] = inv_view["hold_age_seconds"].map(
+                lambda x: "n/a" if x is None else f"{float(x) / 60.0:.1f}m"
+            )
             inv_view["unrealized_pnl"] = inv_view["unrealized_pnl"].map(lambda x: f"${x:,.2f}")
             inv_view["mark_age_minutes"] = inv_view["mark_age_minutes"].map(
                 lambda x: "n/a" if x is None else f"{float(x):.1f}"
@@ -749,12 +896,29 @@ def main():
             {
                 "Time": t.created_at.strftime("%Y-%m-%d %H:%M") if t.created_at else "N/A",
                 "Tag": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("strategy_tag") or "")
-                if obs_by_id.get(t.observation_id) is not None
-                else "",
+                if obs_by_id.get(t.observation_id) is not None else "",
+                "Condition": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("condition_id") or "")
+                if obs_by_id.get(t.observation_id) is not None else "",
+                "Outcome": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("outcome") or "")
+                if obs_by_id.get(t.observation_id) is not None else "",
                 "Side": t.side,
                 "Entry Price": f"{t.entry_price:.2%}" if t.entry_price else "N/A",
                 "Fill Price": f"{t.simulated_fill_price:.2%}" if t.simulated_fill_price else "N/A",
+                "Book Bid": (
+                    f"{_safe_float(_observation_game_state(obs_by_id.get(t.observation_id)).get('market_bid')):.2%}"
+                    if obs_by_id.get(t.observation_id) is not None
+                    and _safe_float(_observation_game_state(obs_by_id.get(t.observation_id)).get("market_bid")) > 0
+                    else "N/A"
+                ),
+                "Book Ask": (
+                    f"{_safe_float(_observation_game_state(obs_by_id.get(t.observation_id)).get('market_ask')):.2%}"
+                    if obs_by_id.get(t.observation_id) is not None
+                    and _safe_float(_observation_game_state(obs_by_id.get(t.observation_id)).get("market_ask")) > 0
+                    else "N/A"
+                ),
                 "Size": f"${t.size:.2f}" if t.size else "N/A",
+                "Reason": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("reason") or "")
+                if obs_by_id.get(t.observation_id) is not None else "",
                 "Edge (Theo)": f"{t.edge_theoretical:.1%}" if t.edge_theoretical else "N/A",
                 "Edge (Real)": f"{t.edge_realized:.1%}" if t.edge_realized else "Pending",
                 "P&L": f"${t.pnl:.2f}" if t.pnl is not None else "Pending",
