@@ -93,7 +93,7 @@ class TestMarketScanner:
             slug="old",
             symbol="BTCUSDT",
             event_start=now - 1200,
-            end_time=now - 120,
+            end_time=now - 300,
             token_ids={},
             outcome_prices={},
         )
@@ -299,14 +299,14 @@ class TestCryptoMinuteEngine:
     async def test_resolve_winning_trade(self, tmp_path):
         engine = self._make_engine(tmp_path)
 
-        # Create an expired market where Down won
+        # Create an expired market where Down won (>90s ago so resolution triggers)
         now = time.time()
         market = MinuteMarket(
             condition_id="0xtest",
             slug="btc-updown-15m-done",
             symbol="BTCUSDT",
             event_start=now - 1200,
-            end_time=now - 10,  # already expired
+            end_time=now - 100,  # expired 100s ago (> 90s resolution delay)
             token_ids={"Up": "tok-up", "Down": "tok-down"},
             outcome_prices={"Up": 0.0, "Down": 1.0},  # Down won
         )
@@ -363,7 +363,7 @@ class TestCryptoMinuteEngine:
             slug="btc-updown-15m-lost",
             symbol="BTCUSDT",
             event_start=now - 1200,
-            end_time=now - 10,
+            end_time=now - 100,  # expired 100s ago (> 90s resolution delay)
             token_ids={"Up": "tok-up", "Down": "tok-down"},
             outcome_prices={"Up": 1.0, "Down": 0.0},  # Up won
         )

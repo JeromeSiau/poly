@@ -268,8 +268,8 @@ class MarketScanner:
             return None
 
     def _cleanup_expired(self, now: float) -> None:
-        """Remove markets that have already ended."""
-        expired = [slug for slug, m in self._markets.items() if m.end_time < now - 60]
+        """Remove markets that have already ended (keep 3 min for resolution)."""
+        expired = [slug for slug, m in self._markets.items() if m.end_time < now - 180]
         for slug in expired:
             del self._markets[slug]
 
@@ -456,17 +456,25 @@ class CryptoMinuteEngine:
         return trade
 
     async def resolve_expired_trades(self) -> list[PaperTrade]:
-        """Check and resolve any trades whose markets have expired."""
+        """Check and resolve any trades whose markets have expired.
+
+        Waits 90s after market end_time so Polymarket has time to
+        resolve prices to 0/1 before we read the final outcome.
+        """
         now = time.time()
         spot_prices = self.poller.prices
         resolved: list[PaperTrade] = []
+        resolution_delay = 90  # seconds after end_time before resolving
 
         still_open: list[PaperTrade] = []
         for trade in self._open_trades:
             market = self.scanner.markets.get(trade.market_slug)
 
-            # Market already expired or not found
-            if not market or market.end_time <= now:
+            # Wait for resolution_delay after expiry so prices settle to 0/1
+            market_ended = market and market.end_time + resolution_delay <= now
+            market_gone = not market
+
+            if market_ended or market_gone:
                 # Refresh final prices
                 if market:
                     await self.scanner.refresh_prices(trade.market_slug)
@@ -477,9 +485,8 @@ class CryptoMinuteEngine:
                 if market:
                     final_price = market.outcome_prices.get(trade.side, 0.0)
 
-                # Won if final price > entry price (for both strategies)
-                # At expiration, prices converge to 0 or 1
-                won = final_price > trade.entry_price
+                # Won if final price >= 0.5 (resolved prices are ~0 or ~1)
+                won = final_price >= 0.5
                 pnl_per_unit = final_price - trade.entry_price
                 trade.won = won
                 trade.pnl_usd = round(pnl_per_unit * (trade.size_usd / trade.entry_price), 2)
