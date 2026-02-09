@@ -639,12 +639,14 @@ class TwoSidedPaperRecorder:
         run_id: str,
         min_edge_pct: float,
         exit_edge_pct: float,
+        event_type: str = TWO_SIDED_EVENT_TYPE,
     ) -> None:
         self._database_url = _ensure_sync_db_url(database_url)
         self._strategy_tag = strategy_tag
         self._run_id = run_id
         self._min_edge_pct = min_edge_pct
         self._exit_edge_pct = exit_edge_pct
+        self._event_type = event_type
 
     def bootstrap(self) -> None:
         init_db(self._database_url)
@@ -653,7 +655,7 @@ class TwoSidedPaperRecorder:
         stmt = (
             select(PaperTrade, LiveObservation)
             .join(LiveObservation, LiveObservation.id == PaperTrade.observation_id)
-            .where(LiveObservation.event_type == TWO_SIDED_EVENT_TYPE)
+            .where(LiveObservation.event_type == self._event_type)
             .order_by(PaperTrade.created_at.asc(), PaperTrade.id.asc())
         )
         session = get_sync_session(self._database_url)
@@ -737,7 +739,7 @@ class TwoSidedPaperRecorder:
         observation_ts = datetime.fromtimestamp(intent.timestamp, tz=timezone.utc)
 
         game_state = {
-            "strategy": "two_sided_inventory",
+            "strategy": self._event_type,
             "strategy_tag": self._strategy_tag,
             "run_id": self._run_id,
             "min_edge_pct": self._min_edge_pct,
@@ -779,7 +781,7 @@ class TwoSidedPaperRecorder:
         observation = LiveObservation(
             timestamp=observation_ts,
             match_id=intent.condition_id,
-            event_type=TWO_SIDED_EVENT_TYPE,
+            event_type=self._event_type,
             game_state=game_state,
             model_prediction=fair_price,
             polymarket_price=fill.fill_price,

@@ -390,6 +390,7 @@ async def main() -> None:
             run_id=run_id,
             min_edge_pct=0.0,
             exit_edge_pct=0.0,
+            event_type="sniper_sports",
         )
         paper_recorder.bootstrap()
         logger.info("paper_recorder_ready", strategy_tag=args.strategy_tag, run_id=run_id)
