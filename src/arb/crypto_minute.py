@@ -155,7 +155,11 @@ class MarketScanner:
         return dict(self._markets)
 
     async def sync(self) -> list[MinuteMarket]:
-        """Fetch currently active 15-min markets from Gamma API."""
+        """Fetch currently active 15-min markets from Gamma API.
+
+        Always re-fetches outcome prices for known markets so we have
+        up-to-date probabilities for the entry decision.
+        """
         import aiohttp
 
         now = time.time()
@@ -172,8 +176,6 @@ class MarketScanner:
                     current_slot = int(now // 900) * 900
                     for slot_ts in [current_slot, current_slot + 900]:
                         slug = f"{slug_prefix}-updown-15m-{slot_ts}"
-                        if slug in self._markets:
-                            continue
 
                         url = f"{self._gamma_url}/events?slug={slug}"
                         async with session.get(
@@ -194,9 +196,13 @@ class MarketScanner:
 
                             mkt = markets_data[0]
                             market = self._parse_market(mkt, symbol, slug)
-                            if market:
-                                self._markets[slug] = market
+                            if not market:
+                                continue
+
+                            if slug not in self._markets:
                                 discovered.append(market)
+                            # Always update so outcome_prices stay current
+                            self._markets[slug] = market
 
         except Exception as e:
             logger.warning("gamma_sync_error", error=str(e))
