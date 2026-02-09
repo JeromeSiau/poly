@@ -80,6 +80,70 @@ class OddsApiSnapshot:
     usage: OddsApiUsage
 
 
+@dataclass(slots=True)
+class LiveGame:
+    event_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    home_score: int
+    away_score: int
+    completed: bool
+    commence_time: Optional[datetime] = None
+    last_updated: Optional[datetime] = None
+
+
+@dataclass(slots=True)
+class ScoresSnapshot:
+    games: list[LiveGame]
+    usage: OddsApiUsage
+
+
+@dataclass(slots=True)
+class ScoreChange:
+    event_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    home_score: int
+    away_score: int
+    prev_home_score: int
+    prev_away_score: int
+    completed: bool
+    change_type: str  # "score_change" | "completed"
+
+
+class ScoreTracker:
+    """Detects score changes between consecutive polls."""
+
+    def __init__(self) -> None:
+        self._prev: dict[str, LiveGame] = {}
+
+    def update(self, games: list[LiveGame]) -> list[ScoreChange]:
+        changes: list[ScoreChange] = []
+        for game in games:
+            prev = self._prev.get(game.event_id)
+            if prev is not None:
+                if game.completed and not prev.completed:
+                    changes.append(ScoreChange(
+                        event_id=game.event_id, sport=game.sport,
+                        home_team=game.home_team, away_team=game.away_team,
+                        home_score=game.home_score, away_score=game.away_score,
+                        prev_home_score=prev.home_score, prev_away_score=prev.away_score,
+                        completed=True, change_type="completed",
+                    ))
+                elif game.home_score != prev.home_score or game.away_score != prev.away_score:
+                    changes.append(ScoreChange(
+                        event_id=game.event_id, sport=game.sport,
+                        home_team=game.home_team, away_team=game.away_team,
+                        home_score=game.home_score, away_score=game.away_score,
+                        prev_home_score=prev.home_score, prev_away_score=prev.away_score,
+                        completed=game.completed, change_type="score_change",
+                    ))
+            self._prev[game.event_id] = game
+        return changes
+
+
 class OddsApiClient:
     """Fetches odds and normalizes them for the matcher layer."""
 
@@ -138,6 +202,68 @@ class OddsApiClient:
                 events[parsed.event_id] = parsed
 
         return OddsApiSnapshot(events=list(events.values()), usage=usage)
+
+    async def fetch_scores(
+        self,
+        client: httpx.AsyncClient,
+        sports: list[str],
+        days_from: int = 1,
+    ) -> ScoresSnapshot:
+        games: list[LiveGame] = []
+        usage = OddsApiUsage()
+
+        for sport in sports:
+            endpoint = f"{self.base_url}/sports/{sport}/scores"
+            params = {
+                "apiKey": self.api_key,
+                "daysFrom": str(days_from),
+                "dateFormat": self.date_format,
+            }
+            try:
+                response = await client.get(endpoint, params=params)
+                response.raise_for_status()
+            except Exception as exc:
+                logger.warning("odds_api_scores_error", sport=sport, error=str(exc))
+                continue
+
+            usage = self._parse_usage_headers(response.headers)
+            payload = response.json()
+            if not isinstance(payload, list):
+                continue
+
+            for row in payload:
+                scores = row.get("scores")
+                if not isinstance(scores, list) or len(scores) < 2:
+                    continue
+                home = str(row.get("home_team", "")).strip()
+                away = str(row.get("away_team", "")).strip()
+                if not home or not away:
+                    continue
+                home_score = 0
+                away_score = 0
+                for s in scores:
+                    name = str(s.get("name", "")).strip()
+                    try:
+                        val = int(s.get("score", 0))
+                    except (TypeError, ValueError):
+                        val = 0
+                    if name == home:
+                        home_score = val
+                    elif name == away:
+                        away_score = val
+                games.append(LiveGame(
+                    event_id=f"{sport}:{row.get('id', '')}",
+                    sport=sport,
+                    home_team=home,
+                    away_team=away,
+                    home_score=home_score,
+                    away_score=away_score,
+                    completed=bool(row.get("completed", False)),
+                    commence_time=_parse_datetime(row.get("commence_time")),
+                    last_updated=_parse_datetime(row.get("last_updated")),
+                ))
+
+        return ScoresSnapshot(games=games, usage=usage)
 
     @staticmethod
     def _parse_usage_headers(headers: httpx.Headers) -> OddsApiUsage:
