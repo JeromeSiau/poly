@@ -126,6 +126,7 @@ class TwoSidedInventoryEngine:
         fee_bps: int = 0,
         enable_sells: bool = True,
         allow_pair_exit: bool = True,
+        allow_single_leg_entries: bool = True,
     ) -> None:
         self.min_edge_pct = min_edge_pct
         self.exit_edge_pct = exit_edge_pct
@@ -138,6 +139,7 @@ class TwoSidedInventoryEngine:
         self.fee_bps = fee_bps
         self.enable_sells = enable_sells
         self.allow_pair_exit = allow_pair_exit
+        self.allow_single_leg_entries = allow_single_leg_entries
 
         self._inventory: dict[tuple[str, str], InventoryState] = {}
 
@@ -475,63 +477,64 @@ class TwoSidedInventoryEngine:
                     market_net -= sign * size_usd
 
         # 2) New entries / adds.
-        for outcome in snapshot.outcome_order:
-            if outcome in consumed_outcomes:
-                continue
+        if self.allow_single_leg_entries:
+            for outcome in snapshot.outcome_order:
+                if outcome in consumed_outcomes:
+                    continue
 
-            quote = snapshot.outcomes[outcome]
-            if quote.ask is None:
-                continue
+                quote = snapshot.outcomes[outcome]
+                if quote.ask is None:
+                    continue
 
-            fair_price = fair[outcome]
-            state = self.get_state(snapshot.condition_id, outcome)
-            inv_value = state.notional(fair_price)
+                fair_price = fair[outcome]
+                state = self.get_state(snapshot.condition_id, outcome)
+                inv_value = state.notional(fair_price)
 
-            raw_edge = fair_price - quote.ask - self.fee_pct
-            # Inventory skew penalizes adding where we're already heavy.
-            inv_ratio = (
-                inv_value / self.max_outcome_inventory_usd
-                if self.max_outcome_inventory_usd > 0
-                else 0.0
-            )
-            skew_penalty = max(0.0, inv_ratio) * self.inventory_skew_pct
-            edge_buy = raw_edge - skew_penalty
-            if edge_buy < self.min_edge_pct:
-                continue
-
-            outcome_room = max(0.0, self.max_outcome_inventory_usd - inv_value)
-            if outcome_room < self.min_order_usd:
-                continue
-
-            size_cap = min(
-                self.max_order_usd,
-                outcome_room,
-                (quote.ask_size or (self.max_order_usd / quote.ask)) * quote.ask,
-            )
-
-            sign = self._outcome_sign(snapshot, outcome)
-            net_room = self._room_by_market_net(market_net, side="BUY", sign=sign)
-            size_usd = min(size_cap, net_room if sign != 0 else size_cap)
-
-            if size_usd < self.min_order_usd:
-                continue
-
-            intents.append(
-                TradeIntent(
-                    condition_id=snapshot.condition_id,
-                    title=snapshot.title,
-                    outcome=outcome,
-                    token_id=quote.token_id,
-                    side="BUY",
-                    price=quote.ask,
-                    size_usd=size_usd,
-                    edge_pct=edge_buy,
-                    reason="under_fair",
-                    timestamp=now,
+                raw_edge = fair_price - quote.ask - self.fee_pct
+                # Inventory skew penalizes adding where we're already heavy.
+                inv_ratio = (
+                    inv_value / self.max_outcome_inventory_usd
+                    if self.max_outcome_inventory_usd > 0
+                    else 0.0
                 )
-            )
-            if sign != 0:
-                market_net += sign * size_usd
+                skew_penalty = max(0.0, inv_ratio) * self.inventory_skew_pct
+                edge_buy = raw_edge - skew_penalty
+                if edge_buy < self.min_edge_pct:
+                    continue
+
+                outcome_room = max(0.0, self.max_outcome_inventory_usd - inv_value)
+                if outcome_room < self.min_order_usd:
+                    continue
+
+                size_cap = min(
+                    self.max_order_usd,
+                    outcome_room,
+                    (quote.ask_size or (self.max_order_usd / quote.ask)) * quote.ask,
+                )
+
+                sign = self._outcome_sign(snapshot, outcome)
+                net_room = self._room_by_market_net(market_net, side="BUY", sign=sign)
+                size_usd = min(size_cap, net_room if sign != 0 else size_cap)
+
+                if size_usd < self.min_order_usd:
+                    continue
+
+                intents.append(
+                    TradeIntent(
+                        condition_id=snapshot.condition_id,
+                        title=snapshot.title,
+                        outcome=outcome,
+                        token_id=quote.token_id,
+                        side="BUY",
+                        price=quote.ask,
+                        size_usd=size_usd,
+                        edge_pct=edge_buy,
+                        reason="under_fair",
+                        timestamp=now,
+                    )
+                )
+                if sign != 0:
+                    market_net += sign * size_usd
 
         # Prioritize strongest edges first.
         intents.sort(key=lambda i: i.edge_pct, reverse=True)

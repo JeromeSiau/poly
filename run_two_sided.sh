@@ -12,7 +12,7 @@ BASE="$(cd "$(dirname "$0")" && pwd)"
 #   5: wallet size in USD (default: 200)
 #   6: fair mode -> "external_only" (default), "timing_only", "hybrid"
 #   7: fair blend (used only for hybrid, default: 0.6)
-#   8: strategy style -> "default" (default), "rn1_mimic", or "rn1_sport"
+#   8: strategy style -> "default" (default), "rn1_mimic", "rn1_sport", "complete_set", or "rn1_hf"
 MIN_EDGE="${1:-0.02}"
 EXIT_EDGE="${2:-0.006}"
 WALLET_USD="${5:-${WALLET_USD:-200}}"
@@ -118,8 +118,63 @@ case "$STRATEGY_STYLE" in
     if [[ "$MAX_OUTCOME_INV" == "$MAX_OUTCOME_INV_DEFAULT" ]]; then MAX_OUTCOME_INV="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.60; if(v<maxo*6) v=maxo*6; printf "%.2f", v}')"; fi
     if [[ "$MAX_MARKET_NET" == "$MAX_MARKET_NET_DEFAULT" ]]; then MAX_MARKET_NET="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.40; if(v<maxo*3) v=maxo*3; printf "%.2f", v}')"; fi
     ;;
+  complete_set)
+    # Pure complete-set paper arb: pair entries + merges, no single-leg flow.
+    STYLE_FLAGS+=(
+      "--pair-only"
+      "--buy-only"
+      "--no-allow-pair-exit"
+      "--no-settle-resolved"
+      "--entry-require-ended"
+      "--entry-min-seconds-since-end" "$ENTRY_MIN_SECONDS_SINCE_END"
+    )
+    FORCE_TIMING_ONLY=1
+    if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
+    if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="0"; fi
+    if [[ "$MAX_ORDERS_PER_CYCLE" == "4" ]]; then MAX_ORDERS_PER_CYCLE="24"; fi
+    if [[ "$MIN_EDGE" == "0.02" ]]; then MIN_EDGE="0.001"; fi
+    if [[ "$PAIR_MERGE_MIN_EDGE" == "0.003" ]]; then PAIR_MERGE_MIN_EDGE="0.0005"; fi
+    if [[ "$MIN_LIQUIDITY" == "500" ]]; then MIN_LIQUIDITY="100"; fi
+    if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="20"; fi
+    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="3"; fi
+    if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="0"; fi
+    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="nfl,nba,epl,lal,sea,fl1,por,bun,tur,arg,col1,cbb,atp,wta,super"; fi
+    if [[ "$SCAN_LIMIT" == "250" ]]; then SCAN_LIMIT="1200"; fi
+    if [[ "$MAX_BOOK_CONCURRENCY" == "24" ]]; then MAX_BOOK_CONCURRENCY="80"; fi
+    if [[ "$ENTRY_REQUIRE_ENDED" == "0" ]]; then ENTRY_REQUIRE_ENDED="1"; fi
+    if [[ "$MAX_ORDER" == "$MAX_ORDER_DEFAULT" ]]; then MAX_ORDER="$(awk -v w="$WALLET_USD" 'BEGIN{v=w*0.06; if(v<5) v=5; printf "%.2f", v}')"; fi
+    if [[ "$MAX_OUTCOME_INV" == "$MAX_OUTCOME_INV_DEFAULT" ]]; then MAX_OUTCOME_INV="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*1.00; if(v<maxo*12) v=maxo*12; printf "%.2f", v}')"; fi
+    if [[ "$MAX_MARKET_NET" == "$MAX_MARKET_NET_DEFAULT" ]]; then MAX_MARKET_NET="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.80; if(v<maxo*6) v=maxo*6; printf "%.2f", v}')"; fi
+    ;;
+  rn1_hf)
+    # High-frequency RN1-like mode: broad sports universe + fast timing proxy.
+    STYLE_FLAGS+=(
+      "--buy-only"
+      "--no-settle-resolved"
+      "--timing-gamma-proxy"
+      "--timing-gamma-proxy-min-prob" "0.55"
+      "--timing-gamma-proxy-min-gap" "0.08"
+      "--no-timing-gamma-proxy-require-ended"
+    )
+    FORCE_TIMING_ONLY=1
+    if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
+    if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="0"; fi
+    if [[ "$MAX_ORDERS_PER_CYCLE" == "4" ]]; then MAX_ORDERS_PER_CYCLE="64"; fi
+    if [[ "$MIN_EDGE" == "0.02" ]]; then MIN_EDGE="0.0003"; fi
+    if [[ "$PAIR_MERGE_MIN_EDGE" == "0.003" ]]; then PAIR_MERGE_MIN_EDGE="0.0003"; fi
+    if [[ "$MIN_LIQUIDITY" == "500" ]]; then MIN_LIQUIDITY="20"; fi
+    if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="0"; fi
+    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="7"; fi
+    if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="0"; fi
+    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="nfl,nba,epl,lal,sea,fl1,por,bun,tur,arg,col1,cbb,atp,wta,super,ucl,mlb,nhl"; fi
+    if [[ "$SCAN_LIMIT" == "250" ]]; then SCAN_LIMIT="2500"; fi
+    if [[ "$MAX_BOOK_CONCURRENCY" == "24" ]]; then MAX_BOOK_CONCURRENCY="120"; fi
+    if [[ "$MAX_ORDER" == "$MAX_ORDER_DEFAULT" ]]; then MAX_ORDER="$(awk -v w="$WALLET_USD" 'BEGIN{v=w*0.05; if(v<4) v=4; printf "%.2f", v}')"; fi
+    if [[ "$MAX_OUTCOME_INV" == "$MAX_OUTCOME_INV_DEFAULT" ]]; then MAX_OUTCOME_INV="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.80; if(v<maxo*10) v=maxo*10; printf "%.2f", v}')"; fi
+    if [[ "$MAX_MARKET_NET" == "$MAX_MARKET_NET_DEFAULT" ]]; then MAX_MARKET_NET="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.60; if(v<maxo*8) v=maxo*8; printf "%.2f", v}')"; fi
+    ;;
   *)
-    echo "Invalid STRATEGY_STYLE: $STRATEGY_STYLE (expected default|rn1_mimic|rn1_sport)" >&2
+    echo "Invalid STRATEGY_STYLE: $STRATEGY_STYLE (expected default|rn1_mimic|rn1_sport|complete_set|rn1_hf)" >&2
     exit 1
     ;;
 esac
@@ -145,7 +200,7 @@ case "$FAIR_MODE" in
     ;;
 esac
 
-if [[ "$ENTRY_REQUIRE_ENDED" == "1" && "$STRATEGY_STYLE" != "rn1_sport" ]]; then
+if [[ "$ENTRY_REQUIRE_ENDED" == "1" && "$STRATEGY_STYLE" != "rn1_sport" && "$STRATEGY_STYLE" != "complete_set" ]]; then
   STYLE_FLAGS+=("--entry-require-ended" "--entry-min-seconds-since-end" "$ENTRY_MIN_SECONDS_SINCE_END")
 fi
 

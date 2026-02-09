@@ -1824,6 +1824,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow pair_arb_exit SELL intents when bid_yes + bid_no is rich enough.",
     )
     parser.add_argument(
+        "--pair-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Only generate pair-level intents (pair_arb_entry/pair_arb_exit), no single-leg under_fair entries.",
+    )
+    parser.add_argument(
         "--pair-merge",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1943,6 +1949,7 @@ async def main() -> None:
         fee_bps=settings.POLYMARKET_FEE_BPS,
         enable_sells=not args.buy_only,
         allow_pair_exit=(args.allow_pair_exit and not args.buy_only),
+        allow_single_leg_entries=not args.pair_only,
     )
     executor = build_executor_if_needed(args.autopilot)
     fair_runtime: Optional[ExternalFairRuntime] = None
