@@ -82,6 +82,13 @@ async def fetch_sport_markets(
             clob_ids = json.loads(raw.get("clobTokenIds", "[]")) if isinstance(raw.get("clobTokenIds"), str) else (raw.get("clobTokenIds") or [])
             if len(outcomes) != 2 or len(clob_ids) < 2:
                 continue
+            # Skip already-resolved markets (any outcome price >= 0.95)
+            try:
+                raw_prices = json.loads(raw.get("outcomePrices", "[]")) if isinstance(raw.get("outcomePrices"), str) else (raw.get("outcomePrices") or [])
+                if raw_prices and any(float(p) >= 0.95 for p in raw_prices):
+                    continue
+            except (ValueError, TypeError):
+                pass
             # Event prefix filter
             events = raw.get("events", [])
             if isinstance(events, str):
@@ -324,7 +331,7 @@ async def execution_loop(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Event-driven sports sniper")
     p.add_argument("--scores-sports", type=str,
-                    default="soccer_epl,soccer_la_liga,soccer_serie_a,soccer_brazil_serie_a,soccer_argentina_primera_division")
+                    default="soccer_epl,soccer_spain_la_liga,soccer_italy_serie_a,soccer_brazil_campeonato,soccer_argentina_primera_division")
     p.add_argument("--scores-interval", type=float, default=120.0,
                     help="Seconds between Odds API score polls")
     p.add_argument("--spike-threshold", type=float, default=0.15,

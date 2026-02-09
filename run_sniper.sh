@@ -11,7 +11,7 @@ BASE="$(cd "$(dirname "$0")" && pwd)"
 #                     (default: soccer_epl,soccer_la_liga,soccer_serie_a,soccer_brazil_serie_a,soccer_argentina_primera_division)
 SNIPER_MODE="${1:-paper}"
 WALLET_USD="${2:-${WALLET_USD:-200}}"
-SCORES_SPORTS="${3:-${SCORES_SPORTS:-soccer_epl,soccer_la_liga,soccer_serie_a,soccer_brazil_serie_a,soccer_argentina_primera_division}}"
+SCORES_SPORTS="${3:-${SCORES_SPORTS:-soccer_epl,soccer_spain_la_liga,soccer_italy_serie_a,soccer_brazil_campeonato,soccer_argentina_primera_division}}"
 
 # Scoring loop (overridable via env)
 SCORES_INTERVAL="${SCORES_INTERVAL:-120}"
