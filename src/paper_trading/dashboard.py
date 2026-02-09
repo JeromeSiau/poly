@@ -21,6 +21,7 @@ from src.paper_trading.metrics import PaperTradingMetrics, TradeRecord
 TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
 SNIPER_EVENT_TYPE = "sniper_sports"
 CRYPTO_MINUTE_EVENT_TYPE = "crypto_minute"
+WEATHER_ORACLE_EVENT_TYPE = "weather_oracle"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
 
@@ -843,6 +844,38 @@ def extract_crypto_minute_rows(
     return rows
 
 
+def extract_weather_oracle_rows(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> list[dict[str, Any]]:
+    """Build rows for weather oracle strategy analysis."""
+    obs_by_id = {obs.id: obs for obs in observations}
+    rows: list[dict[str, Any]] = []
+
+    for trade in trades:
+        obs = obs_by_id.get(trade.observation_id)
+        if obs is None or obs.event_type != WEATHER_ORACLE_EVENT_TYPE:
+            continue
+        gs = _observation_game_state(obs)
+        rows.append({
+            "timestamp": trade.created_at or obs.timestamp,
+            "city": gs.get("city", ""),
+            "target_date": gs.get("target_date", ""),
+            "outcome": gs.get("outcome", ""),
+            "entry_price": _safe_float(trade.entry_price),
+            "exit_price": _safe_float(trade.exit_price),
+            "size_usd": _safe_float(trade.size),
+            "pnl": _safe_float(trade.pnl),
+            "confidence": _safe_float(gs.get("confidence")),
+            "forecast_temp_max": _safe_float(gs.get("forecast_temp_max")),
+            "forecast_temp_min": _safe_float(gs.get("forecast_temp_min")),
+            "reason": gs.get("reason", ""),
+            "slug": gs.get("slug", ""),
+            "won": _safe_float(trade.exit_price) >= 0.5,
+        })
+    return rows
+
+
 def _render_sniper_tab(
     observations: list[LiveObservation],
     trades: list[PaperTrade],
@@ -1072,6 +1105,98 @@ def _render_crypto_minute_tab(
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def _render_weather_oracle_tab(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> None:
+    """Render the Weather Oracle tab content."""
+    rows = extract_weather_oracle_rows(observations, trades)
+
+    if not rows:
+        st.info("No weather oracle trades found. Run: python scripts/run_weather_oracle.py watch")
+        return
+
+    pnls = [r["pnl"] for r in rows]
+    total_pnl = sum(pnls)
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p <= 0)
+    total_invested = sum(r["size_usd"] for r in rows)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Trades", len(rows))
+    c2.metric("Win Rate", f"{wins / len(rows):.1%}" if rows else "N/A")
+    c3.metric("Total P&L", f"${total_pnl:,.2f}")
+    c4.metric("ROI", f"{total_pnl / total_invested:.0%}" if total_invested else "N/A")
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Wins / Losses", f"{wins} / {losses}")
+    c6.metric("Total Invested", f"${total_invested:,.2f}")
+    avg_win = sum(p for p in pnls if p > 0) / wins if wins else 0
+    c7.metric("Avg Win", f"${avg_win:,.2f}")
+    avg_conf = sum(r["confidence"] for r in rows) / len(rows) if rows else 0
+    c8.metric("Avg Confidence", f"{avg_conf:.0%}")
+
+    st.divider()
+
+    st.subheader("By City")
+    cities = sorted({r["city"] for r in rows if r["city"]})
+    city_data: list[dict[str, Any]] = []
+    for city in cities:
+        c_rows = [r for r in rows if r["city"] == city]
+        c_pnls = [r["pnl"] for r in c_rows]
+        c_wins = sum(1 for p in c_pnls if p > 0)
+        city_data.append({
+            "City": city,
+            "Trades": len(c_rows),
+            "Win Rate": f"{c_wins / len(c_rows):.1%}" if c_rows else "N/A",
+            "Total P&L": f"${sum(c_pnls):,.2f}",
+            "Invested": f"${sum(r['size_usd'] for r in c_rows):,.2f}",
+        })
+    if city_data:
+        st.dataframe(pd.DataFrame(city_data), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.subheader("Cumulative P&L")
+    sorted_rows = sorted(rows, key=lambda r: r.get("timestamp") or datetime.min)
+    if sorted_rows:
+        wo_df = pd.DataFrame(sorted_rows)
+        wo_df = wo_df.sort_values("timestamp")
+        wo_df["cumulative_pnl"] = wo_df["pnl"].cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=wo_df["timestamp"], y=wo_df["cumulative_pnl"],
+            mode="lines+markers", name="Cumulative P&L",
+            line=dict(color="#f39c12", width=2), marker=dict(size=5),
+        ))
+        fig.update_layout(
+            xaxis_title="Time", yaxis_title="Cumulative P&L ($)",
+            height=350, template="plotly_dark",
+            margin=dict(l=50, r=50, t=30, b=50),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("Recent Trades")
+    recent = sorted(rows, key=lambda r: r.get("timestamp") or datetime.min, reverse=True)[:50]
+    if recent:
+        df = pd.DataFrame([{
+            "Time": r["timestamp"].strftime("%m-%d %H:%M") if isinstance(r.get("timestamp"), datetime) else "N/A",
+            "City": r["city"],
+            "Date": r["target_date"],
+            "Outcome": r["outcome"],
+            "Entry": f"{r['entry_price']:.3f}",
+            "Exit": f"{r['exit_price']:.3f}",
+            "Won": "Y" if r["won"] else "N",
+            "Size": f"${r['size_usd']:.2f}",
+            "P&L": f"${r['pnl']:.2f}",
+            "Conf": f"{r['confidence']:.0%}",
+            "Forecast High": f"{r['forecast_temp_max']:.0f}°",
+        } for r in recent])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def main():
     """Main dashboard entry point."""
     st.set_page_config(
@@ -1099,7 +1224,9 @@ def main():
         trades = []
 
     # --- Tabs ---
-    tab_two_sided, tab_sniper, tab_crypto = st.tabs(["Two-Sided", "Sniper Sports", "Crypto Minute"])
+    tab_two_sided, tab_sniper, tab_crypto, tab_weather = st.tabs(
+        ["Two-Sided", "Sniper Sports", "Crypto Minute", "Weather Oracle"]
+    )
 
     # ===== TWO-SIDED TAB =====
     with tab_two_sided:
@@ -1378,6 +1505,10 @@ def main():
     # ===== CRYPTO MINUTE TAB =====
     with tab_crypto:
         _render_crypto_minute_tab(observations, trades)
+
+    # ===== WEATHER ORACLE TAB =====
+    with tab_weather:
+        _render_weather_oracle_tab(observations, trades)
 
     # Footer
     st.divider()
