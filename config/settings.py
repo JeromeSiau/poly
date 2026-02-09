@@ -137,6 +137,30 @@ class Settings(BaseSettings):
     SCREENER_LLM_PROVIDER: str = "claude"
     PERPLEXITY_API_KEY: str = ""
 
+    # === Crypto 15-Minute Strategies ===
+    CRYPTO_MINUTE_ENABLED: bool = True
+    CRYPTO_MINUTE_SCAN_INTERVAL: float = 3.0
+    CRYPTO_MINUTE_SYMBOLS: str = "BTCUSDT,ETHUSDT"
+    CRYPTO_MINUTE_BINANCE_URL: str = "https://api.binance.com/api/v3/ticker/price"
+    CRYPTO_MINUTE_GAMMA_URL: str = "https://gamma-api.polymarket.com"
+
+    # Entry window (seconds remaining)
+    CRYPTO_MINUTE_MIN_ENTRY_TIME: int = 120
+    CRYPTO_MINUTE_MAX_ENTRY_TIME: int = 300
+
+    # Time Decay strategy
+    CRYPTO_MINUTE_TD_THRESHOLD: float = 0.88
+    CRYPTO_MINUTE_TD_MIN_GAP_PCT: float = 0.3
+
+    # Long Vol strategy
+    CRYPTO_MINUTE_LV_THRESHOLD: float = 0.15
+    CRYPTO_MINUTE_LV_MAX_GAP_PCT: float = 0.5
+
+    # Paper trading
+    CRYPTO_MINUTE_PAPER_SIZE_USD: float = 10.0
+    CRYPTO_MINUTE_PAPER_CAPITAL: float = 1000.0
+    CRYPTO_MINUTE_PAPER_FILE: str = "data/crypto_minute_paper.jsonl"
+
     # === Combinatorial Arbitrage ===
     COMBO_ARB_SCAN_INTERVAL: float = 60.0
     COMBO_ARB_MIN_PROFIT: float = 0.05
