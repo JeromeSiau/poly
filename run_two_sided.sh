@@ -33,10 +33,15 @@ LOG_FILE="$BASE/logs/two_sided_${TAG}.log"
 #   max_order        = 4.0% wallet
 #   max_outcome_inv  = 12.5% wallet
 #   max_market_net   = 6.0% wallet
-MIN_ORDER="$(awk -v w="$WALLET_USD" 'BEGIN{v=w*0.025; if(v<1) v=1; printf "%.2f", v}')"
-MAX_ORDER="$(awk -v w="$WALLET_USD" -v min="$MIN_ORDER" 'BEGIN{v=w*0.04; if(v<min+1) v=min+1; printf "%.2f", v}')"
-MAX_OUTCOME_INV="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.125; if(v<maxo*2) v=maxo*2; printf "%.2f", v}')"
-MAX_MARKET_NET="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.06; if(v<maxo*1.2) v=maxo*1.2; printf "%.2f", v}')"
+MIN_ORDER_DEFAULT="$(awk -v w="$WALLET_USD" 'BEGIN{v=w*0.025; if(v<1) v=1; printf "%.2f", v}')"
+MAX_ORDER_DEFAULT="$(awk -v w="$WALLET_USD" -v min="$MIN_ORDER_DEFAULT" 'BEGIN{v=w*0.04; if(v<min+1) v=min+1; printf "%.2f", v}')"
+MAX_OUTCOME_INV_DEFAULT="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER_DEFAULT" 'BEGIN{v=w*0.125; if(v<maxo*2) v=maxo*2; printf "%.2f", v}')"
+MAX_MARKET_NET_DEFAULT="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER_DEFAULT" 'BEGIN{v=w*0.06; if(v<maxo*1.2) v=maxo*1.2; printf "%.2f", v}')"
+
+MIN_ORDER="${MIN_ORDER:-$MIN_ORDER_DEFAULT}"
+MAX_ORDER="${MAX_ORDER:-$MAX_ORDER_DEFAULT}"
+MAX_OUTCOME_INV="${MAX_OUTCOME_INV:-$MAX_OUTCOME_INV_DEFAULT}"
+MAX_MARKET_NET="${MAX_MARKET_NET:-$MAX_MARKET_NET_DEFAULT}"
 WATCH_INTERVAL="${WATCH_INTERVAL:-5}"
 SIGNAL_COOLDOWN="${SIGNAL_COOLDOWN:-8}"
 MAX_ORDERS_PER_CYCLE="${MAX_ORDERS_PER_CYCLE:-4}"
@@ -91,23 +96,27 @@ case "$STRATEGY_STYLE" in
       "--entry-require-ended"
       "--entry-min-seconds-since-end" "$ENTRY_MIN_SECONDS_SINCE_END"
       "--timing-gamma-proxy"
-      "--timing-gamma-proxy-min-prob" "0.80"
-      "--timing-gamma-proxy-min-gap" "0.25"
+      "--timing-gamma-proxy-min-prob" "0.65"
+      "--timing-gamma-proxy-min-gap" "0.15"
       "--timing-gamma-proxy-require-ended"
     )
     FORCE_TIMING_ONLY=1
     if [[ "$WATCH_INTERVAL" == "5" ]]; then WATCH_INTERVAL="1"; fi
     if [[ "$SIGNAL_COOLDOWN" == "8" ]]; then SIGNAL_COOLDOWN="0"; fi
     if [[ "$MAX_ORDERS_PER_CYCLE" == "4" ]]; then MAX_ORDERS_PER_CYCLE="16"; fi
+    if [[ "$MIN_EDGE" == "0.004" ]]; then MIN_EDGE="0.0005"; fi
     if [[ "$PAIR_MERGE_MIN_EDGE" == "0.003" ]]; then PAIR_MERGE_MIN_EDGE="0.001"; fi
     if [[ "$MIN_LIQUIDITY" == "500" ]]; then MIN_LIQUIDITY="100"; fi
     if [[ "$MIN_VOLUME_24H" == "100" ]]; then MIN_VOLUME_24H="20"; fi
-    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="1"; fi
+    if [[ "$MAX_DAYS_TO_END" == "1" ]]; then MAX_DAYS_TO_END="3"; fi
     if [[ "$INCLUDE_NONSPORTS" == "0" ]]; then INCLUDE_NONSPORTS="0"; fi
-    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="epl,lal,sea,fl1,por,bun,tur,arg,col1,nba,cbb,atp,wta"; fi
+    if [[ -z "$EVENT_PREFIXES" ]]; then EVENT_PREFIXES="nfl,nba,epl,lal,sea,fl1,por,bun,tur,arg,col1,cbb,atp,wta,super"; fi
     if [[ "$SCAN_LIMIT" == "250" ]]; then SCAN_LIMIT="1200"; fi
     if [[ "$MAX_BOOK_CONCURRENCY" == "24" ]]; then MAX_BOOK_CONCURRENCY="80"; fi
     if [[ "$ENTRY_REQUIRE_ENDED" == "0" ]]; then ENTRY_REQUIRE_ENDED="1"; fi
+    if [[ "$MAX_ORDER" == "$MAX_ORDER_DEFAULT" ]]; then MAX_ORDER="$(awk -v w="$WALLET_USD" 'BEGIN{v=w*0.06; if(v<5) v=5; printf "%.2f", v}')"; fi
+    if [[ "$MAX_OUTCOME_INV" == "$MAX_OUTCOME_INV_DEFAULT" ]]; then MAX_OUTCOME_INV="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.60; if(v<maxo*6) v=maxo*6; printf "%.2f", v}')"; fi
+    if [[ "$MAX_MARKET_NET" == "$MAX_MARKET_NET_DEFAULT" ]]; then MAX_MARKET_NET="$(awk -v w="$WALLET_USD" -v maxo="$MAX_ORDER" 'BEGIN{v=w*0.40; if(v<maxo*3) v=maxo*3; printf "%.2f", v}')"; fi
     ;;
   *)
     echo "Invalid STRATEGY_STYLE: $STRATEGY_STYLE (expected default|rn1_mimic|rn1_sport)" >&2
