@@ -21,6 +21,7 @@ import asyncio
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,6 +36,9 @@ from src.arb.sniper_router import SniperRouter, SniperAction
 from src.arb.two_sided_inventory import TradeIntent, FillResult, TwoSidedInventoryEngine
 from src.feeds.odds_api import OddsApiClient, ScoreTracker
 from src.feeds.spike_detector import SpikeDetector
+
+# Lazy import to avoid circular deps at module level
+TwoSidedPaperRecorder: Any = None
 
 logger = structlog.get_logger()
 
@@ -243,6 +247,7 @@ async def execution_loop(
     engine: TwoSidedInventoryEngine,
     max_order_usd: float,
     strategy_tag: str,
+    paper_recorder: Any = None,
     dry_run: bool = False,
 ) -> None:
     """Consume actions from queue, fetch live ask, and paper-fill."""
@@ -299,6 +304,17 @@ async def execution_loop(
                         event_slug=action.source_event_slug,
                         tag=strategy_tag,
                     )
+                    if paper_recorder is not None:
+                        try:
+                            paper_recorder.persist_fill(
+                                intent=intent,
+                                fill=fill,
+                                snapshot=None,
+                                fair_prices={intent.outcome: intent.price},
+                                execution_mode="paper",
+                            )
+                        except Exception as exc:
+                            logger.warning("paper_db_persist_failed", error=repr(exc))
         except Exception as exc:
             logger.warning("execution_error", error=str(exc), condition_id=action.condition_id)
         finally:
@@ -356,6 +372,21 @@ async def main() -> None:
         max_market_net_usd=args.max_market_net,
     )
 
+    # Paper recorder for DB persistence (same as run_two_sided_inventory.py)
+    paper_recorder = None
+    if not args.dry_run:
+        from scripts.run_two_sided_inventory import TwoSidedPaperRecorder
+        run_id = f"sniper_{uuid.uuid4().hex[:8]}"
+        paper_recorder = TwoSidedPaperRecorder(
+            args.db_url,
+            strategy_tag=args.strategy_tag,
+            run_id=run_id,
+            min_edge_pct=0.0,
+            exit_edge_pct=0.0,
+        )
+        paper_recorder.bootstrap()
+        logger.info("paper_recorder_ready", strategy_tag=args.strategy_tag, run_id=run_id)
+
     prefixes = [p.strip() for p in args.event_prefixes.split(",") if p.strip()] or None
     scores_sports = [s.strip() for s in args.scores_sports.split(",") if s.strip()]
 
@@ -388,6 +419,7 @@ async def main() -> None:
                 client, action_queue, mapper, engine,
                 max_order_usd=args.max_order,
                 strategy_tag=args.strategy_tag,
+                paper_recorder=paper_recorder,
                 dry_run=args.dry_run,
             )),
         ]
