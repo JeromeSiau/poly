@@ -11,9 +11,11 @@ markets often don't fully price in forecast data.
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import date as date_type
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -136,3 +138,326 @@ class WeatherPaperTrade:
     pnl_usd: float = 0.0
     resolution_price: float = 0.0
     resolution_time: str = ""
+
+
+class OpenMeteoFetcher:
+    """Fetches temperature forecasts from Open-Meteo (free, no API key)."""
+
+    def __init__(self, base_url: str = ""):
+        self._base_url = base_url or settings.WEATHER_ORACLE_OPEN_METEO_URL
+        self._cache: dict[str, list[ForecastData]] = {}  # city -> forecasts
+        self._last_fetch: dict[str, float] = {}  # city -> timestamp
+
+    async def fetch_city(self, city: str) -> list[ForecastData]:
+        """Fetch daily high/low forecast for a city using airport coordinates."""
+        import aiohttp
+
+        station = CITY_STATIONS.get(city)
+        if not station:
+            logger.warning("unknown_city", city=city)
+            return []
+
+        params = {
+            "latitude": station["lat"],
+            "longitude": station["lon"],
+            "daily": "temperature_2m_max,temperature_2m_min",
+            "temperature_unit": station["unit"],
+            "timezone": station["tz"],
+            "forecast_days": settings.WEATHER_ORACLE_FORECAST_DAYS,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self._base_url,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning("open_meteo_error", city=city, status=resp.status)
+                        return []
+                    data = await resp.json()
+        except Exception as e:
+            logger.warning("open_meteo_fetch_error", city=city, error=str(e))
+            return []
+
+        return self._parse_response(city, station["unit"], data)
+
+    def _parse_response(
+        self, city: str, unit: str, data: dict[str, Any],
+    ) -> list[ForecastData]:
+        """Parse Open-Meteo daily response into ForecastData list."""
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        maxes = daily.get("temperature_2m_max", [])
+        mins = daily.get("temperature_2m_min", [])
+
+        now = time.time()
+        forecasts = []
+        for i, date_str in enumerate(dates):
+            if i < len(maxes) and i < len(mins):
+                forecasts.append(ForecastData(
+                    city=city,
+                    date=date_str,
+                    temp_max=maxes[i],
+                    temp_min=mins[i],
+                    unit=unit,
+                    fetched_at=now,
+                ))
+
+        self._cache[city] = forecasts
+        self._last_fetch[city] = now
+        return forecasts
+
+    async def fetch_all_cities(self) -> dict[str, list[ForecastData]]:
+        """Fetch forecasts for all known cities."""
+        results: dict[str, list[ForecastData]] = {}
+        for city in CITY_STATIONS:
+            forecasts = await self.fetch_city(city)
+            if forecasts:
+                results[city] = forecasts
+        return results
+
+    def get_forecast(self, city: str, date: str) -> Optional[ForecastData]:
+        """Get cached forecast for a city on a specific date."""
+        for fc in self._cache.get(city, []):
+            if fc.date == date:
+                return fc
+        return None
+
+
+class WeatherMarketScanner:
+    """Discovers active weather markets on Polymarket via Gamma API."""
+
+    _TITLE_PATTERN = re.compile(
+        r"(?:Highest|High)\s+temperature\s+in\s+(.+?)\s+on\s+(\w+)\s+(\d{1,2})",
+        re.IGNORECASE,
+    )
+
+    _MONTH_MAP = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    def __init__(self, gamma_url: str = ""):
+        self._gamma_url = gamma_url or settings.WEATHER_ORACLE_GAMMA_URL
+        self._markets: dict[str, WeatherMarket] = {}
+
+    @property
+    def markets(self) -> dict[str, WeatherMarket]:
+        return dict(self._markets)
+
+    async def scan(self) -> list[WeatherMarket]:
+        """Fetch active weather markets from Gamma API."""
+        import aiohttp
+
+        discovered: list[WeatherMarket] = []
+        search_terms = ["temperature", "fahrenheit", "celsius", "weather"]
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                for term in search_terms:
+                    url = f"{self._gamma_url}/markets"
+                    params = {"_q": term, "closed": "false", "limit": 100}
+                    async with session.get(
+                        url,
+                        params=params,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        raw_markets = await resp.json()
+
+                        for mkt in raw_markets:
+                            market = self._parse_market(mkt)
+                            if market and market.condition_id not in self._markets:
+                                self._markets[market.condition_id] = market
+                                discovered.append(market)
+
+        except Exception as e:
+            logger.warning("weather_scan_error", error=str(e))
+
+        return discovered
+
+    def _parse_market(self, mkt: dict[str, Any]) -> Optional[WeatherMarket]:
+        """Parse a Gamma API market into a WeatherMarket."""
+        try:
+            question = mkt.get("question", "") or mkt.get("title", "")
+            city = self._extract_city(question)
+            if not city:
+                return None
+
+            target_date = self._extract_target_date(question)
+            if not target_date:
+                return None
+
+            condition_id = mkt.get("conditionId", "")
+            slug = mkt.get("slug", "")
+            outcomes_raw = json.loads(mkt.get("outcomes", "[]"))
+            prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
+            tokens_raw = json.loads(mkt.get("clobTokenIds", "[]"))
+            end_date = mkt.get("endDate", "")
+            description = mkt.get("description", "")
+
+            outcomes = {}
+            outcome_prices = {}
+            for i, outcome_label in enumerate(outcomes_raw):
+                token_id = tokens_raw[i] if i < len(tokens_raw) else ""
+                price = float(prices_raw[i]) if i < len(prices_raw) else 0.0
+                outcomes[outcome_label] = token_id
+                outcome_prices[outcome_label] = price
+
+            return WeatherMarket(
+                condition_id=condition_id,
+                slug=slug,
+                title=question,
+                city=city,
+                target_date=target_date,
+                outcomes=outcomes,
+                outcome_prices=outcome_prices,
+                end_date=end_date,
+                resolution_source=description,
+            )
+        except Exception as e:
+            logger.warning("parse_weather_market_error", error=str(e))
+            return None
+
+    def _extract_city(self, title: str) -> Optional[str]:
+        """Extract city name from market title."""
+        match = self._TITLE_PATTERN.search(title)
+        if not match:
+            return None
+        city_raw = match.group(1).strip()
+        for known_city in CITY_STATIONS:
+            if known_city.lower() == city_raw.lower():
+                return known_city
+        return None
+
+    def _extract_target_date(self, title: str) -> Optional[str]:
+        """Extract target date as YYYY-MM-DD from market title."""
+        match = self._TITLE_PATTERN.search(title)
+        if not match:
+            return None
+        month_str = match.group(2).lower()
+        day = int(match.group(3))
+        month = self._MONTH_MAP.get(month_str)
+        if not month:
+            return None
+        year = datetime.now(timezone.utc).year
+        try:
+            target = date_type(year, month, day)
+            return target.isoformat()
+        except ValueError:
+            return None
+
+
+class WeatherOracleEngine:
+    """Main engine: matches forecasts to markets and generates buy signals."""
+
+    _THRESHOLD_HIGH = re.compile(r"(\d+)\s*°[FC]\s+or\s+higher", re.IGNORECASE)
+    _THRESHOLD_LOW = re.compile(r"(\d+)\s*°[FC]\s+or\s+lower", re.IGNORECASE)
+    _RANGE = re.compile(r"(\d+)\s*[-–]\s*(\d+)\s*°[FC]", re.IGNORECASE)
+    _EXACT = re.compile(r"^(\d+)\s*°[FC]$", re.IGNORECASE)
+
+    def __init__(
+        self,
+        fetcher=None,
+        scanner=None,
+        database_url: str = "sqlite:///data/arb.db",
+    ):
+        self.fetcher = fetcher or OpenMeteoFetcher()
+        self.scanner = scanner or WeatherMarketScanner()
+        self._database_url = database_url
+
+        self.max_entry_price = settings.WEATHER_ORACLE_MAX_ENTRY_PRICE
+        self.min_confidence = settings.WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE
+        self.paper_size = settings.WEATHER_ORACLE_PAPER_SIZE_USD
+        self.max_daily_spend = settings.WEATHER_ORACLE_MAX_DAILY_SPEND
+        self.paper_file = Path(settings.WEATHER_ORACLE_PAPER_FILE)
+
+        self._open_trades: list[WeatherPaperTrade] = []
+        self._entered_markets: set[str] = set()  # "condition_id:outcome"
+        self._daily_spend: float = 0.0
+        self._daily_spend_date: str = ""
+
+        self._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+
+    def evaluate_market(
+        self, market: WeatherMarket, forecast: ForecastData,
+    ) -> list[WeatherSignal]:
+        """Evaluate a single market against a forecast, return buy signals."""
+        signals: list[WeatherSignal] = []
+        temp_max = forecast.temp_max
+
+        for outcome_label, price in market.outcome_prices.items():
+            if price > self.max_entry_price or price <= 0:
+                continue
+
+            entry_key = f"{market.condition_id}:{outcome_label}"
+            if entry_key in self._entered_markets:
+                continue
+
+            confidence = self._outcome_confidence(outcome_label, temp_max)
+
+            if confidence >= self.min_confidence:
+                signals.append(WeatherSignal(
+                    market=market,
+                    outcome=outcome_label,
+                    entry_price=price,
+                    forecast=forecast,
+                    confidence=confidence,
+                    reason=f"Forecast {temp_max:.0f}° → {outcome_label} (conf={confidence:.0%})",
+                ))
+
+        return signals
+
+    def _outcome_confidence(self, outcome_label: str, forecast_temp: float) -> float:
+        """Estimate confidence that a forecast supports this outcome.
+
+        Uses simple heuristics based on forecast distance from thresholds.
+        Open-Meteo ECMWF forecast MAE is ~3-4°F at 3 days, ~5-6°F at 7 days.
+        We use 4°F as a conservative standard deviation.
+        """
+        forecast_std = 4.0
+
+        match = self._THRESHOLD_HIGH.search(outcome_label)
+        if match:
+            threshold = float(match.group(1))
+            margin = forecast_temp - threshold
+            if margin <= 0:
+                return 0.0
+            z_score = margin / forecast_std
+            return min(0.99, 0.5 + 0.5 * min(z_score / 2.0, 1.0))
+
+        match = self._THRESHOLD_LOW.search(outcome_label)
+        if match:
+            threshold = float(match.group(1))
+            margin = threshold - forecast_temp
+            if margin <= 0:
+                return 0.0
+            z_score = margin / forecast_std
+            return min(0.99, 0.5 + 0.5 * min(z_score / 2.0, 1.0))
+
+        match = self._RANGE.search(outcome_label)
+        if match:
+            low = float(match.group(1))
+            high = float(match.group(2))
+            mid = (low + high) / 2.0
+            dist_to_mid = abs(forecast_temp - mid)
+            range_half = (high - low) / 2.0
+            if dist_to_mid <= range_half:
+                return min(0.95, 0.6 + 0.35 * (1.0 - dist_to_mid / max(forecast_std, 1.0)))
+            else:
+                return max(0.0, 0.5 - dist_to_mid / (2 * forecast_std))
+
+        match = self._EXACT.search(outcome_label)
+        if match:
+            exact = float(match.group(1))
+            dist = abs(forecast_temp - exact)
+            if dist <= 0.5:
+                return 0.85
+            return max(0.0, 0.5 - dist / (2 * forecast_std))
+
+        return 0.0
