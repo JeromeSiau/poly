@@ -188,6 +188,7 @@ async def test_scanner_parses_weather_markets():
 import time
 from src.arb.weather_oracle import (
     WeatherOracleEngine,
+    WeatherPaperTrade,
     WeatherSignal,
 )
 
@@ -336,3 +337,76 @@ def test_outcome_confidence_threshold_low():
     # Forecast above threshold -> 0
     conf = engine._outcome_confidence("47°F or lower", 50.0)
     assert conf == 0.0
+
+
+def test_engine_enter_paper_trade():
+    """Engine should record a paper trade from a signal."""
+    market = WeatherMarket(
+        condition_id="0xabc",
+        slug="highest-temp-dallas-feb-12",
+        title="Highest temperature in Dallas on February 12?",
+        city="Dallas",
+        target_date="2026-02-12",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.03},
+        end_date="2026-02-13T00:00:00Z",
+        resolution_source="Weather Underground",
+    )
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-12",
+        temp_max=65.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+    signal = WeatherSignal(
+        market=market, outcome="58°F or higher", entry_price=0.03,
+        forecast=forecast, confidence=0.95, reason="test",
+    )
+
+    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+    engine.paper_size = 3.0
+    engine.max_daily_spend = 50.0
+    engine._open_trades = []
+    engine._entered_markets = set()
+    engine._daily_spend = 0.0
+    engine._daily_spend_date = ""
+    engine._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+
+    trade = engine.enter_paper_trade(signal)
+    assert trade is not None
+    assert trade.city == "Dallas"
+    assert trade.entry_price == 0.03
+    assert trade.size_usd == 3.0
+    assert "0xabc:58°F or higher" in engine._entered_markets
+    assert len(engine._open_trades) == 1
+
+
+def test_engine_daily_spend_limit():
+    """Engine should respect daily spend limit."""
+    from datetime import datetime, timezone
+
+    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+    engine.paper_size = 30.0
+    engine.max_daily_spend = 50.0
+    engine._open_trades = []
+    engine._entered_markets = set()
+    engine._daily_spend = 40.0
+    engine._daily_spend_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    engine._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+
+    market = WeatherMarket(
+        condition_id="0x1", slug="test", title="test",
+        city="Dallas", target_date="2026-02-12",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.03},
+        end_date="2026-02-13T00:00:00Z", resolution_source="",
+    )
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-12",
+        temp_max=65.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+    signal = WeatherSignal(
+        market=market, outcome="58°F or higher", entry_price=0.03,
+        forecast=forecast, confidence=0.95, reason="test",
+    )
+
+    result = engine.enter_paper_trade(signal)
+    assert result is None  # exceeded daily limit

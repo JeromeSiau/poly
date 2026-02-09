@@ -461,3 +461,225 @@ class WeatherOracleEngine:
             return max(0.0, 0.5 - dist / (2 * forecast_std))
 
         return 0.0
+
+    def enter_paper_trade(self, signal: WeatherSignal) -> Optional[WeatherPaperTrade]:
+        """Record a paper trade entry."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._daily_spend_date != today:
+            self._daily_spend = 0.0
+            self._daily_spend_date = today
+
+        if self._daily_spend + self.paper_size > self.max_daily_spend:
+            logger.info("daily_spend_limit", spend=self._daily_spend, limit=self.max_daily_spend)
+            return None
+
+        trade = WeatherPaperTrade(
+            id=str(uuid.uuid4())[:8],
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            city=signal.market.city,
+            target_date=signal.market.target_date,
+            market_slug=signal.market.slug,
+            condition_id=signal.market.condition_id,
+            outcome=signal.outcome,
+            entry_price=signal.entry_price,
+            size_usd=self.paper_size,
+            forecast_temp_max=signal.forecast.temp_max,
+            forecast_temp_min=signal.forecast.temp_min,
+            confidence=signal.confidence,
+            reason=signal.reason,
+        )
+
+        self._open_trades.append(trade)
+        entry_key = f"{signal.market.condition_id}:{signal.outcome}"
+        self._entered_markets.add(entry_key)
+        self._daily_spend += self.paper_size
+
+        logger.info(
+            "weather_paper_trade_entered",
+            city=trade.city,
+            outcome=trade.outcome,
+            entry_price=trade.entry_price,
+            confidence=trade.confidence,
+            reason=trade.reason,
+        )
+        return trade
+
+    async def resolve_trades(self) -> list[WeatherPaperTrade]:
+        """Check open trades against current market prices for resolution."""
+        resolved: list[WeatherPaperTrade] = []
+        still_open: list[WeatherPaperTrade] = []
+
+        for trade in self._open_trades:
+            market = self.scanner.markets.get(trade.condition_id)
+            if not market:
+                still_open.append(trade)
+                continue
+
+            try:
+                end_dt = datetime.fromisoformat(market.end_date.replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) < end_dt:
+                    still_open.append(trade)
+                    continue
+            except (ValueError, AttributeError):
+                still_open.append(trade)
+                continue
+
+            final_price = market.outcome_prices.get(trade.outcome, 0.0)
+
+            if final_price > 0.9:
+                trade.won = True
+                shares = trade.size_usd / trade.entry_price
+                trade.pnl_usd = round(shares * (1.0 - trade.entry_price), 2)
+            elif final_price < 0.1:
+                trade.won = False
+                trade.pnl_usd = round(-trade.size_usd, 2)
+            else:
+                still_open.append(trade)
+                continue
+
+            trade.resolved = True
+            trade.resolution_price = final_price
+            trade.resolution_time = datetime.now(timezone.utc).isoformat()
+
+            self._stats["trades"] += 1
+            if trade.won:
+                self._stats["wins"] += 1
+            self._stats["pnl"] += trade.pnl_usd
+
+            self._save_trade(trade)
+            resolved.append(trade)
+
+            logger.info(
+                "weather_trade_resolved",
+                city=trade.city, outcome=trade.outcome,
+                won=trade.won, pnl=trade.pnl_usd, entry=trade.entry_price,
+            )
+
+        self._open_trades = still_open
+        return resolved
+
+    def _save_trade(self, trade: WeatherPaperTrade) -> None:
+        """Persist trade to DB (LiveObservation + PaperTrade) and JSONL backup."""
+        now = datetime.now(timezone.utc)
+        strategy_tag = "weather_oracle"
+
+        game_state = {
+            "strategy": "weather_oracle",
+            "strategy_tag": strategy_tag,
+            "city": trade.city,
+            "target_date": trade.target_date,
+            "condition_id": trade.condition_id,
+            "outcome": trade.outcome,
+            "side": "BUY",
+            "slug": trade.market_slug,
+            "forecast_temp_max": trade.forecast_temp_max,
+            "forecast_temp_min": trade.forecast_temp_min,
+            "confidence": trade.confidence,
+            "reason": trade.reason,
+            "title": f"{trade.city} {trade.target_date} → {trade.outcome}",
+        }
+
+        edge = trade.pnl_usd / trade.size_usd if trade.size_usd > 0 else 0.0
+
+        observation = LiveObservation(
+            timestamp=now,
+            match_id=trade.condition_id,
+            event_type=WEATHER_ORACLE_EVENT_TYPE,
+            game_state=game_state,
+            model_prediction=trade.confidence,
+            polymarket_price=trade.entry_price,
+        )
+
+        db_trade = PaperTradeDB(
+            observation_id=0,
+            side="BUY",
+            entry_price=trade.entry_price,
+            simulated_fill_price=trade.entry_price,
+            size=trade.size_usd,
+            edge_theoretical=edge,
+            edge_realized=edge,
+            exit_price=1.0 if trade.won else 0.0,
+            pnl=trade.pnl_usd,
+            created_at=now,
+        )
+
+        try:
+            session = get_sync_session(self._database_url)
+            try:
+                session.add(observation)
+                session.flush()
+                db_trade.observation_id = int(observation.id)
+                session.add(db_trade)
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.warning("db_save_error", trade_id=trade.id)
+            finally:
+                session.close()
+        except Exception as e:
+            logger.warning("db_connect_error", error=str(e))
+
+        self.paper_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.paper_file, "a") as f:
+            f.write(json.dumps(asdict(trade)) + "\n")
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return current paper trading stats."""
+        total = self._stats["trades"]
+        wins = self._stats["wins"]
+        return {
+            "trades": total,
+            "wins": wins,
+            "winrate": round(wins / total * 100, 1) if total > 0 else 0.0,
+            "pnl_usd": round(self._stats["pnl"], 2),
+            "open": len(self._open_trades),
+            "daily_spend": self._daily_spend,
+        }
+
+    async def run(self) -> None:
+        """Main loop: scan markets, fetch forecasts, enter trades, resolve."""
+        scan_interval = settings.WEATHER_ORACLE_SCAN_INTERVAL
+        logger.info(
+            "weather_oracle_started",
+            scan_interval=scan_interval,
+            max_entry_price=self.max_entry_price,
+            min_confidence=self.min_confidence,
+            paper_size=self.paper_size,
+        )
+
+        while True:
+            try:
+                new_markets = await self.scanner.scan()
+                if new_markets:
+                    logger.info("weather_markets_discovered", count=len(new_markets))
+
+                cities_needed = {m.city for m in self.scanner.markets.values()}
+                for city in cities_needed:
+                    await self.fetcher.fetch_city(city)
+
+                total_signals = 0
+                for market in self.scanner.markets.values():
+                    forecast = self.fetcher.get_forecast(market.city, market.target_date)
+                    if not forecast:
+                        continue
+
+                    signals = self.evaluate_market(market, forecast)
+                    for signal in signals:
+                        trade = self.enter_paper_trade(signal)
+                        if trade:
+                            total_signals += 1
+
+                if total_signals:
+                    logger.info("weather_signals_entered", count=total_signals)
+
+                resolved = await self.resolve_trades()
+                if resolved:
+                    logger.info("weather_trades_resolved", count=len(resolved))
+
+                stats = self.get_stats()
+                logger.info("weather_oracle_stats", **stats)
+
+            except Exception as e:
+                logger.error("weather_oracle_cycle_error", error=str(e))
+
+            await asyncio.sleep(scan_interval)
