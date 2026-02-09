@@ -15,6 +15,7 @@ from src.arb.crypto_minute import (
     MinuteOpportunity,
     PaperTrade,
 )
+from src.db.database import init_db, reset_engines
 
 
 # === PaperTrade ===
@@ -135,11 +136,15 @@ def _make_market(
 
 class TestCryptoMinuteEngine:
     def _make_engine(self, tmp_path: Path) -> CryptoMinuteEngine:
+        db_path = tmp_path / "test_arb.db"
+        db_url = f"sqlite:///{db_path}"
+        reset_engines()
+        init_db(db_url)
         poller = BinanceSpotPoller(["BTCUSDT", "ETHUSDT"])
         # Stub poll() so it doesn't hit real Binance and override test prices
         poller.poll = AsyncMock(side_effect=lambda: dict(poller._prices))
         scanner = MarketScanner(["BTCUSDT", "ETHUSDT"])
-        engine = CryptoMinuteEngine(poller=poller, scanner=scanner)
+        engine = CryptoMinuteEngine(poller=poller, scanner=scanner, database_url=db_url)
         engine.paper_file = tmp_path / "test_trades.jsonl"
         return engine
 
@@ -326,13 +331,27 @@ class TestCryptoMinuteEngine:
         assert resolved[0].pnl_usd > 0
         assert len(engine._open_trades) == 0
 
-        # Check file was written
+        # Check JSONL backup was written
         assert engine.paper_file.exists()
         lines = engine.paper_file.read_text().strip().split("\n")
         assert len(lines) == 1
         data = json.loads(lines[0])
         assert data["strategy"] == "long_vol"
         assert data["won"] is True
+
+        # Check DB was written with correct strategy_tag
+        from sqlalchemy import select
+        from src.db.database import get_sync_session
+        from src.db.models import LiveObservation as LO, PaperTrade as PT
+
+        session = get_sync_session(engine._database_url)
+        obs = session.execute(select(LO)).scalars().all()
+        assert len(obs) == 1
+        assert obs[0].game_state["strategy_tag"] == "crypto_minute_long_vol"
+        trades_db = session.execute(select(PT)).scalars().all()
+        assert len(trades_db) == 1
+        assert trades_db[0].pnl > 0
+        session.close()
 
     @pytest.mark.asyncio
     async def test_resolve_losing_trade(self, tmp_path):

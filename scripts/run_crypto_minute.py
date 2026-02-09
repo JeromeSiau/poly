@@ -17,12 +17,16 @@ import structlog
 
 from config.settings import settings
 from src.arb.crypto_minute import CryptoMinuteEngine
+from src.db.database import init_db
 
 logger = structlog.get_logger()
 
+DB_URL = "sqlite:///data/arb.db"
+
 
 async def main() -> None:
-    engine = CryptoMinuteEngine()
+    init_db(DB_URL)
+    engine = CryptoMinuteEngine(database_url=DB_URL)
     await engine.run()
 
 
