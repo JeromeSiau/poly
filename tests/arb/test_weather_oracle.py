@@ -410,3 +410,88 @@ def test_engine_daily_spend_limit():
 
     result = engine.enter_paper_trade(signal)
     assert result is None  # exceeded daily limit
+
+
+@pytest.mark.asyncio
+async def test_full_cycle_scan_evaluate_enter():
+    """Integration: scan -> forecast -> evaluate -> enter trade."""
+    from pathlib import Path
+
+    mock_markets_resp = [
+        {
+            "conditionId": "0xintegration",
+            "slug": "highest-temp-dallas-feb-15",
+            "question": "Highest temperature in Dallas on February 15?",
+            "outcomes": '["60°F or higher","58-59°F","56-57°F"]',
+            "outcomePrices": '[0.02,0.08,0.15]',
+            "clobTokenIds": '["t1","t2","t3"]',
+            "endDate": "2026-02-16T00:00:00Z",
+            "description": "Resolution source: Weather Underground",
+        },
+    ]
+
+    mock_forecast_resp = {
+        "daily": {
+            "time": ["2026-02-15"],
+            "temperature_2m_max": [78.0],
+            "temperature_2m_min": [42.0],
+        },
+    }
+
+    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+    engine.fetcher = OpenMeteoFetcher()
+    engine.scanner = WeatherMarketScanner()
+    engine.max_entry_price = 0.05
+    engine.min_confidence = 0.90
+    engine.paper_size = 3.0
+    engine.max_daily_spend = 50.0
+    engine.paper_file = Path("/tmp/test_weather_oracle.jsonl")
+    engine._open_trades = []
+    engine._entered_markets = set()
+    engine._daily_spend = 0.0
+    engine._daily_spend_date = ""
+    engine._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+    engine._database_url = "sqlite:///data/arb.db"
+
+    with patch("aiohttp.ClientSession") as mock_cls:
+        mock_resp_markets = AsyncMock()
+        mock_resp_markets.status = 200
+        mock_resp_markets.json = AsyncMock(return_value=mock_markets_resp)
+        mock_resp_markets.__aenter__ = AsyncMock(return_value=mock_resp_markets)
+        mock_resp_markets.__aexit__ = AsyncMock(return_value=False)
+
+        mock_resp_forecast = AsyncMock()
+        mock_resp_forecast.status = 200
+        mock_resp_forecast.json = AsyncMock(return_value=mock_forecast_resp)
+        mock_resp_forecast.__aenter__ = AsyncMock(return_value=mock_resp_forecast)
+        mock_resp_forecast.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.get = MagicMock(side_effect=[
+            mock_resp_markets, mock_resp_markets, mock_resp_markets, mock_resp_markets,
+            mock_resp_forecast,
+        ])
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_session
+
+        # Scan
+        await engine.scanner.scan()
+        assert len(engine.scanner.markets) >= 1
+
+        # Fetch forecast
+        await engine.fetcher.fetch_city("Dallas")
+        forecast = engine.fetcher.get_forecast("Dallas", "2026-02-15")
+        assert forecast is not None
+
+    # Evaluate
+    market = list(engine.scanner.markets.values())[0]
+    signals = engine.evaluate_market(market, forecast)
+    assert len(signals) >= 1
+    assert signals[0].outcome == "60°F or higher"
+
+    # Enter trade
+    trade = engine.enter_paper_trade(signals[0])
+    assert trade is not None
+    assert trade.city == "Dallas"
+    assert trade.entry_price == 0.02
