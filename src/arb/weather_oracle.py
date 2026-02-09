@@ -272,7 +272,12 @@ class WeatherMarketScanner:
 
                         for mkt in raw_markets:
                             market = self._parse_market(mkt)
-                            if market and market.condition_id not in self._markets:
+                            if not market:
+                                continue
+                            if market.condition_id in self._markets:
+                                # Update prices on existing markets
+                                self._markets[market.condition_id].outcome_prices = market.outcome_prices
+                            else:
                                 self._markets[market.condition_id] = market
                                 discovered.append(market)
 
@@ -345,9 +350,13 @@ class WeatherMarketScanner:
         month = self._MONTH_MAP.get(month_str)
         if not month:
             return None
-        year = datetime.now(timezone.utc).year
+        today = datetime.now(timezone.utc).date()
+        year = today.year
         try:
             target = date_type(year, month, day)
+            # If date is in the past, it likely refers to next year
+            if target < today:
+                target = date_type(year + 1, month, day)
             return target.isoformat()
         except ValueError:
             return None
@@ -356,10 +365,10 @@ class WeatherMarketScanner:
 class WeatherOracleEngine:
     """Main engine: matches forecasts to markets and generates buy signals."""
 
-    _THRESHOLD_HIGH = re.compile(r"(\d+)\s*°[FC]\s+or\s+higher", re.IGNORECASE)
-    _THRESHOLD_LOW = re.compile(r"(\d+)\s*°[FC]\s+or\s+lower", re.IGNORECASE)
-    _RANGE = re.compile(r"(\d+)\s*[-–]\s*(\d+)\s*°[FC]", re.IGNORECASE)
-    _EXACT = re.compile(r"^(\d+)\s*°[FC]$", re.IGNORECASE)
+    _THRESHOLD_HIGH = re.compile(r"(-?\d+)\s*°[FC]\s+or\s+higher", re.IGNORECASE)
+    _THRESHOLD_LOW = re.compile(r"(-?\d+)\s*°[FC]\s+or\s+lower", re.IGNORECASE)
+    _RANGE = re.compile(r"(-?\d+)\s*[-–]\s*(-?\d+)\s*°[FC]", re.IGNORECASE)
+    _EXACT = re.compile(r"^(-?\d+)\s*°[FC]$", re.IGNORECASE)
 
     def __init__(
         self,
@@ -418,9 +427,10 @@ class WeatherOracleEngine:
 
         Uses simple heuristics based on forecast distance from thresholds.
         Open-Meteo ECMWF forecast MAE is ~3-4°F at 3 days, ~5-6°F at 7 days.
-        We use 4°F as a conservative standard deviation.
+        We use 4°F (or ~2.2°C) as a conservative standard deviation.
         """
-        forecast_std = 4.0
+        is_celsius = "°C" in outcome_label or "°c" in outcome_label
+        forecast_std = 2.2 if is_celsius else 4.0
 
         match = self._THRESHOLD_HIGH.search(outcome_label)
         if match:
@@ -619,9 +629,12 @@ class WeatherOracleEngine:
         except Exception as e:
             logger.warning("db_connect_error", error=str(e))
 
-        self.paper_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.paper_file, "a") as f:
-            f.write(json.dumps(asdict(trade)) + "\n")
+        try:
+            self.paper_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.paper_file, "a") as f:
+                f.write(json.dumps(asdict(trade)) + "\n")
+        except Exception as e:
+            logger.warning("jsonl_save_error", trade_id=trade.id, error=str(e))
 
     def get_stats(self) -> dict[str, Any]:
         """Return current paper trading stats."""
