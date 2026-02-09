@@ -167,6 +167,18 @@ class Settings(BaseSettings):
     COMBO_ARB_MAX_PAIRS_PER_SCAN: int = 50
     COMBO_ARB_DEPENDENCY_CONFIDENCE: float = 0.90
 
+    # === Weather Oracle Strategy ===
+    WEATHER_ORACLE_ENABLED: bool = True
+    WEATHER_ORACLE_SCAN_INTERVAL: float = 300.0  # 5 min between scans
+    WEATHER_ORACLE_GAMMA_URL: str = "https://gamma-api.polymarket.com"
+    WEATHER_ORACLE_OPEN_METEO_URL: str = "https://api.open-meteo.com/v1/forecast"
+    WEATHER_ORACLE_MAX_ENTRY_PRICE: float = 0.05  # max 5¢ entry
+    WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE: float = 0.90  # 90% confidence threshold
+    WEATHER_ORACLE_PAPER_SIZE_USD: float = 3.0  # $3 per ticket
+    WEATHER_ORACLE_MAX_DAILY_SPEND: float = 50.0  # max $50/day
+    WEATHER_ORACLE_FORECAST_DAYS: int = 7  # look ahead 7 days
+    WEATHER_ORACLE_PAPER_FILE: str = "data/weather_oracle_paper.jsonl"
+
     model_config = {"env_file": ".env"}
 
 
