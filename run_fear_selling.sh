@@ -29,7 +29,7 @@ SPIKE_THRESHOLD="${SPIKE_THRESHOLD:-0.05}"
 SPIKE_WINDOW="${SPIKE_WINDOW:-600}"
 
 # Capital allocation (overridable via env)
-FEAR_ALLOCATION="${FEAR_ALLOCATION:-0.20}"
+FEAR_ALLOCATION="${FEAR_ALLOCATION:-20}"
 
 AUTOPILOT_FLAG=()
 if [[ "$MODE" == "autopilot" ]]; then

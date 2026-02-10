@@ -119,8 +119,19 @@ class FearClassifier:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-            logger.warning("fear_classifier_api_error", error=str(exc))
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "fear_classifier_api_error",
+                status_code=exc.response.status_code,
+                error=exc.response.text[:200],
+            )
+            return []
+        except httpx.RequestError as exc:
+            logger.warning(
+                "fear_classifier_network_error",
+                error_type=type(exc).__name__,
+                error=str(exc) or "timeout or connection error",
+            )
             return []
 
         return self._parse_response(data)
