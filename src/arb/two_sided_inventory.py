@@ -127,6 +127,7 @@ class TwoSidedInventoryEngine:
         enable_sells: bool = True,
         allow_pair_exit: bool = True,
         allow_single_leg_entries: bool = True,
+        maker_mode: bool = False,
     ) -> None:
         self.min_edge_pct = min_edge_pct
         self.exit_edge_pct = exit_edge_pct
@@ -140,6 +141,7 @@ class TwoSidedInventoryEngine:
         self.enable_sells = enable_sells
         self.allow_pair_exit = allow_pair_exit
         self.allow_single_leg_entries = allow_single_leg_entries
+        self.maker_mode = maker_mode
 
         self._inventory: dict[tuple[str, str], InventoryState] = {}
 
@@ -259,28 +261,35 @@ class TwoSidedInventoryEngine:
         consumed: set[str] = set()
 
         # Pair entry arb: buy equal shares on both legs.
-        if q_a.ask is not None and q_b.ask is not None:
-            pair_edge = 1.0 - (q_a.ask + q_b.ask) - 2 * self.fee_pct
+        # Maker mode: place bids; Taker mode: cross asks.
+        pa = q_a.bid if self.maker_mode else q_a.ask
+        pb = q_b.bid if self.maker_mode else q_b.ask
+        pa_size = q_a.bid_size if self.maker_mode else q_a.ask_size
+        pb_size = q_b.bid_size if self.maker_mode else q_b.ask_size
+        pair_reason = "maker_pair_arb_entry" if self.maker_mode else "pair_arb_entry"
+
+        if pa is not None and pb is not None and pa > 0 and pb > 0:
+            pair_edge = 1.0 - (pa + pb) - 2 * self.fee_pct
             if pair_edge >= self.min_edge_pct:
                 room_a = max(0.0, self.max_outcome_inventory_usd - s_a.notional(fair[out_a]))
                 room_b = max(0.0, self.max_outcome_inventory_usd - s_b.notional(fair[out_b]))
 
                 max_shares = min(
-                    self.max_order_usd / q_a.ask,
-                    self.max_order_usd / q_b.ask,
-                    (q_a.ask_size or (self.max_order_usd / q_a.ask)),
-                    (q_b.ask_size or (self.max_order_usd / q_b.ask)),
-                    (room_a / q_a.ask) if q_a.ask > 0 else 0.0,
-                    (room_b / q_b.ask) if q_b.ask > 0 else 0.0,
+                    self.max_order_usd / pa,
+                    self.max_order_usd / pb,
+                    (pa_size or (self.max_order_usd / pa)),
+                    (pb_size or (self.max_order_usd / pb)),
+                    (room_a / pa) if pa > 0 else 0.0,
+                    (room_b / pb) if pb > 0 else 0.0,
                 )
                 min_shares = max(
-                    self.min_order_usd / q_a.ask,
-                    self.min_order_usd / q_b.ask,
+                    self.min_order_usd / pa,
+                    self.min_order_usd / pb,
                 )
                 if max_shares >= min_shares and max_shares > 0:
                     # Respect market directional cap after each leg.
-                    size_a = max_shares * q_a.ask
-                    size_b = max_shares * q_b.ask
+                    size_a = max_shares * pa
+                    size_b = max_shares * pb
                     sign_a = self._outcome_sign(snapshot, out_a)
                     sign_b = self._outcome_sign(snapshot, out_b)
 
@@ -300,10 +309,10 @@ class TwoSidedInventoryEngine:
                                         outcome=out_a,
                                         token_id=q_a.token_id,
                                         side="BUY",
-                                        price=q_a.ask,
+                                        price=pa,
                                         size_usd=size_a,
                                         edge_pct=pair_edge,
-                                        reason="pair_arb_entry",
+                                        reason=pair_reason,
                                         timestamp=now,
                                     ),
                                     TradeIntent(
@@ -312,10 +321,10 @@ class TwoSidedInventoryEngine:
                                         outcome=out_b,
                                         token_id=q_b.token_id,
                                         side="BUY",
-                                        price=q_b.ask,
+                                        price=pb,
                                         size_usd=size_b,
                                         edge_pct=pair_edge,
-                                        reason="pair_arb_entry",
+                                        reason=pair_reason,
                                         timestamp=now,
                                     ),
                                 ]
@@ -483,14 +492,23 @@ class TwoSidedInventoryEngine:
                     continue
 
                 quote = snapshot.outcomes[outcome]
-                if quote.ask is None:
+
+                # Maker mode: place limit at bid; Taker mode: cross at ask.
+                if self.maker_mode:
+                    entry_price = quote.bid
+                    entry_size_hint = quote.bid_size
+                else:
+                    entry_price = quote.ask
+                    entry_size_hint = quote.ask_size
+
+                if entry_price is None:
                     continue
 
                 fair_price = fair[outcome]
                 state = self.get_state(snapshot.condition_id, outcome)
                 inv_value = state.notional(fair_price)
 
-                raw_edge = fair_price - quote.ask - self.fee_pct
+                raw_edge = fair_price - entry_price - self.fee_pct
                 # Inventory skew penalizes adding where we're already heavy.
                 inv_ratio = (
                     inv_value / self.max_outcome_inventory_usd
@@ -509,7 +527,7 @@ class TwoSidedInventoryEngine:
                 size_cap = min(
                     self.max_order_usd,
                     outcome_room,
-                    (quote.ask_size or (self.max_order_usd / quote.ask)) * quote.ask,
+                    (entry_size_hint or (self.max_order_usd / entry_price)) * entry_price,
                 )
 
                 sign = self._outcome_sign(snapshot, outcome)
@@ -526,10 +544,10 @@ class TwoSidedInventoryEngine:
                         outcome=outcome,
                         token_id=quote.token_id,
                         side="BUY",
-                        price=quote.ask,
+                        price=entry_price,
                         size_usd=size_usd,
                         edge_pct=edge_buy,
-                        reason="under_fair",
+                        reason="maker_under_fair" if self.maker_mode else "under_fair",
                         timestamp=now,
                     )
                 )

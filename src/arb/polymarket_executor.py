@@ -98,6 +98,7 @@ class PolymarketExecutor:
         size: float,
         price: float,
         outcome: Optional[str] = None,
+        order_type: str = "",
     ) -> dict[str, Any]:
         self._ensure_creds()
 
@@ -122,10 +123,12 @@ class PolymarketExecutor:
         )
 
         order = self._client.create_order(order_args)
-        order_type = self._resolve_order_type(settings.POLYMARKET_ORDER_TYPE)
+        resolved_type = self._resolve_order_type(
+            order_type if order_type else settings.POLYMARKET_ORDER_TYPE
+        )
         response = self._client.post_order(
             order,
-            orderType=order_type,
+            orderType=resolved_type,
             post_only=settings.POLYMARKET_POST_ONLY,
         )
 
@@ -136,6 +139,7 @@ class PolymarketExecutor:
             outcome=outcome,
             size=size,
             price=price,
+            order_type=order_type or settings.POLYMARKET_ORDER_TYPE,
         )
 
         return self._normalize_response(response)
@@ -147,8 +151,14 @@ class PolymarketExecutor:
         size: float,
         price: float,
         outcome: Optional[str] = None,
+        order_type: str = "",
     ) -> dict[str, Any]:
-        """Place an order asynchronously."""
+        """Place an order asynchronously.
+
+        Args:
+            order_type: Override order type (e.g. "GTC", "FOK").
+                        Empty string falls back to settings.POLYMARKET_ORDER_TYPE.
+        """
         try:
             return await asyncio.to_thread(
                 self._place_order_sync,
@@ -157,7 +167,39 @@ class PolymarketExecutor:
                 size,
                 price,
                 outcome,
+                order_type,
             )
         except Exception as e:
             logger.error("polymarket_order_failed", error=str(e))
             return {"status": "ERROR", "message": str(e)}
+
+    def _cancel_order_sync(self, order_id: str) -> dict[str, Any]:
+        self._ensure_creds()
+        try:
+            response = self._client.cancel(order_id)
+        except Exception as exc:
+            return {"status": "ERROR", "message": str(exc)}
+        return self._normalize_response(response)
+
+    async def cancel_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel a live order by ID."""
+        try:
+            return await asyncio.to_thread(self._cancel_order_sync, order_id)
+        except Exception as e:
+            logger.error("polymarket_cancel_failed", order_id=order_id, error=str(e))
+            return {"status": "ERROR", "message": str(e)}
+
+    def _get_open_orders_sync(self, market: str = "") -> list[dict[str, Any]]:
+        self._ensure_creds()
+        try:
+            params: dict[str, Any] = {}
+            if market:
+                params["market"] = market
+            orders = self._client.get_orders(**params)
+            return orders if isinstance(orders, list) else []
+        except Exception:
+            return []
+
+    async def get_open_orders(self, market: str = "") -> list[dict[str, Any]]:
+        """Get open/live orders, optionally filtered by market (condition_id)."""
+        return await asyncio.to_thread(self._get_open_orders_sync, market)

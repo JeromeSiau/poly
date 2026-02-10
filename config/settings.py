@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     # WebSocket endpoints
     POLYMARKET_CLOB_HTTP: str = "https://clob.polymarket.com"
-    POLYMARKET_CLOB_WS: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    POLYMARKET_CLOB_WS: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     POLYMARKET_RTDS_WS: str = "wss://ws-live-data.polymarket.com"
 
     # === PandaScore (Esports) ===

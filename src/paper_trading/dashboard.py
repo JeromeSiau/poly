@@ -22,6 +22,7 @@ TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
 SNIPER_EVENT_TYPE = "sniper_sports"
 CRYPTO_MINUTE_EVENT_TYPE = "crypto_minute"
 WEATHER_ORACLE_EVENT_TYPE = "weather_oracle"
+CRYPTO_MAKER_EVENT_TYPE = "crypto_maker"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
 
@@ -1197,6 +1198,130 @@ def _render_weather_oracle_tab(
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def _render_crypto_maker_tab(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> None:
+    """Render the Crypto Maker tab content."""
+    rows = extract_two_sided_trade_rows(
+        observations, trades, event_types={CRYPTO_MAKER_EVENT_TYPE}
+    )
+
+    if not rows:
+        st.info("No crypto maker trades found. Run: python scripts/run_crypto_maker.py --paper")
+        return
+
+    tags = available_two_sided_tags(rows)
+    selected_tag = st.selectbox("Strategy Tag", ["All"] + tags, key="cm_maker_tag_select")
+    rows_view = rows if selected_tag == "All" else [r for r in rows if r["strategy_tag"] == selected_tag]
+
+    # Summary metrics
+    pnls = [r["pnl"] for r in rows_view if r.get("pnl")]
+    total_pnl = sum(pnls)
+    buys = [r for r in rows_view if r["side"] == "BUY"]
+    sells = [r for r in rows_view if r["side"] == "SELL"]
+    sell_wins = sum(1 for r in sells if r["pnl"] > 0)
+    total_notional = sum(r["size_usd"] for r in rows_view)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Trades", len(rows_view))
+    c2.metric("Buys / Sells", f"{len(buys)} / {len(sells)}")
+    c3.metric("Sell Win Rate", f"{sell_wins / len(sells):.1%}" if sells else "N/A")
+    c4.metric("Realized P&L", f"${total_pnl:,.2f}")
+
+    # Open inventory
+    open_inv_df = build_two_sided_open_inventory(rows_view)
+    if not open_inv_df.empty:
+        unrealized = float(open_inv_df["unrealized_pnl_mark"].sum())
+        open_not = float(open_inv_df["open_notional"].sum())
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Open Positions", len(open_inv_df))
+        c6.metric("Open Notional", f"${open_not:,.2f}")
+        c7.metric("Unrealized P&L", f"${unrealized:,.2f}")
+        c8.metric("Total P&L", f"${total_pnl + unrealized:,.2f}")
+
+    st.divider()
+
+    # P&L over time
+    st.subheader("Cumulative P&L")
+    sorted_rows = sorted(rows_view, key=lambda r: r.get("timestamp") or datetime.min)
+    if sorted_rows:
+        mk_df = pd.DataFrame(sorted_rows).sort_values("timestamp")
+        mk_df["cumulative_pnl"] = mk_df["pnl"].cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=mk_df["timestamp"], y=mk_df["cumulative_pnl"],
+            mode="lines+markers", name="Cumulative P&L",
+            line=dict(color="#9b59b6", width=2), marker=dict(size=5),
+        ))
+        fig.update_layout(
+            xaxis_title="Time", yaxis_title="Cumulative P&L ($)",
+            height=350, template="plotly_dark",
+            margin=dict(l=50, r=50, t=30, b=50),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # By-pair summary
+    summary_df = summarize_two_sided_pairs(rows_view)
+    if not summary_df.empty:
+        if not open_inv_df.empty:
+            pair_unr = (
+                open_inv_df
+                .groupby(["strategy_tag", "condition_id", "title"], as_index=False)
+                .agg(unrealized_pnl_mark=("unrealized_pnl_mark", "sum"), open_outcomes=("outcome", "count"))
+            )
+            summary_df = summary_df.merge(pair_unr, on=["strategy_tag", "condition_id", "title"], how="left")
+        for col, default in [("unrealized_pnl_mark", 0.0), ("open_outcomes", 0)]:
+            if col not in summary_df.columns:
+                summary_df[col] = default
+            summary_df[col] = summary_df[col].fillna(default)
+        summary_df["total_pnl"] = summary_df["realized_pnl"] + summary_df["unrealized_pnl_mark"]
+
+        st.subheader("By Market")
+        show_df = summary_df.sort_values("total_pnl", ascending=False).copy()
+        show_df["win_rate_sells"] = show_df["win_rate_sells"].map(lambda x: f"{x:.1%}")
+        show_df["avg_edge_theoretical"] = show_df["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
+        st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    # Open inventory detail
+    if not open_inv_df.empty:
+        st.subheader("Open Inventory")
+        inv = open_inv_df.copy()
+        inv = inv[["strategy_tag", "condition_id", "title", "outcome", "open_shares",
+                    "avg_entry_price", "mark_price", "unrealized_pnl_mark",
+                    "sell_signal", "sell_block_reason", "hold_age_seconds"]]
+        inv["avg_entry_price"] = inv["avg_entry_price"].map(lambda x: f"{x:.3f}")
+        inv["mark_price"] = inv["mark_price"].map(lambda x: f"{x:.3f}")
+        inv["open_shares"] = inv["open_shares"].map(lambda x: f"{x:.2f}")
+        inv["sell_signal"] = inv["sell_signal"].map(lambda x: "yes" if bool(x) else "no")
+        inv["sell_block_reason"] = inv["sell_block_reason"].map(_format_sell_reason)
+        inv["hold_age_seconds"] = inv["hold_age_seconds"].map(
+            lambda x: "n/a" if x is None else f"{float(x) / 60.0:.1f}m"
+        )
+        st.dataframe(inv, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # Recent trades
+    st.subheader("Recent Trades")
+    recent = sorted(rows_view, key=lambda r: r.get("timestamp") or datetime.min, reverse=True)[:50]
+    if recent:
+        df = pd.DataFrame([{
+            "Time": r["timestamp"].strftime("%m-%d %H:%M") if isinstance(r.get("timestamp"), datetime) else "N/A",
+            "Tag": r.get("strategy_tag", ""),
+            "Title": str(r.get("title", ""))[:50],
+            "Outcome": r.get("outcome", ""),
+            "Side": r.get("side", ""),
+            "Price": f"{r['fill_price']:.3f}",
+            "Size": f"${r['size_usd']:.2f}",
+            "Edge": f"{r['edge_theoretical']:.2%}",
+            "P&L": f"${r['pnl']:.2f}" if r.get("pnl") else "",
+        } for r in recent])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def main():
     """Main dashboard entry point."""
     st.set_page_config(
@@ -1224,8 +1349,8 @@ def main():
         trades = []
 
     # --- Tabs ---
-    tab_two_sided, tab_sniper, tab_crypto, tab_weather = st.tabs(
-        ["Two-Sided", "Sniper Sports", "Crypto Minute", "Weather Oracle"]
+    tab_two_sided, tab_sniper, tab_crypto, tab_weather, tab_maker = st.tabs(
+        ["Two-Sided", "Sniper Sports", "Crypto Minute", "Weather Oracle", "Crypto Maker"]
     )
 
     # ===== TWO-SIDED TAB =====
@@ -1509,6 +1634,10 @@ def main():
     # ===== WEATHER ORACLE TAB =====
     with tab_weather:
         _render_weather_oracle_tab(observations, trades)
+
+    # ===== CRYPTO MAKER TAB =====
+    with tab_maker:
+        _render_crypto_maker_tab(observations, trades)
 
     # Footer
     st.divider()

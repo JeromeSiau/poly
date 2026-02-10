@@ -54,6 +54,7 @@ from src.matching.bookmaker_matcher import (
 logger = structlog.get_logger()
 
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS_API = "https://gamma-api.polymarket.com/events"
 CLOB_API = "https://clob.polymarket.com"
 TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
 DEFAULT_SETTLEMENT_WINNER_MIN_PRICE = 0.985
@@ -63,7 +64,7 @@ DEFAULT_SETTLEMENT_ENDDATE_GRACE_SECONDS = 300.0
 DEFAULT_PAIR_MERGE_PRICE = 0.5
 DEFAULT_PAIR_MERGE_MIN_EDGE = 0.002
 DEFAULT_BOOK_404_COOLDOWN_SECONDS = 600.0
-PAIR_BUNDLE_REASONS = {"pair_arb_entry", "pair_arb_exit", "pair_merge"}
+PAIR_BUNDLE_REASONS = {"pair_arb_entry", "pair_arb_exit", "pair_merge", "maker_pair_arb_entry"}
 _BOOK_404_SUPPRESS_UNTIL: dict[str, float] = {}
 
 SPORT_HINT_PATTERNS = (
@@ -324,6 +325,12 @@ class ExternalFairStats:
     credits_remaining: Optional[int] = None
     credits_used: Optional[int] = None
     credits_last_call: Optional[int] = None
+
+
+@dataclass(slots=True)
+class PendingMakerOrder:
+    intent: TradeIntent
+    placed_at: float
 
 
 @dataclass(slots=True)
@@ -893,6 +900,79 @@ async def fetch_markets(
     return all_markets
 
 
+# ---------------------------------------------------------------------------
+# Crypto 15-minute market discovery via /events endpoint
+# ---------------------------------------------------------------------------
+
+CRYPTO_SYMBOL_TO_SLUG: dict[str, str] = {
+    "BTCUSDT": "btc",
+    "ETHUSDT": "eth",
+    "SOLUSDT": "sol",
+}
+
+
+async def fetch_crypto_markets(
+    client: httpx.AsyncClient,
+    symbols: list[str],
+    slots_ahead: int = 2,
+) -> list[dict[str, Any]]:
+    """Discover active crypto 15-min binary markets via Gamma /events API.
+
+    For each symbol, constructs slugs for current and upcoming 15-min slots
+    and fetches the corresponding event/market data.  Returns a list of market
+    dicts in the same shape as :func:`fetch_markets` for seamless integration.
+    """
+    now = time.time()
+    current_slot = int(now // 900) * 900
+    all_markets: list[dict[str, Any]] = []
+    seen_conditions: set[str] = set()
+
+    for symbol in symbols:
+        slug_prefix = CRYPTO_SYMBOL_TO_SLUG.get(symbol.upper())
+        if not slug_prefix:
+            continue
+
+        for offset in range(slots_ahead):
+            slot_ts = current_slot + offset * 900
+            slug = f"{slug_prefix}-updown-15m-{slot_ts}"
+
+            try:
+                resp = await client.get(
+                    GAMMA_EVENTS_API,
+                    params={"slug": slug},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                if resp.status_code != 200:
+                    continue
+                events = resp.json()
+                if not events:
+                    continue
+            except Exception as exc:
+                logger.warning("crypto_event_fetch_error", slug=slug, error=str(exc))
+                continue
+
+            for event in events:
+                for mkt in event.get("markets", []):
+                    cid = mkt.get("conditionId", "")
+                    if not cid or cid in seen_conditions:
+                        continue
+
+                    outcomes = parse_json_list(mkt.get("outcomes", []))
+                    clob_ids = parse_json_list(mkt.get("clobTokenIds", []))
+                    if len(outcomes) != 2 or len(clob_ids) < 2:
+                        continue
+
+                    # Inject event slug so _first_event_slug can find it
+                    if "events" not in mkt:
+                        mkt["events"] = [{"slug": slug}]
+
+                    seen_conditions.add(cid)
+                    all_markets.append(mkt)
+
+    logger.info("crypto_markets_discovered", count=len(all_markets), symbols=symbols)
+    return all_markets
+
+
 def _parse_orderbook_level(level: Any) -> tuple[Optional[float], Optional[float]]:
     if isinstance(level, dict):
         return _to_float(level.get("price"), default=-1.0), _to_float(level.get("size"), default=0.0)
@@ -1414,18 +1494,26 @@ async def run_cycle(
     paper_recorder: Optional[TwoSidedPaperRecorder],
     args: argparse.Namespace,
     signal_memory: dict[tuple[str, str, str, int], float],
+    pending_maker_orders: Optional[list[PendingMakerOrder]] = None,
 ) -> None:
-    raw_markets = await fetch_markets(
-        client=client,
-        limit=args.limit,
-        min_liquidity=args.min_liquidity,
-        min_volume_24h=args.min_volume_24h,
-        sports_only=not args.include_nonsports,
-        max_days_to_end=args.max_days_to_end,
-        event_prefixes=_parse_csv_values(args.event_prefixes),
-        entry_require_ended=args.entry_require_ended,
-        entry_min_seconds_since_end=args.entry_min_seconds_since_end,
-    )
+    crypto_symbols = _parse_csv_values(getattr(args, "crypto_symbols", ""))
+    if crypto_symbols:
+        raw_markets = await fetch_crypto_markets(
+            client=client,
+            symbols=crypto_symbols,
+        )
+    else:
+        raw_markets = await fetch_markets(
+            client=client,
+            limit=args.limit,
+            min_liquidity=args.min_liquidity,
+            min_volume_24h=args.min_volume_24h,
+            sports_only=not args.include_nonsports,
+            max_days_to_end=args.max_days_to_end,
+            event_prefixes=_parse_csv_values(args.event_prefixes),
+            entry_require_ended=args.entry_require_ended,
+            entry_min_seconds_since_end=args.entry_min_seconds_since_end,
+        )
     snapshots = await build_snapshots(
         client=client,
         markets=raw_markets,
@@ -1439,6 +1527,67 @@ async def run_cycle(
 
     now = time.time()
     snapshots_by_condition = {s.condition_id: s for s in snapshots}
+
+    # -- Maker mode: check pending limit orders for simulated fills --
+    maker_fills = 0
+    if pending_maker_orders is not None and pending_maker_orders:
+        still_pending: list[PendingMakerOrder] = []
+        for pending in pending_maker_orders:
+            snapshot = snapshots_by_condition.get(pending.intent.condition_id)
+            if snapshot is None:
+                logger.debug("maker_order_expired_no_market", condition_id=pending.intent.condition_id)
+                continue
+            age = now - pending.placed_at
+            if age > args.max_hold_seconds:
+                logger.debug(
+                    "maker_order_expired_age",
+                    condition_id=pending.intent.condition_id,
+                    outcome=pending.intent.outcome,
+                    age_seconds=round(age, 1),
+                )
+                continue
+
+            quote = snapshot.outcomes.get(pending.intent.outcome)
+            filled = False
+            if quote is not None:
+                if pending.intent.side == "BUY" and quote.ask is not None:
+                    filled = quote.ask <= pending.intent.price
+                elif pending.intent.side == "SELL" and quote.bid is not None:
+                    filled = quote.bid >= pending.intent.price
+
+            if filled:
+                fill = engine.apply_fill(pending.intent)
+                maker_fills += 1
+                logger.info(
+                    "maker_order_filled",
+                    condition_id=pending.intent.condition_id,
+                    outcome=pending.intent.outcome,
+                    side=pending.intent.side,
+                    price=pending.intent.price,
+                    age_seconds=round(age, 1),
+                )
+                if paper_recorder is not None and args.persist_paper:
+                    fair_prices = engine.compute_fair_prices(snapshot)
+                    try:
+                        paper_recorder.persist_fill(
+                            intent=pending.intent,
+                            fill=fill,
+                            snapshot=snapshot,
+                            fair_prices=fair_prices,
+                            execution_mode="maker_paper",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "paper_db_persist_failed",
+                            condition_id=pending.intent.condition_id,
+                            outcome=pending.intent.outcome,
+                            error=repr(exc),
+                        )
+            else:
+                still_pending.append(pending)
+        pending_maker_orders.clear()
+        pending_maker_orders.extend(still_pending)
+
     settled = 0
     merged = 0
     if args.settle_resolved and args.paper_fill:
@@ -1506,9 +1655,11 @@ async def run_cycle(
 
     all_intents.sort(key=lambda x: x.edge_pct * x.size_usd, reverse=True)
 
+    pending_count = len(pending_maker_orders) if pending_maker_orders is not None else 0
     print(
         f"\n[{time.strftime('%H:%M:%S')}] markets={len(raw_markets)} "
         f"snapshots={len(snapshots)} intents={len(all_intents)} settled={settled} merged={merged}"
+        + (f" maker_fills={maker_fills} pending={pending_count}" if args.maker_mode else "")
     )
     if fair_runtime is not None:
         stats = fair_runtime.stats
@@ -1591,30 +1742,44 @@ async def run_cycle(
                     response=response,
                 )
         elif args.paper_fill:
-            fill = engine.apply_fill(intent)
-            executed += 1
-            if paper_recorder is not None:
-                try:
-                    paper_recorder.persist_fill(
-                        intent=intent,
-                        fill=fill,
-                        snapshot=snapshots_by_condition.get(intent.condition_id),
-                        fair_prices=fair_cache.get(intent.condition_id, {}),
-                        execution_mode="paper",
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "paper_db_persist_failed",
-                        condition_id=intent.condition_id,
-                        outcome=intent.outcome,
-                        side=intent.side,
-                        error=repr(exc),
-                    )
+            if args.maker_mode and pending_maker_orders is not None:
+                pending_maker_orders.append(PendingMakerOrder(intent=intent, placed_at=now))
+                executed += 1
+                logger.info(
+                    "maker_order_queued",
+                    condition_id=intent.condition_id,
+                    outcome=intent.outcome,
+                    side=intent.side,
+                    price=intent.price,
+                    pending_total=len(pending_maker_orders),
+                )
+            else:
+                fill = engine.apply_fill(intent)
+                executed += 1
+                if paper_recorder is not None:
+                    try:
+                        paper_recorder.persist_fill(
+                            intent=intent,
+                            fill=fill,
+                            snapshot=snapshots_by_condition.get(intent.condition_id),
+                            fair_prices=fair_cache.get(intent.condition_id, {}),
+                            execution_mode="paper",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "paper_db_persist_failed",
+                            condition_id=intent.condition_id,
+                            outcome=intent.outcome,
+                            side=intent.side,
+                            error=repr(exc),
+                        )
 
     inv = inventory_mark_summary(engine, snapshots, fair_cache=fair_cache)
+    pending_count = len(pending_maker_orders) if pending_maker_orders is not None else 0
     print(
-        f"Executed this cycle: {executed} (failures={failures}, settled={settled}, merged={merged}) | "
-        f"Inventory open={int(inv['open_positions'])} marked=${inv['marked_notional']:,.2f} "
+        f"Executed this cycle: {executed} (failures={failures}, settled={settled}, merged={merged}"
+        + (f", maker_fills={maker_fills}, pending={pending_count}" if args.maker_mode else "")
+        + f") | Inventory open={int(inv['open_positions'])} marked=${inv['marked_notional']:,.2f} "
         f"realized=${inv['realized_pnl']:,.2f}"
     )
 
@@ -1649,6 +1814,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep markets ending within N days (0 disables the filter).",
     )
     parser.add_argument("--include-nonsports", action="store_true", help="Include non-sports markets.")
+    parser.add_argument(
+        "--crypto-symbols",
+        type=str,
+        default="",
+        help="Comma-separated crypto symbols (e.g. BTCUSDT,ETHUSDT). When set, "
+        "discovers 15-min binary markets via /events instead of /markets.",
+    )
     parser.add_argument(
         "--event-prefixes",
         type=str,
@@ -1832,6 +2004,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only generate pair-level intents (pair_arb_entry/pair_arb_exit), no single-leg under_fair entries.",
     )
     parser.add_argument(
+        "--maker-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Market-making mode: place limit orders at bid instead of crossing the spread. "
+        "Paper fills are queued and simulated via orderbook crossing.",
+    )
+    parser.add_argument(
         "--pair-merge",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1952,6 +2131,7 @@ async def main() -> None:
         enable_sells=not args.buy_only,
         allow_pair_exit=(args.allow_pair_exit and not args.buy_only),
         allow_single_leg_entries=not args.pair_only,
+        maker_mode=args.maker_mode,
     )
     executor = build_executor_if_needed(args.autopilot)
     fair_runtime: Optional[ExternalFairRuntime] = None
@@ -1976,6 +2156,7 @@ async def main() -> None:
             shared_cache_ttl_seconds=shared_cache_ttl,
         )
     signal_memory: dict[tuple[str, str, str, int], float] = {}
+    pending_maker_orders: list[PendingMakerOrder] = [] if args.maker_mode else []
     paper_recorder: Optional[TwoSidedPaperRecorder] = None
     if args.persist_paper:
         paper_recorder = TwoSidedPaperRecorder(
@@ -2008,12 +2189,12 @@ async def main() -> None:
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         if args.mode == "scan":
-            await run_cycle(client, engine, executor, fair_runtime, paper_recorder, args, signal_memory)
+            await run_cycle(client, engine, executor, fair_runtime, paper_recorder, args, signal_memory, pending_maker_orders)
             return
 
         while True:
             try:
-                await run_cycle(client, engine, executor, fair_runtime, paper_recorder, args, signal_memory)
+                await run_cycle(client, engine, executor, fair_runtime, paper_recorder, args, signal_memory, pending_maker_orders)
             except Exception as exc:
                 logger.error("watch_cycle_error", error=str(exc))
             await asyncio.sleep(args.interval)

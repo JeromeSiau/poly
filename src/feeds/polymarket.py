@@ -1,15 +1,19 @@
 # src/feeds/polymarket.py
-"""Polymarket WebSocket feed for real-time order book updates.
+"""Polymarket CLOB WebSocket feed for real-time order book updates.
 
-Polymarket provides real-time order book updates with ~100ms latency.
-CLOB WebSocket: wss://ws-subscriptions-clob.polymarket.com/ws/
+Uses the CLOB Market channel at wss://ws-subscriptions-clob.polymarket.com/ws/market.
+Subscribes by sending ``{"assets_ids": [...], "type": "MARKET"}`` with token IDs.
 
-This feed maintains a local copy of the order book for fast price lookups.
+On subscribe, receives an initial ``book`` snapshot (full bids/asks per token),
+then incremental ``price_change`` messages with per-level updates.
+
+Public lookup methods accept (condition_id, outcome) pairs — the feed maps them to
+token IDs internally via the ``token_map`` passed to ``subscribe_market()``.
 """
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -40,13 +44,12 @@ class OrderBookUpdate(FeedEvent):
         Returns:
             OrderBookUpdate with normalized data
         """
-        event_type = raw_data.get("type", "unknown")
-        market_id = raw_data.get("market_id", "")
+        event_type = raw_data.get("event_type", raw_data.get("type", "unknown"))
+        market_id = raw_data.get("market_id", raw_data.get("asset_id", ""))
         outcome = raw_data.get("outcome", "")
-        price = raw_data.get("price", 0.0)
+        price = float(raw_data.get("price", raw_data.get("last_trade_price", 0.0) or 0))
         timestamp = raw_data.get("timestamp", datetime.now().timestamp())
 
-        # Build the data dict with extra fields based on event type
         data: dict[str, Any] = {
             "market_id": market_id,
             "outcome": outcome,
@@ -56,17 +59,16 @@ class OrderBookUpdate(FeedEvent):
         if event_type == "trade":
             data["size"] = raw_data.get("size", 0.0)
             data["side"] = raw_data.get("side", "")
-
-        elif event_type == "book_update":
+        elif event_type in ("book", "book_update", "agg_orderbook"):
             data["bids"] = raw_data.get("bids", [])
             data["asks"] = raw_data.get("asks", [])
 
         return cls(
             source="polymarket",
             event_type=event_type,
-            game="prediction",  # Polymarket is for prediction markets
+            game="prediction",
             data=data,
-            timestamp=float(timestamp),
+            timestamp=float(timestamp) if timestamp else datetime.now().timestamp(),
             match_id=market_id,
             market_id=market_id,
             outcome=outcome,
@@ -75,39 +77,39 @@ class OrderBookUpdate(FeedEvent):
 
 
 class PolymarketFeed(BaseFeed):
-    """Real-time order book feed from Polymarket WebSocket.
+    """Real-time order book feed from Polymarket CLOB WebSocket.
 
-    Maintains a local copy of the order book for fast price lookups.
-    Provides ~100ms latency for price updates.
+    Connects to the Market channel, maintains a local copy of the order book
+    keyed by token_id, and provides fast price lookups via (condition_id, outcome).
     """
 
-    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/"
-    PING_INTERVAL = 30.0  # seconds
+    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    PING_INTERVAL = 10.0  # seconds
 
-    def __init__(self):
-        """Initialize Polymarket feed."""
+    def __init__(self) -> None:
         super().__init__()
         self._ws: Optional[ClientConnection] = None
-        self._local_orderbook: dict[str, dict[str, dict[str, list[tuple[float, float]]]]] = {}
-        self._subscribed_markets: set[str] = set()
+        # Orderbook keyed by token_id -> {"bids": [(price,size)...], "asks": [...]}
+        self._local_orderbook: dict[str, dict[str, list[tuple[float, float]]]] = {}
+        self._subscribed_tokens: set[str] = set()
+        # (condition_id, outcome) -> token_id  for backward-compat lookup
+        self._token_map: dict[tuple[str, str], str] = {}
         self._keepalive_task: Optional[asyncio.Task] = None
         self._receive_task: Optional[asyncio.Task] = None
 
     async def connect(self) -> None:
-        """Establish WebSocket connection to Polymarket."""
+        """Establish WebSocket connection to Polymarket CLOB Market channel."""
         if self._connected:
             return
 
         self._ws = await websockets.connect(self.WS_URL)
         self._connected = True
 
-        # Start background tasks
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         self._receive_task = asyncio.create_task(self._receive_loop())
 
     async def disconnect(self) -> None:
         """Close WebSocket connection."""
-        # Cancel background tasks
         if self._keepalive_task:
             self._keepalive_task.cancel()
             try:
@@ -124,24 +126,19 @@ class PolymarketFeed(BaseFeed):
                 pass
             self._receive_task = None
 
-        # Close WebSocket
         if self._ws:
             await self._ws.close()
             self._ws = None
 
         self._connected = False
-        self._subscribed_markets.clear()
+        self._subscribed_tokens.clear()
+        self._token_map.clear()
         self._local_orderbook.clear()
 
     async def subscribe(self, game: str, match_id: str) -> None:
-        """Subscribe to events for a specific match/market.
+        """Subscribe to events for a specific match/market (BaseFeed interface).
 
-        This method is required by BaseFeed but for Polymarket,
-        use subscribe_market() instead for clearer semantics.
-
-        Args:
-            game: Ignored for Polymarket (always "prediction")
-            match_id: Market ID to subscribe to
+        For the CLOB WS you should prefer ``subscribe_market()`` with a token_map.
         """
         await self.subscribe_market(match_id)
 
@@ -149,49 +146,73 @@ class PolymarketFeed(BaseFeed):
         """Unsubscribe from a market (BaseFeed interface)."""
         await self.unsubscribe_market(match_id)
 
-    async def subscribe_market(self, market_id: str) -> None:
+    async def subscribe_market(
+        self,
+        market_id: str,
+        token_map: dict[str, str] | None = None,
+    ) -> None:
         """Subscribe to order book updates for a market.
 
         Args:
-            market_id: Polymarket market identifier (e.g., "0x123abc")
+            market_id: Condition ID (e.g. "0x123abc…")
+            token_map: ``{outcome: token_id}`` mapping.  Required for the CLOB WS
+                       to know which token streams to open.  If ``None``, the call
+                       is a no-op.
         """
         if not self._ws or not self._connected:
             raise RuntimeError("Not connected. Call connect() first.")
 
-        message = json.dumps({
-            "type": "subscribe",
-            "markets": [market_id],
-        })
-        await self._ws.send(message)
-        self._subscribed_markets.add(market_id)
-        self._subscriptions.add(("prediction", market_id))
-
-        # Initialize orderbook structure for this market
-        if market_id not in self._local_orderbook:
-            self._local_orderbook[market_id] = {
-                "YES": {"bids": [], "asks": []},
-                "NO": {"bids": [], "asks": []},
-            }
-
-    async def unsubscribe_market(self, market_id: str) -> None:
-        """Unsubscribe from order book updates for a market.
-
-        Args:
-            market_id: Polymarket market identifier
-        """
-        if not self._ws or not self._connected:
+        if not token_map:
+            logger.warning("subscribe_market_no_tokens", market_id=market_id)
             return
 
-        message = json.dumps({
-            "type": "unsubscribe",
-            "markets": [market_id],
-        })
-        await self._ws.send(message)
-        self._subscribed_markets.discard(market_id)
+        new_tokens: list[str] = []
+        for outcome, token_id in token_map.items():
+            self._token_map[(market_id, outcome)] = token_id
+            if token_id not in self._subscribed_tokens:
+                new_tokens.append(token_id)
+                self._subscribed_tokens.add(token_id)
+                self._local_orderbook.setdefault(token_id, {"bids": [], "asks": []})
+
+        if new_tokens:
+            msg = json.dumps({
+                "assets_ids": new_tokens,
+                "type": "MARKET",
+            })
+            await self._ws.send(msg)
+            logger.debug(
+                "clob_ws_subscribed",
+                market_id=market_id,
+                tokens=len(new_tokens),
+            )
+
+        self._subscriptions.add(("prediction", market_id))
+
+    async def unsubscribe_market(self, market_id: str) -> None:
+        """Unsubscribe from order book updates for a market."""
+        to_remove = [(k, v) for k, v in self._token_map.items() if k[0] == market_id]
+        tokens_to_unsub = []
+        for key, token_id in to_remove:
+            del self._token_map[key]
+            self._subscribed_tokens.discard(token_id)
+            self._local_orderbook.pop(token_id, None)
+            tokens_to_unsub.append(token_id)
+
+        if tokens_to_unsub and self._ws and self._connected:
+            try:
+                msg = json.dumps({
+                    "assets_ids": tokens_to_unsub,
+                    "operation": "unsubscribe",
+                })
+                await self._ws.send(msg)
+            except Exception:
+                pass  # best-effort
+
         self._subscriptions.discard(("prediction", market_id))
 
-        # Remove orderbook data for this market
-        self._local_orderbook.pop(market_id, None)
+    # ------------------------------------------------------------------
+    # Price queries
+    # ------------------------------------------------------------------
 
     def get_best_prices(
         self, market_id: str, outcome: str
@@ -199,23 +220,22 @@ class PolymarketFeed(BaseFeed):
         """Get best bid and ask prices for a market outcome.
 
         Args:
-            market_id: Polymarket market identifier
-            outcome: "YES" or "NO"
+            market_id: Condition ID
+            outcome: e.g. "Up", "Down", "YES", "NO"
 
         Returns:
             Tuple of (best_bid, best_ask). Returns (None, None) if not available.
         """
-        if market_id not in self._local_orderbook:
+        token_id = self._token_map.get((market_id, outcome))
+        if token_id is None:
             return (None, None)
 
-        orderbook = self._local_orderbook[market_id].get(outcome, {})
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
+        book = self._local_orderbook.get(token_id, {})
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
 
-        # Bids are sorted descending (highest first), asks ascending (lowest first)
         best_bid = bids[0][0] if bids else None
         best_ask = asks[0][0] if asks else None
-
         return (best_bid, best_ask)
 
     def get_best_levels(
@@ -224,43 +244,32 @@ class PolymarketFeed(BaseFeed):
         """Get best bid/ask prices and sizes for a market outcome.
 
         Args:
-            market_id: Polymarket market identifier
-            outcome: "YES" or "NO"
+            market_id: Condition ID
+            outcome: e.g. "Up", "Down", "YES", "NO"
 
         Returns:
-            Tuple of (best_bid, bid_size, best_ask, ask_size). Values are None if unavailable.
+            Tuple of (best_bid, bid_size, best_ask, ask_size).
         """
-        if market_id not in self._local_orderbook:
+        token_id = self._token_map.get((market_id, outcome))
+        if token_id is None:
             return (None, None, None, None)
 
-        orderbook = self._local_orderbook[market_id].get(outcome, {})
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
+        book = self._local_orderbook.get(token_id, {})
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
 
         best_bid = bids[0][0] if bids else None
         bid_size = bids[0][1] if bids else None
         best_ask = asks[0][0] if asks else None
         ask_size = asks[0][1] if asks else None
-
         return (best_bid, bid_size, best_ask, ask_size)
 
     def calculate_implied_probability(
         self, best_bid: Optional[float], best_ask: Optional[float]
     ) -> Optional[float]:
-        """Calculate implied probability from best bid and ask.
-
-        The implied probability is the mid-price between bid and ask.
-
-        Args:
-            best_bid: Best bid price
-            best_ask: Best ask price
-
-        Returns:
-            Implied probability (mid-price) or None if prices unavailable
-        """
+        """Calculate implied probability from best bid and ask (mid-price)."""
         if best_bid is None or best_ask is None:
             return None
-
         return (best_bid + best_ask) / 2
 
     def get_market_prices(
@@ -268,23 +277,21 @@ class PolymarketFeed(BaseFeed):
     ) -> dict[str, tuple[Optional[float], Optional[float]]]:
         """Get prices for all outcomes in a market.
 
-        Args:
-            market_id: Polymarket market identifier
-
         Returns:
-            Dict mapping outcome ("YES", "NO") to (best_bid, best_ask) tuples
+            Dict mapping outcome to (best_bid, best_ask) tuples
         """
-        if market_id not in self._local_orderbook:
-            return {}
-
-        result = {}
-        for outcome in self._local_orderbook[market_id]:
-            result[outcome] = self.get_best_prices(market_id, outcome)
-
+        result: dict[str, tuple[Optional[float], Optional[float]]] = {}
+        for (cid, outcome) in self._token_map:
+            if cid == market_id:
+                result[outcome] = self.get_best_prices(market_id, outcome)
         return result
 
+    # ------------------------------------------------------------------
+    # Internal: WebSocket loops
+    # ------------------------------------------------------------------
+
     async def _keepalive_loop(self) -> None:
-        """Send periodic ping messages to keep the connection alive."""
+        """Send periodic ping to keep the connection alive."""
         while self._connected and self._ws:
             try:
                 await asyncio.sleep(self.PING_INTERVAL)
@@ -293,7 +300,7 @@ class PolymarketFeed(BaseFeed):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("receive_loop_error", error=str(e))
+                logger.error("keepalive_error", error=str(e))
                 break
 
     async def _receive_loop(self) -> None:
@@ -301,6 +308,10 @@ class PolymarketFeed(BaseFeed):
         while self._connected and self._ws:
             try:
                 message = await self._ws.recv()
+                if not isinstance(message, str) or not message.strip():
+                    continue  # skip binary or empty frames
+                if message.strip() in ("pong", "ping"):
+                    continue  # skip keepalive responses
                 data = json.loads(message)
                 await self._process_message(data)
             except asyncio.CancelledError:
@@ -308,88 +319,79 @@ class PolymarketFeed(BaseFeed):
             except websockets.exceptions.ConnectionClosed:
                 self._connected = False
                 break
+            except json.JSONDecodeError:
+                continue  # skip non-JSON messages
             except Exception as e:
                 logger.error("receive_loop_error", error=str(e))
                 continue
 
-    async def _process_message(self, data: dict[str, Any]) -> None:
-        """Process an incoming WebSocket message.
+    async def _process_message(self, data: Any) -> None:
+        """Process an incoming CLOB WS message.
 
-        Args:
-            data: Parsed JSON message data
+        Messages are either:
+        - list: initial ``book`` snapshots (one per subscribed token)
+        - dict: incremental ``price_change`` events
         """
-        msg_type = data.get("type", "")
+        if isinstance(data, list):
+            for item in data:
+                event_type = item.get("event_type", "")
+                if event_type == "book":
+                    self._handle_book_snapshot(item)
+        elif isinstance(data, dict):
+            event_type = data.get("event_type", "")
+            if event_type == "price_change":
+                self._handle_price_change(data)
 
-        if msg_type in ("price_change", "trade", "book_update"):
-            # Create event and emit to callbacks
-            update = OrderBookUpdate.from_raw(data)
-            await self._emit(update)
+    def _handle_book_snapshot(self, item: dict[str, Any]) -> None:
+        """Handle an initial full orderbook snapshot for a single token.
 
-            # Update local orderbook if applicable
-            if msg_type == "book_update":
-                self._update_orderbook(data)
-
-        elif msg_type == "snapshot":
-            # Full orderbook snapshot
-            self._handle_snapshot(data)
-
-    def _update_orderbook(self, data: dict[str, Any]) -> None:
-        """Update local orderbook with incremental data.
-
-        Args:
-            data: Order book update message
+        Payload: {"event_type":"book","asset_id":"...","bids":[{"price":"0.49","size":"100"}],...}
         """
-        market_id = data.get("market_id", "")
-        outcome = data.get("outcome", "")
-
-        if not market_id or not outcome:
+        token_id = str(item.get("asset_id", ""))
+        if not token_id or token_id not in self._subscribed_tokens:
             return
 
-        if market_id not in self._local_orderbook:
-            self._local_orderbook[market_id] = {
-                "YES": {"bids": [], "asks": []},
-                "NO": {"bids": [], "asks": []},
-            }
+        bids = [
+            (float(b["price"]), float(b["size"]))
+            for b in item.get("bids", [])
+            if float(b.get("size", 0)) > 0
+        ]
+        asks = [
+            (float(a["price"]), float(a["size"]))
+            for a in item.get("asks", [])
+            if float(a.get("size", 0)) > 0
+        ]
+        # Sort: bids descending (best first), asks ascending (best first)
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
 
-        orderbook = self._local_orderbook[market_id].get(outcome, {"bids": [], "asks": []})
+        self._local_orderbook[token_id] = {"bids": bids, "asks": asks}
 
-        # Update bids
-        if "bids" in data:
-            new_bids = [(float(b[0]), float(b[1])) for b in data["bids"]]
-            orderbook["bids"] = self._merge_levels(orderbook["bids"], new_bids, descending=True)
+    def _handle_price_change(self, data: dict[str, Any]) -> None:
+        """Handle incremental price level changes.
 
-        # Update asks
-        if "asks" in data:
-            new_asks = [(float(a[0]), float(a[1])) for a in data["asks"]]
-            orderbook["asks"] = self._merge_levels(orderbook["asks"], new_asks, descending=False)
-
-        self._local_orderbook[market_id][outcome] = orderbook
-
-    def _handle_snapshot(self, data: dict[str, Any]) -> None:
-        """Handle a full orderbook snapshot.
-
-        Args:
-            data: Snapshot message data
+        Payload: {"event_type":"price_change","market":"0x...","price_changes":[
+            {"asset_id":"...","price":"0.49","size":"100","side":"BUY","best_bid":"0.49","best_ask":"0.51"},
+        ]}
         """
-        market_id = data.get("market_id", "")
-        if not market_id:
-            return
+        for change in data.get("price_changes", []):
+            token_id = str(change.get("asset_id", ""))
+            if not token_id or token_id not in self._local_orderbook:
+                continue
 
-        self._local_orderbook[market_id] = {}
+            price = float(change.get("price", 0))
+            size = float(change.get("size", 0))
+            side = change.get("side", "").upper()
 
-        for outcome_data in data.get("outcomes", []):
-            outcome = outcome_data.get("outcome", "")
-            bids = [(float(b[0]), float(b[1])) for b in outcome_data.get("bids", [])]
-            asks = [(float(a[0]), float(a[1])) for a in outcome_data.get("asks", [])]
-
-            # Sort bids descending, asks ascending
-            bids.sort(key=lambda x: x[0], reverse=True)
-            asks.sort(key=lambda x: x[0])
-
-            self._local_orderbook[market_id][outcome] = {
-                "bids": bids,
-                "asks": asks,
-            }
+            book = self._local_orderbook[token_id]
+            if side == "BUY":
+                book["bids"] = self._merge_levels(
+                    book["bids"], [(price, size)], descending=True
+                )
+            elif side == "SELL":
+                book["asks"] = self._merge_levels(
+                    book["asks"], [(price, size)], descending=False
+                )
 
     def _merge_levels(
         self,
@@ -407,19 +409,14 @@ class PolymarketFeed(BaseFeed):
         Returns:
             Merged and sorted price levels
         """
-        # Convert to dict for easy updates
         levels = {price: size for price, size in existing}
 
         for price, size in updates:
             if size == 0:
-                # Remove level
                 levels.pop(price, None)
             else:
-                # Add or update level
                 levels[price] = size
 
-        # Convert back to sorted list
         result = [(price, size) for price, size in levels.items()]
         result.sort(key=lambda x: x[0], reverse=descending)
-
         return result
