@@ -20,6 +20,7 @@ from typing import Optional
 
 import structlog
 
+from src.arb.fear_classifier import FearClassifier
 from src.arb.fear_scanner import FearMarketCandidate, FearMarketScanner
 from src.arb.fear_spike_detector import FearSpikeDetector
 
@@ -62,6 +63,7 @@ class FearSellingEngine:
         exit_no_price: float = 0.95,
         stop_yes_price: float = 0.70,
         min_fear_score: float = 0.5,
+        classifier: FearClassifier | None = None,
     ) -> None:
         self._risk_manager = risk_manager
         self._executor = executor
@@ -73,7 +75,9 @@ class FearSellingEngine:
         self._min_fear_score = min_fear_score
 
         # Internal components
-        self._scanner = FearMarketScanner(min_fear_score=min_fear_score)
+        self._scanner = FearMarketScanner(
+            min_fear_score=min_fear_score, classifier=classifier
+        )
         self._spike_detector = FearSpikeDetector()
 
         # State tracking

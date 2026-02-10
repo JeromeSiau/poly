@@ -15,6 +15,7 @@ from .two_sided_inventory import (
     InventoryState,
     FillResult,
 )
+from .fear_classifier import FearClassifier, ClassifiedMarket
 from .fear_scanner import FearMarketScanner, FearMarketCandidate
 from .fear_spike_detector import FearSpikeDetector, FearSpike
 from .fear_engine import FearSellingEngine, FearTradeSignal
@@ -38,6 +39,8 @@ __all__ = [
     "TradeIntent",
     "InventoryState",
     "FillResult",
+    "FearClassifier",
+    "ClassifiedMarket",
     "FearMarketScanner",
     "FearMarketCandidate",
     "FearSpikeDetector",

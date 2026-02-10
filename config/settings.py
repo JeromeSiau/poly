@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     LLM_MATCH_CONFIDENCE_THRESHOLD: float = 0.95
     LLM_MODEL: str = "claude-3-haiku-20240307"
 
+    # === OpenAI (GPT-5-nano for fear classification) ===
+    OPENAI_API_KEY: str = ""
+
     # === Cross-Market Arb Settings ===
     CROSSMARKET_SCAN_INTERVAL_SECONDS: float = 5.0
     CROSSMARKET_MIN_EDGE_PCT: float = 0.02

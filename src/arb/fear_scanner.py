@@ -18,12 +18,16 @@ Base-rate estimation uses annualised event frequencies per cluster,
 scaled to the market's time window via exponential decay.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 import structlog
+
+from src.arb.fear_classifier import ClassifiedMarket, FearClassifier
 
 logger = structlog.get_logger()
 
@@ -129,12 +133,14 @@ class FearMarketScanner:
         min_liquidity: float = 1000.0,
         min_volume_24h: float = 5000.0,
         min_fear_score: float = 0.5,
+        classifier: FearClassifier | None = None,
     ):
         self.min_yes_price = min_yes_price
         self.max_yes_price = max_yes_price
         self.min_liquidity = min_liquidity
         self.min_volume_24h = min_volume_24h
         self.min_fear_score = min_fear_score
+        self._classifier = classifier
 
     # ------------------------------------------------------------------
     # Scoring
@@ -188,6 +194,19 @@ class FearMarketScanner:
             score -= 0.10
 
         return max(0.0, min(1.0, score))
+
+    # ------------------------------------------------------------------
+    # Keyword matching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def has_keyword_match(title: str) -> bool:
+        """Return True if *title* matches any fear keyword tier."""
+        title_lower = title.lower()
+        for tier in FEAR_KEYWORDS.values():
+            if any(kw in title_lower for kw in tier):
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Cluster detection
@@ -322,6 +341,12 @@ class FearMarketScanner:
                     continue
 
                 question = market.get("question", title)
+
+                # When classifier is active, only keyword-matched markets
+                # become keyword candidates — the rest go to LLM discovery.
+                if self._classifier is not None and not self.has_keyword_match(question):
+                    continue
+
                 volume_24h = float(market.get("volumeNum", market.get("volume", 0)))
                 liquidity = float(market.get("liquidityNum", market.get("liquidity", 0)))
                 condition_id = market.get("conditionId", market.get("id", ""))
@@ -350,6 +375,171 @@ class FearMarketScanner:
                     )
                 )
 
+        # --- LLM second pass (if classifier configured) --------------------
+        if self._classifier is not None:
+            candidates = await self._llm_refine(candidates, events, now)
+
         # Sort by fear_score descending
         candidates.sort(key=lambda c: c.fear_score, reverse=True)
         return candidates
+
+    # ------------------------------------------------------------------
+    # LLM refinement
+    # ------------------------------------------------------------------
+
+    async def _llm_refine(
+        self,
+        candidates: list[FearMarketCandidate],
+        events: list[dict[str, Any]],
+        now: datetime,
+    ) -> list[FearMarketCandidate]:
+        """Use FearClassifier to confirm and discover fear markets.
+
+        Two passes:
+        1. Confirm existing keyword candidates (boost confirmed, drop rejected).
+        2. Scan non-keyword markets for titles the LLM identifies as fear
+           that keywords missed (e.g. soft geopolitics, inverted fear).
+        """
+        assert self._classifier is not None
+
+        # --- Pass 1: confirm keyword candidates --------------------------
+        kw_titles = [c.title for c in candidates]
+        confirmed = await self._classifier.classify_batch(kw_titles)
+        confirmed_titles = {cm.title for cm in confirmed}
+        confirmed_clusters = {cm.title: cm.cluster for cm in confirmed}
+
+        refined: list[FearMarketCandidate] = []
+        for c in candidates:
+            if c.title in confirmed_titles:
+                # LLM confirmed — boost fear_score and update cluster if LLM
+                # provided a more specific one
+                llm_cluster = confirmed_clusters.get(c.title, c.cluster)
+                if llm_cluster != "other" and c.cluster == "other":
+                    c = FearMarketCandidate(
+                        condition_id=c.condition_id,
+                        token_id=c.token_id,
+                        title=c.title,
+                        yes_price=c.yes_price,
+                        no_price=c.no_price,
+                        estimated_no_probability=c.estimated_no_probability,
+                        edge_pct=c.edge_pct,
+                        volume_24h=c.volume_24h,
+                        liquidity=c.liquidity,
+                        end_date_iso=c.end_date_iso,
+                        fear_score=min(1.0, c.fear_score + 0.10),
+                        cluster=llm_cluster,
+                    )
+                else:
+                    c = FearMarketCandidate(
+                        condition_id=c.condition_id,
+                        token_id=c.token_id,
+                        title=c.title,
+                        yes_price=c.yes_price,
+                        no_price=c.no_price,
+                        estimated_no_probability=c.estimated_no_probability,
+                        edge_pct=c.edge_pct,
+                        volume_24h=c.volume_24h,
+                        liquidity=c.liquidity,
+                        end_date_iso=c.end_date_iso,
+                        fear_score=min(1.0, c.fear_score + 0.05),
+                        cluster=c.cluster,
+                    )
+                refined.append(c)
+            # Keyword-matched but LLM rejected — drop silently
+
+        # --- Pass 2: discover markets keywords missed --------------------
+        existing_titles = set(kw_titles)
+        missed_titles: list[str] = []
+        missed_markets: dict[str, dict[str, Any]] = {}
+
+        for event in events:
+            for market in event.get("markets", []):
+                question = market.get("question", event.get("title", ""))
+                if question not in existing_titles:
+                    missed_titles.append(question)
+                    missed_markets[question] = {**market, "_event": event}
+
+        if missed_titles:
+            # Batch in chunks to respect classifier batch_size
+            for i in range(0, len(missed_titles), self._classifier.batch_size):
+                chunk = missed_titles[i : i + self._classifier.batch_size]
+                discovered = await self._classifier.classify_batch(chunk)
+                for cm in discovered:
+                    mdata = missed_markets.get(cm.title)
+                    if mdata is None:
+                        continue
+                    candidate = self._build_candidate_from_llm(
+                        mdata, cm, now
+                    )
+                    if candidate is not None:
+                        refined.append(candidate)
+
+        logger.info(
+            "llm_refinement_done",
+            keyword_count=len(candidates),
+            confirmed=len(confirmed_titles),
+            dropped=len(candidates) - len(confirmed_titles),
+            discovered=len(refined) - len([c for c in refined if c.title in confirmed_titles]),
+        )
+        return refined
+
+    def _build_candidate_from_llm(
+        self,
+        market_data: dict[str, Any],
+        cm: ClassifiedMarket,
+        now: datetime,
+    ) -> FearMarketCandidate | None:
+        """Build a FearMarketCandidate from an LLM-discovered market."""
+        event = market_data.get("_event", {})
+        tokens = market_data.get("tokens", [])
+
+        yes_price: float | None = None
+        no_price: float | None = None
+        no_token_id: str = ""
+        for token in tokens:
+            outcome = token.get("outcome", "")
+            if outcome == "Yes":
+                yes_price = float(token.get("price", 1.0))
+            elif outcome == "No":
+                no_price = float(token.get("price", 0.0))
+                no_token_id = token.get("token_id", "")
+
+        if yes_price is None or no_price is None:
+            return None
+        if not (self.min_yes_price <= yes_price <= self.max_yes_price):
+            return None
+
+        end_date_str = event.get("endDate", "")
+        try:
+            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            end_date_days = max(1, (end_dt - now).days)
+        except (ValueError, TypeError):
+            end_date_days = 90
+
+        volume_24h = float(market_data.get("volumeNum", market_data.get("volume", 0)))
+        liquidity = float(market_data.get("liquidityNum", market_data.get("liquidity", 0)))
+        condition_id = market_data.get("conditionId", market_data.get("id", ""))
+
+        cluster = cm.cluster
+        estimated_yes_prob = self.estimate_base_rate(end_date_days, cluster)
+        estimated_no_prob = 1.0 - estimated_yes_prob
+        edge = estimated_no_prob - no_price
+
+        fear_score = self.score_market(cm.title, yes_price, volume_24h, end_date_days)
+        # LLM-discovered markets get a confidence-weighted boost
+        fear_score = min(1.0, fear_score + 0.15 * cm.confidence)
+
+        return FearMarketCandidate(
+            condition_id=condition_id,
+            token_id=no_token_id,
+            title=cm.title,
+            yes_price=yes_price,
+            no_price=no_price,
+            estimated_no_probability=estimated_no_prob,
+            edge_pct=edge,
+            volume_24h=volume_24h,
+            liquidity=liquidity,
+            end_date_iso=end_date_str,
+            fear_score=fear_score,
+            cluster=cluster,
+        )

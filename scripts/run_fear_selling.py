@@ -34,6 +34,7 @@ structlog.configure(
 logger = structlog.get_logger()
 
 from config.settings import settings
+from src.arb.fear_classifier import FearClassifier
 from src.arb.fear_engine import FearSellingEngine
 from src.arb.fear_scanner import FearMarketScanner
 from src.arb.fear_spike_detector import FearSpikeDetector
@@ -102,6 +103,14 @@ async def main(args: argparse.Namespace) -> None:
     elif args.autopilot:
         logger.warning("autopilot_requested_but_no_private_key")
 
+    # --- LLM classifier (GPT-5-nano, optional) --------------------------
+    classifier = None
+    if settings.OPENAI_API_KEY:
+        classifier = FearClassifier(api_key=settings.OPENAI_API_KEY)
+        logger.info("fear_classifier_enabled", model="gpt-5-nano")
+    else:
+        logger.info("fear_classifier_disabled_no_openai_key")
+
     # --- Fear selling engine --------------------------------------------
     engine = FearSellingEngine(
         risk_manager=risk_manager,
@@ -112,6 +121,7 @@ async def main(args: argparse.Namespace) -> None:
         exit_no_price=settings.FEAR_SELLING_EXIT_NO_PRICE,
         stop_yes_price=settings.FEAR_SELLING_STOP_YES_PRICE,
         min_fear_score=settings.FEAR_SELLING_MIN_FEAR_SCORE,
+        classifier=classifier,
     )
 
     logger.info(
