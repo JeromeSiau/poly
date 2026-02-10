@@ -251,8 +251,14 @@ from src.arb.weather_oracle import (
 def _make_engine(**overrides):
     """Helper to build a minimal WeatherOracleEngine for unit tests."""
     engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+    engine.min_days_to_resolution = overrides.get("min_days_to_resolution", 0.0)
+    engine.max_days_to_resolution = overrides.get("max_days_to_resolution", 999.0)
     engine.max_entry_price = overrides.get("max_entry_price", 0.05)
     engine.min_confidence = overrides.get("min_confidence", 0.90)
+    engine.lottery_no_enabled = overrides.get("lottery_no_enabled", False)
+    engine.lottery_no_size = overrides.get("lottery_no_size", 3.0)
+    engine.lottery_no_min_yes_price = overrides.get("lottery_no_min_yes_price", 0.95)
+    engine.lottery_no_min_no_confidence = overrides.get("lottery_no_min_no_confidence", 0.60)
     engine.yield_enabled = overrides.get("yield_enabled", False)
     engine.yield_size = overrides.get("yield_size", 50.0)
     engine.yield_min_confidence = overrides.get("yield_min_confidence", 0.95)
@@ -707,3 +713,286 @@ async def test_full_cycle_scan_evaluate_enter():
     assert trade is not None
     assert trade.side == "BUY_YES"
     assert trade.size_usd == 50.0
+
+
+# ---------------------------------------------------------------------------
+# Lottery NO (Type 4) tests — the 0x594ed strategy
+# ---------------------------------------------------------------------------
+
+def test_outcome_no_confidence_threshold_high():
+    """NO confidence for 'X°F or higher' when forecast is BELOW threshold."""
+    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+
+    # Forecast 55°F, threshold 58°F → 3°F below → should be confident in NO
+    conf = engine._outcome_no_confidence("58°F or higher", 55.0)
+    assert conf >= 0.60
+    assert conf < 1.0
+
+    # Forecast 50°F, threshold 58°F → 8°F below → very confident
+    conf = engine._outcome_no_confidence("58°F or higher", 50.0)
+    assert conf >= 0.90
+
+    # Forecast 60°F, threshold 58°F → ABOVE threshold → NO confidence = 0
+    conf = engine._outcome_no_confidence("58°F or higher", 60.0)
+    assert conf == 0.0
+
+    # Forecast exactly at threshold → NO confidence = 0
+    conf = engine._outcome_no_confidence("58°F or higher", 58.0)
+    assert conf == 0.0
+
+
+def test_outcome_no_confidence_threshold_low():
+    """NO confidence for 'X°F or below' when forecast is ABOVE threshold."""
+    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+
+    # Forecast 66°F, threshold 61°F → 5°F above → confident in NO
+    conf = engine._outcome_no_confidence("61°F or below", 66.0)
+    assert conf >= 0.60
+
+    # Forecast 55°F, threshold 61°F → below threshold → NO confidence = 0
+    conf = engine._outcome_no_confidence("61°F or below", 55.0)
+    assert conf == 0.0
+
+
+def test_outcome_no_confidence_range():
+    """NO confidence for range 'X-Y°F' when forecast is OUTSIDE the range."""
+    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+
+    # Forecast 66°F, range 44-45°F → way outside → very confident in NO
+    conf = engine._outcome_no_confidence("44-45°F", 66.0)
+    assert conf >= 0.90
+
+    # Forecast 44.5°F, range 44-45°F → inside range → NO confidence = 0
+    conf = engine._outcome_no_confidence("44-45°F", 44.5)
+    assert conf == 0.0
+
+    # Forecast 47°F, range 44-45°F → 2.5° outside → moderate confidence
+    conf = engine._outcome_no_confidence("44-45°F", 47.0)
+    assert conf > 0.0
+
+
+def test_lottery_no_threshold_high():
+    """Lottery NO: buy NO at <5¢ when 'X or higher' is wrong per forecast.
+
+    This is the core 0x594ed trade:
+    - Market: "58°F or higher?" → YES at 99.9%, NO at 0.1%
+    - Forecast: 50°F (well below 58)
+    - Action: BUY NO at $0.001
+    """
+    market = WeatherMarket(
+        condition_id="0xdallas",
+        slug="highest-temp-dallas-feb-14",
+        title="Highest temperature in Dallas on February 14?",
+        city="Dallas",
+        target_date="2026-02-14",
+        outcomes={"58°F or higher": "tok1", "56-57°F": "tok2"},
+        # YES at 99.9% → NO at 0.1% — massive mispricing!
+        outcome_prices={"58°F or higher": 0.999, "56-57°F": 0.001},
+        end_date="2026-02-15T00:00:00Z",
+        resolution_source="Weather Underground",
+    )
+
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-14",
+        temp_max=50.0, temp_min=35.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(lottery_no_enabled=True)
+
+    signals = engine.evaluate_market(market, forecast)
+    lottery_no = [s for s in signals if s.trade_type == "lottery_no"]
+
+    assert len(lottery_no) >= 1
+    # Should buy NO on "58°F or higher" since forecast (50) is well below 58
+    no_58 = [s for s in lottery_no if s.outcome == "58°F or higher"]
+    assert len(no_58) == 1
+    assert no_58[0].side == "BUY_NO"
+    assert no_58[0].entry_price == pytest.approx(0.001)  # NO price = 1 - 0.999
+    assert no_58[0].confidence >= 0.60
+
+
+def test_lottery_no_threshold_low():
+    """Lottery NO on 'X or below' when forecast is well above threshold."""
+    market = WeatherMarket(
+        condition_id="0xatl",
+        slug="highest-temp-atlanta-feb-14",
+        title="Highest temperature in Atlanta on February 14?",
+        city="Atlanta",
+        target_date="2026-02-14",
+        outcomes={"45°F or below": "tok1"},
+        # Market thinks 45°F or below is almost certain — but forecast says 60°F
+        outcome_prices={"45°F or below": 0.98},
+        end_date="2026-02-15T00:00:00Z",
+        resolution_source="Weather Underground",
+    )
+
+    forecast = ForecastData(
+        city="Atlanta", date="2026-02-14",
+        temp_max=60.0, temp_min=42.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(lottery_no_enabled=True)
+
+    signals = engine.evaluate_market(market, forecast)
+    lottery_no = [s for s in signals if s.trade_type == "lottery_no"]
+
+    assert len(lottery_no) == 1
+    assert lottery_no[0].outcome == "45°F or below"
+    assert lottery_no[0].side == "BUY_NO"
+    assert lottery_no[0].entry_price == pytest.approx(0.02)
+
+
+def test_lottery_no_skips_when_forecast_agrees_with_market():
+    """Should NOT buy NO when forecast actually supports the outcome."""
+    market = WeatherMarket(
+        condition_id="0xmia",
+        slug="highest-temp-miami-feb-14",
+        title="Highest temperature in Miami on February 14?",
+        city="Miami",
+        target_date="2026-02-14",
+        outcomes={"70°F or higher": "tok1"},
+        outcome_prices={"70°F or higher": 0.99},
+        end_date="2026-02-15T00:00:00Z",
+        resolution_source="Weather Underground",
+    )
+
+    # Forecast AGREES with market: 80°F, well above 70°F threshold
+    forecast = ForecastData(
+        city="Miami", date="2026-02-14",
+        temp_max=80.0, temp_min=68.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(lottery_no_enabled=True)
+
+    signals = engine.evaluate_market(market, forecast)
+    lottery_no = [s for s in signals if s.trade_type == "lottery_no"]
+    assert len(lottery_no) == 0  # NO confidence = 0, should not trigger
+
+
+def test_lottery_no_sizing():
+    """Lottery NO trades should use lottery_no_size."""
+    engine = _make_engine(lottery_no_enabled=True, lottery_no_size=5.0)
+
+    market = WeatherMarket(
+        condition_id="0xtest", slug="test", title="test",
+        city="Dallas", target_date="2026-02-14",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.999},
+        end_date="2026-02-15T00:00:00Z", resolution_source="",
+    )
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-14",
+        temp_max=50.0, temp_min=35.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    signals = engine.evaluate_market(market, forecast)
+    lottery_no = [s for s in signals if s.trade_type == "lottery_no"]
+    assert len(lottery_no) == 1
+
+    trade = engine.enter_paper_trade(lottery_no[0])
+    assert trade is not None
+    assert trade.size_usd == 5.0
+    assert trade.side == "BUY_NO"
+    assert trade.trade_type == "lottery_no"
+
+
+@pytest.mark.asyncio
+async def test_resolve_lottery_no_wins():
+    """Lottery NO trade wins when YES resolves to 0 (NO pays $1)."""
+    engine = _make_engine()
+    engine.scanner = WeatherMarketScanner()
+    engine.scanner._markets["slug_ln"] = WeatherMarket(
+        condition_id="slug_ln", slug="slug_ln", title="test",
+        city="Dallas", target_date="2026-02-14",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.0},  # YES resolved to 0 → NO wins
+        end_date="2026-02-10T00:00:00Z", resolution_source="",
+    )
+
+    trade = WeatherPaperTrade(
+        id="tln1", condition_id="slug_ln", outcome="58°F or higher",
+        side="BUY_NO", trade_type="lottery_no",
+        entry_price=0.001, size_usd=3.0,  # Bought NO at 0.1¢
+    )
+    engine._open_trades = [trade]
+
+    resolved = await engine.resolve_trades()
+    assert len(resolved) == 1
+    assert resolved[0].won is True
+    # $3 at 0.001 = 3000 shares → profit = 3000 * (1 - 0.001) = $2997
+    assert resolved[0].pnl_usd == pytest.approx(2997.0, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Days-to-resolution filter tests
+# ---------------------------------------------------------------------------
+
+def test_days_to_resolution_filters_too_close():
+    """Markets resolving in <2 days should be filtered out."""
+    from datetime import datetime, timezone, timedelta
+
+    # Market resolving in 1 day
+    end_date = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    market = WeatherMarket(
+        condition_id="0xclose", slug="test", title="test",
+        city="Dallas", target_date="2026-02-11",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.03},
+        end_date=end_date, resolution_source="",
+    )
+
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-11",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(min_days_to_resolution=2.0, max_days_to_resolution=8.0)
+    signals = engine.evaluate_market(market, forecast)
+    assert len(signals) == 0
+
+
+def test_days_to_resolution_filters_too_far():
+    """Markets resolving in >8 days should be filtered out."""
+    from datetime import datetime, timezone, timedelta
+
+    end_date = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+    market = WeatherMarket(
+        condition_id="0xfar", slug="test", title="test",
+        city="Dallas", target_date="2026-02-20",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.03},
+        end_date=end_date, resolution_source="",
+    )
+
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-20",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(min_days_to_resolution=2.0, max_days_to_resolution=8.0)
+    signals = engine.evaluate_market(market, forecast)
+    assert len(signals) == 0
+
+
+def test_days_to_resolution_passes_sweet_spot():
+    """Markets resolving in 3-7 days should pass the filter."""
+    from datetime import datetime, timezone, timedelta
+
+    end_date = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+    market = WeatherMarket(
+        condition_id="0xsweet", slug="test", title="test",
+        city="Dallas", target_date="2026-02-15",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.03},
+        end_date=end_date, resolution_source="",
+    )
+
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-15",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(min_days_to_resolution=2.0, max_days_to_resolution=8.0)
+    signals = engine.evaluate_market(market, forecast)
+    lottery = [s for s in signals if s.trade_type == "lottery"]
+    assert len(lottery) == 1

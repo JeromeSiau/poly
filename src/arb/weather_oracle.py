@@ -394,10 +394,20 @@ class WeatherOracleEngine:
         self.scanner = scanner or WeatherMarketScanner()
         self._database_url = database_url
 
+        # Days-to-resolution filter
+        self.min_days_to_resolution = settings.WEATHER_ORACLE_MIN_DAYS_TO_RESOLUTION
+        self.max_days_to_resolution = settings.WEATHER_ORACLE_MAX_DAYS_TO_RESOLUTION
+
         # Lottery YES (Type 3) – cheap tail bets
         self.max_entry_price = settings.WEATHER_ORACLE_MAX_ENTRY_PRICE
         self.min_confidence = settings.WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE
         self.paper_size = settings.WEATHER_ORACLE_PAPER_SIZE_USD
+
+        # Lottery NO (Type 4) – the 0x594ed strategy: buy NO at <5¢ on mispriced markets
+        self.lottery_no_enabled = settings.WEATHER_ORACLE_LOTTERY_NO_ENABLED
+        self.lottery_no_size = settings.WEATHER_ORACLE_LOTTERY_NO_SIZE_USD
+        self.lottery_no_min_yes_price = settings.WEATHER_ORACLE_LOTTERY_NO_MIN_YES_PRICE
+        self.lottery_no_min_no_confidence = settings.WEATHER_ORACLE_LOTTERY_NO_MIN_NO_CONFIDENCE
 
         # Yield YES (Type 1) – buy likely outcome at 80-97¢
         self.yield_enabled = settings.WEATHER_ORACLE_YIELD_ENABLED
@@ -422,16 +432,35 @@ class WeatherOracleEngine:
 
         self._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
 
+    def _days_to_resolution(self, market: WeatherMarket) -> Optional[float]:
+        """Calculate days until market resolves. Returns None if unparseable."""
+        try:
+            end_str = market.end_date.replace("Z", "+00:00") if market.end_date else ""
+            if not end_str:
+                return None
+            end_dt = datetime.fromisoformat(end_str)
+            now = datetime.now(timezone.utc)
+            return (end_dt - now).total_seconds() / 86400.0
+        except (ValueError, AttributeError):
+            return None
+
     def evaluate_market(
         self, market: WeatherMarket, forecast: ForecastData,
     ) -> list[WeatherSignal]:
         """Evaluate a single market against a forecast, return buy signals.
 
-        Generates up to 3 signal types per outcome:
+        Generates up to 4 signal types per outcome:
         - Type 3 (lottery YES): cheap YES on high-confidence tail outcomes
+        - Type 4 (lottery NO): cheap NO when market is wrong (the 0x594ed strategy)
         - Type 1 (yield YES): buy YES at 80-97¢ on the most likely outcome
         - Type 2 (yield NO): buy NO on very unlikely outcomes (YES ≤ 5¢)
         """
+        # Days-to-resolution filter: only trade in the sweet spot
+        days = self._days_to_resolution(market)
+        if days is not None:
+            if days < self.min_days_to_resolution or days > self.max_days_to_resolution:
+                return []
+
         signals: list[WeatherSignal] = []
         temp_max = forecast.temp_max
 
@@ -455,6 +484,36 @@ class WeatherOracleEngine:
                         side="BUY_YES",
                         trade_type="lottery",
                     ))
+
+            # --- Type 4: Lottery NO (the 0x594ed strategy) ---
+            # Market prices YES at 95%+ but forecast says outcome is unlikely.
+            # Buy NO at <5¢ for massive asymmetric upside.
+            if self.lottery_no_enabled:
+                no_price = 1.0 - yes_price
+                if (
+                    yes_price >= self.lottery_no_min_yes_price
+                    and no_price <= self.max_entry_price
+                ):
+                    no_confidence = self._outcome_no_confidence(outcome_label, temp_max)
+                    key = f"{market.condition_id}:BUY_NO:lottery_no:{outcome_label}"
+                    if (
+                        key not in self._entered_markets
+                        and no_confidence >= self.lottery_no_min_no_confidence
+                    ):
+                        signals.append(WeatherSignal(
+                            market=market,
+                            outcome=outcome_label,
+                            entry_price=no_price,
+                            forecast=forecast,
+                            confidence=no_confidence,
+                            reason=(
+                                f"Lottery NO {temp_max:.0f}° → {outcome_label} "
+                                f"YES@{yes_price:.3f} NO@{no_price:.3f} "
+                                f"(no_conf={no_confidence:.0%})"
+                            ),
+                            side="BUY_NO",
+                            trade_type="lottery_no",
+                        ))
 
             # --- Type 1: Yield YES (buy likely outcome at 80-97¢) ---
             if self.yield_enabled:
@@ -541,13 +600,71 @@ class WeatherOracleEngine:
 
         return 0.0
 
+    def _outcome_no_confidence(self, outcome_label: str, forecast_temp: float) -> float:
+        """Confidence that this outcome will NOT happen (for lottery NO trades).
+
+        Mirrors _outcome_confidence but measures how far the forecast is on
+        the WRONG side of the threshold. Used by Type 4 (Lottery NO) to
+        confirm that buying NO is supported by forecast data.
+        """
+        is_celsius = "°C" in outcome_label or "°c" in outcome_label
+        forecast_std = 2.2 if is_celsius else 4.0
+
+        # "X°F or higher" → NO wins when temp is BELOW X
+        match = self._THRESHOLD_HIGH.search(outcome_label)
+        if match:
+            threshold = float(match.group(1))
+            margin_below = threshold - forecast_temp
+            if margin_below <= 0:
+                return 0.0  # forecast is above threshold, YES might happen
+            z_score = margin_below / forecast_std
+            return min(0.99, 0.5 + 0.5 * min(z_score / 2.0, 1.0))
+
+        # "X°F or below" → NO wins when temp is ABOVE X
+        match = self._THRESHOLD_LOW.search(outcome_label)
+        if match:
+            threshold = float(match.group(1))
+            margin_above = forecast_temp - threshold
+            if margin_above <= 0:
+                return 0.0  # forecast is below threshold, YES might happen
+            z_score = margin_above / forecast_std
+            return min(0.99, 0.5 + 0.5 * min(z_score / 2.0, 1.0))
+
+        # Range "X-Y°F" → NO wins when temp is OUTSIDE the range
+        match = self._RANGE.search(outcome_label)
+        if match:
+            low = float(match.group(1))
+            high = float(match.group(2))
+            mid = (low + high) / 2.0
+            range_half = (high - low) / 2.0
+            dist_to_mid = abs(forecast_temp - mid)
+            if dist_to_mid <= range_half:
+                return 0.0  # forecast is IN the range, YES might happen
+            excess = dist_to_mid - range_half
+            z_score = excess / forecast_std
+            return min(0.99, 0.5 + 0.5 * min(z_score / 2.0, 1.0))
+
+        # Exact "X°F" → NO wins when temp is NOT at this value
+        match = self._EXACT.search(outcome_label)
+        if match:
+            exact = float(match.group(1))
+            dist = abs(forecast_temp - exact)
+            if dist <= 0.5:
+                return 0.0  # forecast is at this exact temp
+            z_score = (dist - 0.5) / forecast_std
+            return min(0.99, 0.5 + 0.5 * min(z_score / 2.0, 1.0))
+
+        return 0.0
+
     def _size_for_signal(self, signal: WeatherSignal) -> float:
         """Return position size in USD based on trade type."""
         if signal.trade_type == "yield_yes":
             return self.yield_size
         if signal.trade_type == "yield_no":
             return self.no_size
-        return self.paper_size  # lottery
+        if signal.trade_type == "lottery_no":
+            return self.lottery_no_size
+        return self.paper_size  # lottery YES
 
     def enter_paper_trade(self, signal: WeatherSignal) -> Optional[WeatherPaperTrade]:
         """Record a paper trade entry."""
@@ -754,13 +871,16 @@ class WeatherOracleEngine:
         logger.info(
             "weather_oracle_started",
             scan_interval=scan_interval,
-            lottery_max_price=self.max_entry_price,
-            lottery_min_conf=self.min_confidence,
-            lottery_size=self.paper_size,
+            days_filter=f"{self.min_days_to_resolution}-{self.max_days_to_resolution}",
+            lottery_yes_max_price=self.max_entry_price,
+            lottery_yes_min_conf=self.min_confidence,
+            lottery_yes_size=self.paper_size,
+            lottery_no_enabled=self.lottery_no_enabled,
+            lottery_no_size=self.lottery_no_size,
+            lottery_no_min_yes=self.lottery_no_min_yes_price,
+            lottery_no_min_no_conf=self.lottery_no_min_no_confidence,
             yield_yes_enabled=self.yield_enabled,
-            yield_yes_size=self.yield_size,
             yield_no_enabled=self.no_enabled,
-            yield_no_size=self.no_size,
         )
 
         while True:

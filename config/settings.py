@@ -177,21 +177,31 @@ class Settings(BaseSettings):
     WEATHER_ORACLE_MAX_DAILY_SPEND: float = 500.0  # max $500/day (paper)
     WEATHER_ORACLE_PAPER_FILE: str = "data/weather_oracle_paper.jsonl"
 
-    # Type 3 – Lottery YES (cheap tail bets)
+    # Days-to-resolution filter (0x594ed trades 3-7 days before resolution)
+    WEATHER_ORACLE_MIN_DAYS_TO_RESOLUTION: float = 2.0
+    WEATHER_ORACLE_MAX_DAYS_TO_RESOLUTION: float = 8.0
+
+    # Type 3 – Lottery YES (cheap tail bets on correct YES outcomes)
     WEATHER_ORACLE_MAX_ENTRY_PRICE: float = 0.05  # max 5¢ entry
     WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE: float = 0.90  # 90% confidence
     WEATHER_ORACLE_PAPER_SIZE_USD: float = 3.0  # $3 per lottery ticket
 
-    # Type 1 – Yield YES (buy likely outcome at 80-97¢)
-    WEATHER_ORACLE_YIELD_ENABLED: bool = True
-    WEATHER_ORACLE_YIELD_SIZE_USD: float = 50.0  # $50 per yield trade
+    # Type 4 – Lottery NO (the 0x594ed strategy: buy NO at <5¢ when market is wrong)
+    WEATHER_ORACLE_LOTTERY_NO_ENABLED: bool = True
+    WEATHER_ORACLE_LOTTERY_NO_SIZE_USD: float = 3.0  # $3 per lottery NO ticket
+    WEATHER_ORACLE_LOTTERY_NO_MIN_YES_PRICE: float = 0.95  # YES must be ≥95¢ → NO ≤5¢
+    WEATHER_ORACLE_LOTTERY_NO_MIN_NO_CONFIDENCE: float = 0.60  # min confidence outcome won't happen
+
+    # Type 1 – Yield YES (buy likely outcome at 80-97¢) — low edge, disabled by default
+    WEATHER_ORACLE_YIELD_ENABLED: bool = False
+    WEATHER_ORACLE_YIELD_SIZE_USD: float = 10.0  # $10 per yield trade
     WEATHER_ORACLE_YIELD_MIN_CONFIDENCE: float = 0.95
     WEATHER_ORACLE_YIELD_MIN_YES_PRICE: float = 0.80
     WEATHER_ORACLE_YIELD_MAX_YES_PRICE: float = 0.97
 
-    # Type 2 – Yield NO (sell unlikely outcomes, buy NO at 1-yes_price)
-    WEATHER_ORACLE_NO_ENABLED: bool = True
-    WEATHER_ORACLE_NO_SIZE_USD: float = 50.0  # $50 per NO trade
+    # Type 2 – Yield NO (buy NO at 95¢+ when outcome is unlikely — low edge)
+    WEATHER_ORACLE_NO_ENABLED: bool = False
+    WEATHER_ORACLE_NO_SIZE_USD: float = 10.0  # $10 per NO trade
     WEATHER_ORACLE_NO_MAX_CONFIDENCE: float = 0.10  # outcome must be unlikely
     WEATHER_ORACLE_NO_MAX_YES_PRICE: float = 0.05  # YES must be ≤5¢ (NO ≥95¢)
 
