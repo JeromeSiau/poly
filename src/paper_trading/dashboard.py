@@ -14,7 +14,7 @@ import streamlit as st
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.db.models import LiveObservation, PaperTrade
+from src.db.models import FearPosition, LiveObservation, PaperTrade
 from src.ml.validation.calibration import reliability_diagram_data
 from src.paper_trading.metrics import PaperTradingMetrics, TradeRecord
 
@@ -44,6 +44,28 @@ def load_data(db_path: str = "data/arb.db"):
 
     session.close()
     return observations, trades
+
+
+def load_fear_positions(db_path: str = "data/arb.db") -> list:
+    """Load fear selling positions from SQLite database.
+
+    Args:
+        db_path: Path to SQLite database file.
+
+    Returns:
+        List of FearPosition objects.
+    """
+    engine = create_engine(f"sqlite:///{db_path}")
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        positions = session.query(FearPosition).all()
+    except Exception:
+        positions = []
+
+    session.close()
+    return positions
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1322,6 +1344,184 @@ def _render_crypto_maker_tab(
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def _render_fear_selling_tab(positions: list) -> None:
+    """Render the Fear Selling tab content."""
+    if not positions:
+        st.info("No fear selling positions found.")
+        return
+
+    # Build dataframe from FearPosition objects
+    rows: list[dict[str, Any]] = []
+    for p in positions:
+        rows.append({
+            "condition_id": p.condition_id,
+            "token_id": p.token_id,
+            "title": p.title,
+            "cluster": p.cluster,
+            "side": p.side,
+            "entry_price": _safe_float(p.entry_price),
+            "size_usd": _safe_float(p.size_usd),
+            "shares": _safe_float(p.shares),
+            "fear_score": _safe_float(p.fear_score),
+            "yes_price_at_entry": _safe_float(p.yes_price_at_entry),
+            "exit_price": _safe_float(p.exit_price) if p.exit_price is not None else None,
+            "realized_pnl": _safe_float(p.realized_pnl) if p.realized_pnl is not None else 0.0,
+            "unrealized_pnl": _safe_float(p.unrealized_pnl) if p.unrealized_pnl is not None else 0.0,
+            "is_open": bool(p.is_open),
+            "entry_trigger": p.entry_trigger or "",
+            "opened_at": p.opened_at,
+            "closed_at": p.closed_at,
+        })
+
+    df = pd.DataFrame(rows)
+    open_df = df[df["is_open"]].copy()
+    closed_df = df[~df["is_open"]].copy()
+
+    # Summary metrics
+    total_realized = closed_df["realized_pnl"].sum() if not closed_df.empty else 0.0
+    total_unrealized = open_df["unrealized_pnl"].sum() if not open_df.empty else 0.0
+    total_exposure = open_df["size_usd"].sum() if not open_df.empty else 0.0
+    avg_fear = df["fear_score"].mean() if not df.empty else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Positions", len(df))
+    c2.metric("Open / Closed", f"{len(open_df)} / {len(closed_df)}")
+    c3.metric("Realized P&L", f"${total_realized:,.2f}")
+    c4.metric("Unrealized P&L", f"${total_unrealized:,.2f}")
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Total P&L", f"${total_realized + total_unrealized:,.2f}")
+    c6.metric("Open Exposure", f"${total_exposure:,.2f}")
+    c7.metric("Avg Fear Score", f"{avg_fear:.2f}")
+    win_count = len(closed_df[closed_df["realized_pnl"] > 0]) if not closed_df.empty else 0
+    c8.metric("Win Rate (Closed)", f"{win_count / len(closed_df):.1%}" if not closed_df.empty else "N/A")
+
+    st.divider()
+
+    # P&L by cluster (bar chart)
+    st.subheader("P&L by Cluster")
+    cluster_pnl = df.groupby("cluster", as_index=False).agg(
+        realized_pnl=("realized_pnl", "sum"),
+        unrealized_pnl=("unrealized_pnl", "sum"),
+        positions=("condition_id", "count"),
+    )
+    cluster_pnl["total_pnl"] = cluster_pnl["realized_pnl"] + cluster_pnl["unrealized_pnl"]
+    cluster_pnl = cluster_pnl.sort_values("total_pnl", ascending=False)
+
+    if not cluster_pnl.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=cluster_pnl["cluster"],
+            y=cluster_pnl["realized_pnl"],
+            name="Realized P&L",
+            marker_color="#2ecc71",
+        ))
+        fig.add_trace(go.Bar(
+            x=cluster_pnl["cluster"],
+            y=cluster_pnl["unrealized_pnl"],
+            name="Unrealized P&L",
+            marker_color="#3498db",
+        ))
+        fig.update_layout(
+            barmode="group",
+            xaxis_title="Cluster",
+            yaxis_title="P&L ($)",
+            height=400,
+            template="plotly_dark",
+            margin=dict(l=50, r=50, t=30, b=50),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # Cluster exposure summary
+    st.subheader("Cluster Exposure Summary")
+    if not open_df.empty:
+        cluster_exposure = open_df.groupby("cluster", as_index=False).agg(
+            open_positions=("condition_id", "count"),
+            total_exposure=("size_usd", "sum"),
+            total_shares=("shares", "sum"),
+            avg_entry_price=("entry_price", "mean"),
+            avg_fear_score=("fear_score", "mean"),
+            unrealized_pnl=("unrealized_pnl", "sum"),
+        )
+        cluster_exposure = cluster_exposure.sort_values("total_exposure", ascending=False)
+        show_exposure = cluster_exposure.copy()
+        show_exposure["avg_entry_price"] = show_exposure["avg_entry_price"].map(lambda x: f"{x:.3f}")
+        show_exposure["avg_fear_score"] = show_exposure["avg_fear_score"].map(lambda x: f"{x:.2f}")
+        show_exposure["total_exposure"] = show_exposure["total_exposure"].map(lambda x: f"${x:,.2f}")
+        show_exposure["total_shares"] = show_exposure["total_shares"].map(lambda x: f"{x:.2f}")
+        show_exposure["unrealized_pnl"] = show_exposure["unrealized_pnl"].map(lambda x: f"${x:,.2f}")
+        st.dataframe(show_exposure, use_container_width=True, hide_index=True)
+    else:
+        st.info("No open positions.")
+
+    st.divider()
+
+    # Fear score distribution
+    st.subheader("Fear Score Distribution")
+    if not df.empty:
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(
+            x=df["fear_score"],
+            nbinsx=20,
+            name="Fear Score",
+            marker_color="#e74c3c",
+        ))
+        fig_hist.update_layout(
+            xaxis_title="Fear Score",
+            yaxis_title="Count",
+            height=350,
+            template="plotly_dark",
+            margin=dict(l=50, r=50, t=30, b=50),
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    st.divider()
+
+    # Active fear positions table
+    st.subheader("Active Positions")
+    if not open_df.empty:
+        active = open_df.sort_values("opened_at", ascending=False).copy()
+        show_active = pd.DataFrame([{
+            "Opened": r["opened_at"].strftime("%m-%d %H:%M") if isinstance(r.get("opened_at"), datetime) else "N/A",
+            "Title": str(r["title"])[:60],
+            "Cluster": r["cluster"],
+            "Side": r["side"],
+            "Entry Price": f"{r['entry_price']:.3f}",
+            "Size": f"${r['size_usd']:.2f}",
+            "Shares": f"{r['shares']:.2f}",
+            "Fear Score": f"{r['fear_score']:.2f}",
+            "Yes Price": f"{r['yes_price_at_entry']:.3f}",
+            "Unrealized": f"${r['unrealized_pnl']:.2f}",
+            "Trigger": r["entry_trigger"],
+        } for _, r in active.iterrows()])
+        st.dataframe(show_active, use_container_width=True, hide_index=True)
+    else:
+        st.info("No active positions.")
+
+    # Closed positions table
+    st.subheader("Closed Positions")
+    if not closed_df.empty:
+        closed = closed_df.sort_values("closed_at", ascending=False).head(50).copy()
+        show_closed = pd.DataFrame([{
+            "Opened": r["opened_at"].strftime("%m-%d %H:%M") if isinstance(r.get("opened_at"), datetime) else "N/A",
+            "Closed": r["closed_at"].strftime("%m-%d %H:%M") if isinstance(r.get("closed_at"), datetime) else "N/A",
+            "Title": str(r["title"])[:60],
+            "Cluster": r["cluster"],
+            "Side": r["side"],
+            "Entry": f"{r['entry_price']:.3f}",
+            "Exit": f"{r['exit_price']:.3f}" if r["exit_price"] is not None else "N/A",
+            "Size": f"${r['size_usd']:.2f}",
+            "P&L": f"${r['realized_pnl']:.2f}",
+            "Fear Score": f"{r['fear_score']:.2f}",
+            "Trigger": r["entry_trigger"],
+        } for _, r in closed.iterrows()])
+        st.dataframe(show_closed, use_container_width=True, hide_index=True)
+    else:
+        st.info("No closed positions yet.")
+
+
 def main():
     """Main dashboard entry point."""
     st.set_page_config(
@@ -1348,9 +1548,15 @@ def main():
         observations = []
         trades = []
 
+    # Load fear positions
+    try:
+        fear_positions = load_fear_positions(db_path)
+    except Exception:
+        fear_positions = []
+
     # --- Tabs ---
-    tab_maker, tab_sniper, tab_crypto, tab_weather, tab_two_sided = st.tabs(
-        ["Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Two-Sided"]
+    tab_maker, tab_sniper, tab_crypto, tab_weather, tab_fear, tab_two_sided = st.tabs(
+        ["Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling", "Two-Sided"]
     )
 
     # ===== TWO-SIDED TAB =====
@@ -1638,6 +1844,10 @@ def main():
     # ===== CRYPTO MAKER TAB =====
     with tab_maker:
         _render_crypto_maker_tab(observations, trades)
+
+    # ===== FEAR SELLING TAB =====
+    with tab_fear:
+        _render_fear_selling_tab(fear_positions)
 
     # Footer
     st.divider()
