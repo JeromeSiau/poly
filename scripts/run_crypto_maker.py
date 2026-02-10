@@ -212,8 +212,9 @@ class CryptoMaker:
                 if now > slot_end + 300:  # 5 min grace
                     to_remove.append(cid)
 
+        settled_count = 0
         for cid in to_remove:
-            # Cancel any active orders on this market
+            # Cancel any active orders on this market.
             for oid, order in list(self.active_orders.items()):
                 if order.condition_id == cid:
                     if not self.paper_mode and self.executor:
@@ -221,7 +222,14 @@ class CryptoMaker:
                             await self.executor.cancel_order(oid)
                         except Exception:
                             pass
+                    key = (order.condition_id, order.outcome, order.intent.side)
+                    if self._orders_by_key.get(key) == oid:
+                        del self._orders_by_key[key]
                     del self.active_orders[oid]
+
+            # Settle open positions before removing market data.
+            settled_count += self._settle_market(cid, now)
+
             try:
                 await self.polymarket.unsubscribe_market(cid)
             except Exception:
@@ -236,7 +244,138 @@ class CryptoMaker:
             self.market_outcomes.pop(cid, None)
 
         if to_remove:
-            logger.info("markets_pruned", count=len(to_remove), remaining=len(self.known_markets))
+            logger.info(
+                "markets_pruned",
+                count=len(to_remove),
+                settled=settled_count,
+                remaining=len(self.known_markets),
+            )
+
+    # ------------------------------------------------------------------
+    # Settlement
+    # ------------------------------------------------------------------
+
+    def _settle_market(self, condition_id: str, now: float) -> int:
+        """Settle all open positions for an expired market.
+
+        Strategy:
+        1. Pair merge first — if both outcomes held, merge at $1.00 total.
+        2. Settle remaining — winner at $1.00, loser at $0.00 based on
+           last known book (the winning outcome's bid ≈ 1.0 after resolution).
+
+        Returns number of positions settled.
+        """
+        outcomes = self.market_outcomes.get(condition_id, [])
+        if len(outcomes) < 2:
+            return 0
+
+        inv = self.engine.get_open_inventory()
+        by_outcome = inv.get(condition_id)
+        if not by_outcome:
+            return 0
+
+        mkt = self.known_markets.get(condition_id, {})
+        slug = _first_event_slug(mkt)
+        settled = 0
+
+        # --- Phase 1: pair merge (both sides held → profit = $1 - cost) ---
+        states = {o: by_outcome.get(o) for o in outcomes if by_outcome.get(o) and by_outcome[o].shares > 0}
+        if len(states) == 2:
+            out_a, out_b = outcomes[0], outcomes[1]
+            merge_shares = min(states[out_a].shares, states[out_b].shares)
+            if merge_shares > 0:
+                for outcome in [out_a, out_b]:
+                    fill = self.engine.settle_position(
+                        condition_id=condition_id,
+                        outcome=outcome,
+                        settlement_price=0.50,
+                        timestamp=now,
+                    )
+                    if fill.shares > 0:
+                        settled += 1
+                        self._persist_settlement(
+                            condition_id, outcome, slug, fill, 0.50, now,
+                        )
+                pair_cost = states[out_a].avg_price + states[out_b].avg_price
+                logger.info(
+                    "maker_pair_settled",
+                    condition_id=condition_id[:16],
+                    shares=merge_shares,
+                    cost=round(pair_cost, 4),
+                    profit=round(1.0 - pair_cost, 4),
+                )
+
+        # --- Phase 2: settle any remaining single-side positions ---
+        inv = self.engine.get_open_inventory()
+        by_outcome = inv.get(condition_id, {})
+        for outcome in outcomes:
+            state = by_outcome.get(outcome)
+            if not state or state.shares <= 0:
+                continue
+
+            # Determine settlement from last book: bid near 1.0 = winner.
+            bid, _, _, _ = self.polymarket.get_best_levels(condition_id, outcome)
+            if bid is not None and bid >= 0.5:
+                settlement_price = 1.0
+            else:
+                settlement_price = 0.0
+
+            fill = self.engine.settle_position(
+                condition_id=condition_id,
+                outcome=outcome,
+                settlement_price=settlement_price,
+                timestamp=now,
+            )
+            if fill.shares > 0:
+                settled += 1
+                self._persist_settlement(
+                    condition_id, outcome, slug, fill, settlement_price, now,
+                )
+                logger.info(
+                    "maker_position_settled",
+                    condition_id=condition_id[:16],
+                    outcome=outcome,
+                    settlement=settlement_price,
+                    shares=fill.shares,
+                    pnl=round(fill.realized_pnl_delta, 4),
+                )
+
+        return settled
+
+    def _persist_settlement(
+        self,
+        condition_id: str,
+        outcome: str,
+        slug: str,
+        fill: FillResult,
+        settlement_price: float,
+        now: float,
+    ) -> None:
+        """Persist a settlement fill to the paper recorder."""
+        if self.paper_recorder is None:
+            return
+        intent = TradeIntent(
+            condition_id=condition_id,
+            title=str(self.known_markets.get(condition_id, {}).get("question", "")),
+            outcome=outcome,
+            token_id=self.market_tokens.get((condition_id, outcome), ""),
+            side="SELL",
+            price=settlement_price,
+            size_usd=fill.shares * settlement_price,
+            edge_pct=0.0,
+            reason="settlement_closed_market",
+            timestamp=now,
+        )
+        try:
+            self.paper_recorder.persist_fill(
+                intent=intent,
+                fill=fill,
+                snapshot=None,
+                fair_prices={outcome: settlement_price},
+                execution_mode="maker_ws_settlement",
+            )
+        except Exception as exc:
+            logger.warning("persist_settlement_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # Maker loop
