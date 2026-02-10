@@ -107,34 +107,30 @@ class TestFearMarketScanner:
             {
                 "condition_id": "a",
                 "title": "War market",
-                "tokens": [
-                    {"outcome": "Yes", "price": 0.30},
-                    {"outcome": "No", "price": 0.70, "token_id": "tok-a"},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.30", "0.70"],
+                "clobTokenIds": ["tok-a-yes", "tok-a"],
             },
             {
                 "condition_id": "b",
                 "title": "Near certain",
-                "tokens": [
-                    {"outcome": "Yes", "price": 0.90},
-                    {"outcome": "No", "price": 0.10, "token_id": "tok-b"},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.90", "0.10"],
+                "clobTokenIds": ["tok-b-yes", "tok-b"],
             },
             {
                 "condition_id": "c",
                 "title": "Very unlikely fear",
-                "tokens": [
-                    {"outcome": "Yes", "price": 0.03},
-                    {"outcome": "No", "price": 0.97, "token_id": "tok-c"},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.03", "0.97"],
+                "clobTokenIds": ["tok-c-yes", "tok-c"],
             },
             {
                 "condition_id": "d",
                 "title": "Edge of range",
-                "tokens": [
-                    {"outcome": "Yes", "price": 0.65},
-                    {"outcome": "No", "price": 0.35, "token_id": "tok-d"},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.65", "0.35"],
+                "clobTokenIds": ["tok-d-yes", "tok-d"],
             },
         ]
         candidates = scanner.filter_candidates(markets)

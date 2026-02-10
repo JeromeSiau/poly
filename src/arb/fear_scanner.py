@@ -20,6 +20,8 @@ scaled to the market's time window via exponential decay.
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -37,23 +39,39 @@ logger = structlog.get_logger()
 
 FEAR_KEYWORDS: dict[str, list[str]] = {
     "high": [
-        "strike", "invade", "invasion", "nuclear", "war", "attack",
-        "bomb", "collapse", "fall", "regime change",
-        "die", "killed", "coup", "assassinate",
-        "missile", "drone strike", "terrorist", "terrorism",
+        "strike", "strikes", "invade", "invades", "invasion", "nuclear",
+        "war", "wars", "warfare", "attack", "attacks",
+        "bomb", "bombs", "bombing", "collapse",
+        "fall", "falls", "regime change",
+        "die", "dies", "killed", "coup", "coups",
+        "assassinate", "assassination",
+        "missile", "missiles", "drone strike",
+        "terrorist", "terrorism",
         "pandemic", "outbreak",
     ],
     "medium": [
-        "ceasefire", "resign", "impeach", "default", "recession",
-        "shutdown", "sanctions", "regime", "annex", "deploy", "mobilize",
+        "ceasefire", "resign", "impeach", "default", "defaults",
+        "recession", "shutdown", "sanctions", "regime",
+        "annex", "deploy", "mobilize",
         "embargo", "blockade", "martial law",
         "hurricane", "earthquake", "tsunami", "disaster",
         "virus", "epidemic",
     ],
     "low": [
-        "ban", "tariff", "out by", "out as", "fired",
+        "tariff", "tariffs", "fired",
         "charged", "indicted", "arrested",
     ],
+}
+
+# Pre-compiled word-boundary patterns for each tier.
+# Uses \b on both sides so "war" won't match "hardware", "coup" won't
+# match "coupon", "die" won't match "studied", etc.
+_KEYWORD_PATTERNS: dict[str, re.Pattern[str]] = {
+    tier: re.compile(
+        "|".join(r"\b" + re.escape(kw) + r"\b" for kw in keywords),
+        re.IGNORECASE,
+    )
+    for tier, keywords in FEAR_KEYWORDS.items()
 }
 
 # ---------------------------------------------------------------------------
@@ -132,6 +150,20 @@ class FearMarketCandidate:
 # Scanner
 # ---------------------------------------------------------------------------
 
+def _parse_gamma_list(value: Any) -> list:
+    """Parse a Gamma API field that may be a JSON string or an already-parsed list."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []
+
+
 class FearMarketScanner:
     """Scans Polymarket for contrarian NO bets on fear-driven markets."""
 
@@ -170,12 +202,11 @@ class FearMarketScanner:
         score = 0.15  # base score
 
         # --- Keyword tier bonus -----------------------------------------
-        title_lower = title.lower()
-        if any(kw in title_lower for kw in FEAR_KEYWORDS["high"]):
+        if _KEYWORD_PATTERNS["high"].search(title):
             score += 0.35
-        elif any(kw in title_lower for kw in FEAR_KEYWORDS["medium"]):
+        elif _KEYWORD_PATTERNS["medium"].search(title):
             score += 0.20
-        elif any(kw in title_lower for kw in FEAR_KEYWORDS["low"]):
+        elif _KEYWORD_PATTERNS["low"].search(title):
             score += 0.10
 
         # --- YES price sweet spot ---------------------------------------
@@ -211,9 +242,8 @@ class FearMarketScanner:
     @staticmethod
     def has_keyword_match(title: str) -> bool:
         """Return True if *title* matches any fear keyword tier."""
-        title_lower = title.lower()
-        for tier in FEAR_KEYWORDS.values():
-            if any(kw in title_lower for kw in tier):
+        for pattern in _KEYWORD_PATTERNS.values():
+            if pattern.search(title):
                 return True
         return False
 
@@ -266,17 +296,16 @@ class FearMarketScanner:
         """Filter markets whose YES price falls within the configured range."""
         candidates = []
         for market in markets:
-            tokens = market.get("tokens", [])
-            yes_price = None
-            for token in tokens:
-                if token.get("outcome") == "Yes":
-                    yes_price = token.get("price", 1.0)
-                    break
+            outcome_prices = _parse_gamma_list(market.get("outcomePrices", []))
+            outcomes = _parse_gamma_list(market.get("outcomes", []))
+            if len(outcome_prices) < 2 or "Yes" not in outcomes:
+                continue
+            try:
+                yes_price = float(outcome_prices[outcomes.index("Yes")])
+            except (ValueError, IndexError):
+                continue
 
-            if (
-                yes_price is not None
-                and self.min_yes_price <= yes_price <= self.max_yes_price
-            ):
+            if self.min_yes_price <= yes_price <= self.max_yes_price:
                 candidates.append(market)
 
         return candidates
@@ -328,21 +357,27 @@ class FearMarketScanner:
                 end_date_days = 90  # fallback
 
             for market in event.get("markets", []):
-                tokens = market.get("tokens", [])
+                # Gamma API stores prices in outcomePrices and token IDs in
+                # clobTokenIds.  These can be either JSON strings or lists
+                # depending on the endpoint/version.
+                outcome_prices = _parse_gamma_list(market.get("outcomePrices", []))
+                clob_token_ids = _parse_gamma_list(market.get("clobTokenIds", []))
+                outcomes = _parse_gamma_list(market.get("outcomes", []))
 
-                # Extract YES / NO prices and token IDs
-                yes_price: float | None = None
-                no_price: float | None = None
-                no_token_id: str = ""
-                for token in tokens:
-                    outcome = token.get("outcome", "")
-                    if outcome == "Yes":
-                        yes_price = float(token.get("price", 1.0))
-                    elif outcome == "No":
-                        no_price = float(token.get("price", 0.0))
-                        no_token_id = token.get("token_id", "")
+                if len(outcome_prices) < 2 or len(outcomes) < 2:
+                    continue
 
-                if yes_price is None or no_price is None:
+                try:
+                    yes_idx = outcomes.index("Yes")
+                    no_idx = outcomes.index("No")
+                except ValueError:
+                    continue
+
+                yes_price = float(outcome_prices[yes_idx])
+                no_price = float(outcome_prices[no_idx])
+                no_token_id = clob_token_ids[no_idx] if no_idx < len(clob_token_ids) else ""
+
+                if yes_price <= 0 and no_price <= 0:
                     continue
 
                 # Filter by YES price range
@@ -457,6 +492,8 @@ class FearMarketScanner:
             # Keyword-matched but LLM rejected — drop silently
 
         # --- Pass 2: discover markets keywords missed --------------------
+        # Only send markets in YES price range to LLM (avoid wasting calls
+        # on sports, crypto, etc.)
         existing_titles = set(kw_titles)
         missed_titles: list[str] = []
         missed_markets: dict[str, dict[str, Any]] = {}
@@ -464,9 +501,21 @@ class FearMarketScanner:
         for event in events:
             for market in event.get("markets", []):
                 question = market.get("question", event.get("title", ""))
-                if question not in existing_titles:
-                    missed_titles.append(question)
-                    missed_markets[question] = {**market, "_event": event}
+                if question in existing_titles:
+                    continue
+                # Pre-filter: only send markets with YES price in range
+                op = _parse_gamma_list(market.get("outcomePrices", []))
+                oc = _parse_gamma_list(market.get("outcomes", []))
+                if len(op) < 2 or "Yes" not in oc:
+                    continue
+                try:
+                    yes_price = float(op[oc.index("Yes")])
+                except (ValueError, IndexError):
+                    continue
+                if not (self.min_yes_price <= yes_price <= self.max_yes_price):
+                    continue
+                missed_titles.append(question)
+                missed_markets[question] = {**market, "_event": event}
 
         if missed_titles:
             # Batch in chunks to respect classifier batch_size
@@ -500,20 +549,25 @@ class FearMarketScanner:
     ) -> FearMarketCandidate | None:
         """Build a FearMarketCandidate from an LLM-discovered market."""
         event = market_data.get("_event", {})
-        tokens = market_data.get("tokens", [])
 
-        yes_price: float | None = None
-        no_price: float | None = None
-        no_token_id: str = ""
-        for token in tokens:
-            outcome = token.get("outcome", "")
-            if outcome == "Yes":
-                yes_price = float(token.get("price", 1.0))
-            elif outcome == "No":
-                no_price = float(token.get("price", 0.0))
-                no_token_id = token.get("token_id", "")
+        outcome_prices = _parse_gamma_list(market_data.get("outcomePrices", []))
+        clob_token_ids = _parse_gamma_list(market_data.get("clobTokenIds", []))
+        outcomes = _parse_gamma_list(market_data.get("outcomes", []))
 
-        if yes_price is None or no_price is None:
+        if len(outcome_prices) < 2 or len(outcomes) < 2:
+            return None
+
+        try:
+            yes_idx = outcomes.index("Yes")
+            no_idx = outcomes.index("No")
+        except ValueError:
+            return None
+
+        yes_price = float(outcome_prices[yes_idx])
+        no_price = float(outcome_prices[no_idx])
+        no_token_id = clob_token_ids[no_idx] if no_idx < len(clob_token_ids) else ""
+
+        if yes_price <= 0 and no_price <= 0:
             return None
         if not (self.min_yes_price <= yes_price <= self.max_yes_price):
             return None

@@ -29,10 +29,9 @@ FEAR_EVENTS = [
                 "volumeNum": 500000,
                 "liquidity": "80000",
                 "liquidityNum": 80000,
-                "tokens": [
-                    {"token_id": "tok_yes_1", "outcome": "Yes", "price": 0.40},
-                    {"token_id": "tok_no_1", "outcome": "No", "price": 0.60},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.40", "0.60"],
+                "clobTokenIds": ["tok_yes_1", "tok_no_1"],
             }
         ],
     },
@@ -50,10 +49,9 @@ FEAR_EVENTS = [
                 "volumeNum": 300000,
                 "liquidity": "60000",
                 "liquidityNum": 60000,
-                "tokens": [
-                    {"token_id": "tok_yes_2", "outcome": "Yes", "price": 0.35},
-                    {"token_id": "tok_no_2", "outcome": "No", "price": 0.65},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.35", "0.65"],
+                "clobTokenIds": ["tok_yes_2", "tok_no_2"],
             }
         ],
     },
@@ -71,10 +69,9 @@ FEAR_EVENTS = [
                 "volumeNum": 20000,
                 "liquidity": "5000",
                 "liquidityNum": 5000,
-                "tokens": [
-                    {"token_id": "tok_yes_3", "outcome": "Yes", "price": 0.50},
-                    {"token_id": "tok_no_3", "outcome": "No", "price": 0.50},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.50", "0.50"],
+                "clobTokenIds": ["tok_yes_3", "tok_no_3"],
             }
         ],
     },

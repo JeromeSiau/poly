@@ -22,10 +22,9 @@ SAMPLE_EVENTS = [
                 "volumeNum": 500000,
                 "liquidity": "80000",
                 "liquidityNum": 80000,
-                "tokens": [
-                    {"token_id": "tok_yes_1", "outcome": "Yes", "price": 0.40},
-                    {"token_id": "tok_no_1", "outcome": "No", "price": 0.60},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.40", "0.60"],
+                "clobTokenIds": ["tok_yes_1", "tok_no_1"],
             }
         ],
     },
@@ -43,10 +42,9 @@ SAMPLE_EVENTS = [
                 "volumeNum": 30000,
                 "liquidity": "10000",
                 "liquidityNum": 10000,
-                "tokens": [
-                    {"token_id": "tok_yes_2", "outcome": "Yes", "price": 0.50},
-                    {"token_id": "tok_no_2", "outcome": "No", "price": 0.50},
-                ],
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.50", "0.50"],
+                "clobTokenIds": ["tok_yes_2", "tok_no_2"],
             }
         ],
     },

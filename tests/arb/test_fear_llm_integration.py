@@ -27,10 +27,9 @@ def _gamma_events():
                     "conditionId": "cond-nuclear",
                     "volumeNum": 60000,
                     "liquidityNum": 5000,
-                    "tokens": [
-                        {"outcome": "Yes", "price": 0.15, "token_id": "yes-1"},
-                        {"outcome": "No", "price": 0.85, "token_id": "no-1"},
-                    ],
+                    "outcomes": ["Yes", "No"],
+                    "outcomePrices": ["0.15", "0.85"],
+                    "clobTokenIds": ["yes-1", "no-1"],
                 }
             ],
         },
@@ -43,10 +42,9 @@ def _gamma_events():
                     "conditionId": "cond-scs",
                     "volumeNum": 30000,
                     "liquidityNum": 4000,
-                    "tokens": [
-                        {"outcome": "Yes", "price": 0.25, "token_id": "yes-2"},
-                        {"outcome": "No", "price": 0.75, "token_id": "no-2"},
-                    ],
+                    "outcomes": ["Yes", "No"],
+                    "outcomePrices": ["0.25", "0.75"],
+                    "clobTokenIds": ["yes-2", "no-2"],
                 }
             ],
         },
@@ -182,10 +180,9 @@ async def test_classifier_rejection_drops_keyword_candidate():
                             "conditionId": "cond-fall",
                             "volumeNum": 50000,
                             "liquidityNum": 3000,
-                            "tokens": [
-                                {"outcome": "Yes", "price": 0.30, "token_id": "yes-f"},
-                                {"outcome": "No", "price": 0.70, "token_id": "no-f"},
-                            ],
+                            "outcomes": ["Yes", "No"],
+                            "outcomePrices": ["0.30", "0.70"],
+                            "clobTokenIds": ["yes-f", "no-f"],
                         }
                     ],
                 }
