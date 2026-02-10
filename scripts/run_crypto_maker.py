@@ -267,16 +267,18 @@ class CryptoMaker:
         now = time.time()
         self._cycle_count += 1
 
-        # Throttled fill check.
-        if now - self._last_fill_check >= self.fill_check_interval:
+        # Fill check: paper mode runs every tick (free, no I/O);
+        # live mode throttled to fill_check_interval (HTTP polling).
+        if self.paper_mode or now - self._last_fill_check >= self.fill_check_interval:
             await self._check_fills(now)
             self._last_fill_check = now
 
         # Single inventory snapshot for the entire tick.
         inv = self.engine.get_open_inventory()
 
-        # Phase 1: collect cancels and new intents (no I/O yet).
+        # Phase 1: collect cancels, paper fills, and new intents (no I/O yet).
         cancel_ids: list[str] = []
+        paper_fill_ids: list[str] = []
         place_intents: list[TradeIntent] = []
 
         for cid, mkt in list(self.known_markets.items()):
@@ -305,7 +307,12 @@ class CryptoMaker:
 
                 if existing is not None:
                     if existing.intent.price != bid:
-                        cancel_ids.append(existing.order_id)
+                        # Paper mode: bid dropped past our price → someone sold
+                        # through our level → treat as fill, not cancel.
+                        if self.paper_mode and bid < existing.intent.price:
+                            paper_fill_ids.append(existing.order_id)
+                        else:
+                            cancel_ids.append(existing.order_id)
                         existing = None
 
                 if existing is None:
@@ -343,7 +350,41 @@ class CryptoMaker:
                         timestamp=now,
                     ))
 
-        # Phase 2: execute cancels in parallel.
+        # Phase 2a: process paper fills (bid dropped through our level).
+        for oid in paper_fill_ids:
+            order = self.active_orders.pop(oid, None)
+            if order is None:
+                continue
+            key = (order.condition_id, order.outcome, order.intent.side)
+            if self._orders_by_key.get(key) == oid:
+                del self._orders_by_key[key]
+            fill = self.engine.apply_fill(order.intent)
+            logger.info(
+                "maker_order_filled",
+                order_id=oid,
+                condition_id=order.condition_id,
+                outcome=order.outcome,
+                side=order.intent.side,
+                price=order.intent.price,
+                age_seconds=round(now - order.placed_at, 1),
+                paper=True,
+                trigger="bid_drop",
+            )
+            if self.paper_recorder is not None:
+                snapshot = self._build_snapshot(order.condition_id)
+                fair = self.engine.compute_fair_prices(snapshot) if snapshot else {}
+                try:
+                    self.paper_recorder.persist_fill(
+                        intent=order.intent,
+                        fill=fill,
+                        snapshot=snapshot,
+                        fair_prices=fair,
+                        execution_mode="maker_ws_paper",
+                    )
+                except Exception as exc:
+                    logger.warning("persist_fill_failed", error=str(exc))
+
+        # Phase 2b: execute cancels in parallel.
         if cancel_ids:
             await asyncio.gather(
                 *(self._cancel_order(oid) for oid in cancel_ids),
@@ -366,6 +407,7 @@ class CryptoMaker:
                 f"[{time.strftime('%H:%M:%S')}] markets={len(self.known_markets)} "
                 f"active_orders={len(self.active_orders)} positions={n_positions} "
                 f"placed={orders_placed} cancelled={len(cancel_ids)} "
+                f"fills={len(paper_fill_ids)} "
                 f"realized_pnl=${self.engine.get_realized_pnl():,.4f}"
             )
 
