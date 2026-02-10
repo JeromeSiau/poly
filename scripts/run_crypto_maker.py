@@ -438,18 +438,33 @@ class CryptoMaker:
                 if levels[0] is not None:
                     book[outcome] = levels
 
-            # Pair cost filter: bid_up + bid_down must be < $1.00 - min_pair_profit.
-            # If not profitable as a pair, skip the entire market.
-            if len(book) == 2:
-                pair_cost = sum(v[0] for v in book.values())
-                fee_cost = pair_cost * self.engine.fee_pct
-                if pair_cost + fee_cost >= 1.0 - self.min_pair_profit:
-                    # Still need to handle existing orders (cancel or fill).
-                    for outcome in outcomes:
-                        existing = self._find_order(cid, outcome, "BUY")
-                        if existing is not None:
-                            cancel_ids.append(existing.order_id)
-                    continue
+            # GUARD 1: Require BOTH books present.  Without both sides we
+            # cannot verify pair profitability and risk naked directional
+            # exposure.  Cancel any existing orders and skip.
+            if len(book) < 2:
+                for outcome in outcomes:
+                    existing = self._find_order(cid, outcome, "BUY")
+                    if existing is not None:
+                        cancel_ids.append(existing.order_id)
+                continue
+
+            # GUARD 2: Pair cost filter — bid_up + bid_down must be
+            # < $1.00 - min_pair_profit.
+            pair_cost = sum(v[0] for v in book.values())
+            fee_cost = pair_cost * self.engine.fee_pct
+            if pair_cost + fee_cost >= 1.0 - self.min_pair_profit:
+                for outcome in outcomes:
+                    existing = self._find_order(cid, outcome, "BUY")
+                    if existing is not None:
+                        cancel_ids.append(existing.order_id)
+                continue
+
+            # Compute per-outcome inventory for pair imbalance check.
+            cid_inv = inv.get(cid, {})
+            inv_shares: dict[str, float] = {}
+            for outcome in outcomes:
+                out_state = cid_inv.get(outcome)
+                inv_shares[outcome] = out_state.shares if out_state else 0.0
 
             for outcome in outcomes:
                 if outcome not in book:
@@ -480,13 +495,21 @@ class CryptoMaker:
                     if edge < self.engine.min_edge_pct:
                         continue
 
+                    # GUARD 3: Pair imbalance — don't buy more of one side
+                    # if we already hold much more than the other side.
+                    # Max imbalance = one order worth of shares.
+                    other = [o for o in outcomes if o != outcome][0]
+                    my_shares = inv_shares.get(outcome, 0.0)
+                    other_shares = inv_shares.get(other, 0.0)
+                    max_imbalance = self.max_order_usd / bid if bid > 0 else 0
+                    if my_shares - other_shares > max_imbalance:
+                        continue
+
                     # Size: respect inventory limits (using cached inv).
                     current_inv = 0.0
-                    cid_inv = inv.get(cid)
-                    if cid_inv:
-                        out_state = cid_inv.get(outcome)
-                        if out_state:
-                            current_inv = out_state.shares * out_state.avg_price
+                    out_state = cid_inv.get(outcome)
+                    if out_state:
+                        current_inv = out_state.shares * out_state.avg_price
                     remaining = self.max_outcome_inv_usd - current_inv
                     if remaining <= self.min_order_usd:
                         continue
