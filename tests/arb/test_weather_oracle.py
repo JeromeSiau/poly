@@ -116,70 +116,125 @@ def test_open_meteo_fetcher_unknown_city():
     assert fetcher.get_forecast("UnknownCity", "2026-02-10") is None
 
 
-def test_scanner_extracts_city_from_title():
-    """Scanner should extract city name from market title."""
+def test_scanner_generates_slugs_for_all_cities():
+    """Scanner should build slug for each city × upcoming date."""
     scanner = WeatherMarketScanner()
-    assert scanner._extract_city("Highest temperature in Dallas on February 12?") == "Dallas"
-    assert scanner._extract_city("Highest temperature in New York on February 12?") == "New York"
-    assert scanner._extract_city("Highest temperature in Buenos Aires on February 12?") == "Buenos Aires"
-    assert scanner._extract_city("Unrelated market title") is None
+    slugs = scanner._generate_event_slugs()
+    assert len(slugs) > 0
+
+    # NYC should use "nyc" in slug, not "new-york"
+    nyc_slugs = [(s, c, d) for s, c, d in slugs if c == "New York"]
+    assert len(nyc_slugs) > 0
+    assert all("nyc" in s for s, _, _ in nyc_slugs)
+
+    # Buenos Aires should use "buenos-aires"
+    ba_slugs = [(s, c, d) for s, c, d in slugs if c == "Buenos Aires"]
+    assert len(ba_slugs) > 0
+    assert all("buenos-aires" in s for s, _, _ in ba_slugs)
+
+    # All slugs should start with "highest-temperature-in-"
+    for slug, _, _ in slugs:
+        assert slug.startswith("highest-temperature-in-")
 
 
-def test_scanner_extracts_date_from_title():
-    """Scanner should extract target date from market title."""
+def test_scanner_parses_event():
+    """Scanner should parse a Gamma events API response into a WeatherMarket."""
+    event = {
+        "title": "Highest temperature in Dallas on February 10?",
+        "slug": "highest-temperature-in-dallas-on-february-10-2026",
+        "id": 202127,
+        "endDate": "2026-02-10T12:00:00Z",
+        "description": "Resolution source: Weather Underground",
+        "markets": [
+            {
+                "question": "Will the highest temperature in Dallas be 61°F or below on February 10?",
+                "outcomePrices": '["0.0005","0.9995"]',
+                "clobTokenIds": '["tok1","tok2"]',
+            },
+            {
+                "question": "Will the highest temperature in Dallas be between 62-63°F on February 10?",
+                "outcomePrices": '["0.003","0.997"]',
+                "clobTokenIds": '["tok3","tok4"]',
+            },
+            {
+                "question": "Will the highest temperature in Dallas be 72°F or higher on February 10?",
+                "outcomePrices": '["0.9765","0.0235"]',
+                "clobTokenIds": '["tok5","tok6"]',
+            },
+        ],
+    }
+
     scanner = WeatherMarketScanner()
-    result = scanner._extract_target_date("Highest temperature in Dallas on February 12?")
-    assert result is not None
-    assert result.endswith("-02-12")
+    market = scanner._parse_event(event, "Dallas", "2026-02-10")
 
-
-def test_scanner_extracts_date_various_months():
-    """Scanner should handle different month names."""
-    scanner = WeatherMarketScanner()
-    assert scanner._extract_target_date("Highest temperature in Miami on January 5?").endswith("-01-05")
-    assert scanner._extract_target_date("Highest temperature in London on March 20?").endswith("-03-20")
-    assert scanner._extract_target_date("Highest temperature in Seoul on December 1?").endswith("-12-01")
+    assert market is not None
+    assert market.city == "Dallas"
+    assert market.target_date == "2026-02-10"
+    assert market.condition_id == "highest-temperature-in-dallas-on-february-10-2026"
+    assert "61°F or below" in market.outcome_prices
+    assert "between 62-63°F" in market.outcome_prices
+    assert "72°F or higher" in market.outcome_prices
+    assert market.outcome_prices["61°F or below"] == 0.0005
+    assert market.outcome_prices["72°F or higher"] == 0.9765
+    assert market.outcomes["61°F or below"] == "tok1"  # YES token
 
 
 @pytest.mark.asyncio
-async def test_scanner_parses_weather_markets():
-    """Scanner should parse Gamma API response into WeatherMarket objects."""
-    mock_markets = [
-        {
-            "conditionId": "0xabc123",
-            "slug": "highest-temperature-in-dallas-on-february-12",
-            "question": "Highest temperature in Dallas on February 12?",
-            "outcomes": '["58\u00b0F or higher","56-57\u00b0F","54-55\u00b0F","52-53\u00b0F","50-51\u00b0F","48-49\u00b0F","47\u00b0F or lower"]',
-            "outcomePrices": '[0.03,0.05,0.12,0.25,0.30,0.15,0.10]',
-            "clobTokenIds": '["tok1","tok2","tok3","tok4","tok5","tok6","tok7"]',
-            "endDate": "2026-02-13T00:00:00Z",
-            "description": "Resolution source: Weather Underground, station KDAL",
-        },
-    ]
+async def test_scanner_scan_discovers_events():
+    """Scanner.scan() should query events API and discover weather markets."""
+    mock_event = [{
+        "title": "Highest temperature in Dallas on February 15?",
+        "slug": "highest-temperature-in-dallas-on-february-15-2026",
+        "endDate": "2026-02-15T12:00:00Z",
+        "description": "Weather Underground",
+        "markets": [
+            {
+                "question": "Will the highest temperature in Dallas be 58°F or below on February 15?",
+                "outcomePrices": '["0.03","0.97"]',
+                "clobTokenIds": '["tok1","tok2"]',
+            },
+            {
+                "question": "Will the highest temperature in Dallas be 65°F or higher on February 15?",
+                "outcomePrices": '["0.80","0.20"]',
+                "clobTokenIds": '["tok3","tok4"]',
+            },
+        ],
+    }]
 
     scanner = WeatherMarketScanner()
 
-    with patch("aiohttp.ClientSession") as mock_session_cls:
-        mock_resp = AsyncMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value=mock_markets)
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=False)
+    # Return event for any slug, empty for most
+    def make_resp(return_value):
+        resp = AsyncMock()
+        resp.status = 200
+        resp.json = AsyncMock(return_value=return_value)
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        return resp
 
+    call_count = 0
+
+    def side_effect_get(url, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        slug = kwargs.get("params", {}).get("slug", "")
+        if "dallas" in slug:
+            return make_resp(mock_event)
+        return make_resp([])
+
+    with patch("aiohttp.ClientSession") as mock_cls:
         mock_session = AsyncMock()
-        mock_session.get = MagicMock(return_value=mock_resp)
+        mock_session.get = MagicMock(side_effect=side_effect_get)
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
-        mock_session_cls.return_value = mock_session
+        mock_cls.return_value = mock_session
 
         markets = await scanner.scan()
 
+    # Should discover at least one Dallas market
     assert len(markets) >= 1
-    m = markets[0]
-    assert m.city == "Dallas"
-    assert m.condition_id == "0xabc123"
-    assert "58°F or higher" in m.outcome_prices
-    assert m.outcome_prices["58°F or higher"] == 0.03
+    assert markets[0].city == "Dallas"
+    assert "58°F or below" in markets[0].outcome_prices
 
 
 # ---------------------------------------------------------------------------
@@ -327,15 +382,21 @@ def test_outcome_confidence_threshold_high():
 
 
 def test_outcome_confidence_threshold_low():
-    """Test confidence scoring for 'X degrees F or lower' outcomes."""
+    """Test confidence scoring for 'X°F or lower' and 'X°F or below' outcomes."""
     engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
 
-    # Forecast well below threshold -> high confidence
+    # "or lower" - Forecast well below threshold -> high confidence
     conf = engine._outcome_confidence("47°F or lower", 38.0)
+    assert conf >= 0.90
+
+    # "or below" (used by Polymarket) - same logic
+    conf = engine._outcome_confidence("47°F or below", 38.0)
     assert conf >= 0.90
 
     # Forecast above threshold -> 0
     conf = engine._outcome_confidence("47°F or lower", 50.0)
+    assert conf == 0.0
+    conf = engine._outcome_confidence("47°F or below", 50.0)
     assert conf == 0.0
 
 
@@ -417,18 +478,29 @@ async def test_full_cycle_scan_evaluate_enter():
     """Integration: scan -> forecast -> evaluate -> enter trade."""
     from pathlib import Path
 
-    mock_markets_resp = [
-        {
-            "conditionId": "0xintegration",
-            "slug": "highest-temp-dallas-feb-15",
-            "question": "Highest temperature in Dallas on February 15?",
-            "outcomes": '["60°F or higher","58-59°F","56-57°F"]',
-            "outcomePrices": '[0.02,0.08,0.15]',
-            "clobTokenIds": '["t1","t2","t3"]',
-            "endDate": "2026-02-16T00:00:00Z",
-            "description": "Resolution source: Weather Underground",
-        },
-    ]
+    mock_event_resp = [{
+        "title": "Highest temperature in Dallas on February 15?",
+        "slug": "highest-temperature-in-dallas-on-february-15-2026",
+        "endDate": "2026-02-16T00:00:00Z",
+        "description": "Resolution source: Weather Underground",
+        "markets": [
+            {
+                "question": "Will the highest temperature in Dallas be 60°F or higher on February 15?",
+                "outcomePrices": '["0.02","0.98"]',
+                "clobTokenIds": '["t1","t2"]',
+            },
+            {
+                "question": "Will the highest temperature in Dallas be between 58-59°F on February 15?",
+                "outcomePrices": '["0.08","0.92"]',
+                "clobTokenIds": '["t3","t4"]',
+            },
+            {
+                "question": "Will the highest temperature in Dallas be 57°F or below on February 15?",
+                "outcomePrices": '["0.15","0.85"]',
+                "clobTokenIds": '["t5","t6"]',
+            },
+        ],
+    }]
 
     mock_forecast_resp = {
         "daily": {
@@ -453,24 +525,27 @@ async def test_full_cycle_scan_evaluate_enter():
     engine._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
     engine._database_url = "sqlite:///data/arb.db"
 
-    with patch("aiohttp.ClientSession") as mock_cls:
-        mock_resp_markets = AsyncMock()
-        mock_resp_markets.status = 200
-        mock_resp_markets.json = AsyncMock(return_value=mock_markets_resp)
-        mock_resp_markets.__aenter__ = AsyncMock(return_value=mock_resp_markets)
-        mock_resp_markets.__aexit__ = AsyncMock(return_value=False)
+    def make_resp(return_value):
+        resp = AsyncMock()
+        resp.status = 200
+        resp.json = AsyncMock(return_value=return_value)
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        return resp
 
-        mock_resp_forecast = AsyncMock()
-        mock_resp_forecast.status = 200
-        mock_resp_forecast.json = AsyncMock(return_value=mock_forecast_resp)
-        mock_resp_forecast.__aenter__ = AsyncMock(return_value=mock_resp_forecast)
-        mock_resp_forecast.__aexit__ = AsyncMock(return_value=False)
+    with patch("aiohttp.ClientSession") as mock_cls:
+        # Scanner calls use events API; fetcher calls use open-meteo
+        def side_effect_get(url, **kwargs):
+            if "gamma" in url or "events" in str(kwargs):
+                slug = kwargs.get("params", {}).get("slug", "")
+                if "dallas" in slug and "february-15" in slug:
+                    return make_resp(mock_event_resp)
+                return make_resp([])
+            # Open-Meteo forecast
+            return make_resp(mock_forecast_resp)
 
         mock_session = AsyncMock()
-        mock_session.get = MagicMock(side_effect=[
-            mock_resp_markets, mock_resp_markets, mock_resp_markets, mock_resp_markets,
-            mock_resp_forecast,
-        ])
+        mock_session.get = MagicMock(side_effect=side_effect_get)
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_cls.return_value = mock_session

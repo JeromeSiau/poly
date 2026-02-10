@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date as date_type
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,6 +49,7 @@ CITY_STATIONS: dict[str, dict[str, Any]] = {
     "New York": {
         "lat": 40.7769, "lon": -73.8740,
         "station": "KLGA", "tz": "America/New_York", "unit": "fahrenheit",
+        "slug_name": "nyc",
     },
     "Chicago": {
         "lat": 41.9742, "lon": -87.9073,
@@ -227,18 +228,22 @@ class OpenMeteoFetcher:
 
 
 class WeatherMarketScanner:
-    """Discovers active weather markets on Polymarket via Gamma API."""
+    """Discovers active weather markets on Polymarket via Gamma events API.
 
-    _TITLE_PATTERN = re.compile(
-        r"(?:Highest|High)\s+temperature\s+in\s+(.+?)\s+on\s+(\w+)\s+(\d{1,2})",
+    Polymarket weather markets are structured as *events*, each containing
+    multiple Yes/No sub-markets (one per temperature outcome).  The Gamma
+    ``_q`` full-text search does **not** reliably return weather events, so
+    we construct deterministic slugs for each city × date combination and
+    query ``/events?slug=<slug>`` directly.
+    """
+
+    # Extract outcome label from sub-market question, e.g.
+    # "Will the highest temperature in Dallas be 61°F or below on February 10?"
+    # → "61°F or below"
+    _OUTCOME_EXTRACT = re.compile(
+        r"\bbe\s+(.+?)\s+on\s+\w+\s+\d+",
         re.IGNORECASE,
     )
-
-    _MONTH_MAP = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
-    }
 
     def __init__(self, gamma_url: str = ""):
         self._gamma_url = gamma_url or settings.WEATHER_ORACLE_GAMMA_URL
@@ -248,126 +253,131 @@ class WeatherMarketScanner:
     def markets(self) -> dict[str, WeatherMarket]:
         return dict(self._markets)
 
+    def _generate_event_slugs(self) -> list[tuple[str, str, str]]:
+        """Build ``(slug, city, YYYY-MM-DD)`` for each city × upcoming date."""
+        today = datetime.now(timezone.utc).date()
+        results: list[tuple[str, str, str]] = []
+        for city, info in CITY_STATIONS.items():
+            slug_name = info.get("slug_name", city.lower().replace(" ", "-"))
+            for offset in range(0, settings.WEATHER_ORACLE_FORECAST_DAYS + 1):
+                target = today + timedelta(days=offset)
+                month_name = target.strftime("%B").lower()
+                slug = (
+                    f"highest-temperature-in-{slug_name}"
+                    f"-on-{month_name}-{target.day}-{target.year}"
+                )
+                results.append((slug, city, target.isoformat()))
+        return results
+
     async def scan(self) -> list[WeatherMarket]:
-        """Fetch active weather markets from Gamma API."""
+        """Fetch active weather events from Gamma API."""
         import aiohttp
 
+        slugs = self._generate_event_slugs()
         discovered: list[WeatherMarket] = []
-        search_terms = ["temperature", "fahrenheit", "celsius", "weather"]
+        sem = asyncio.Semaphore(5)
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                for term in search_terms:
-                    url = f"{self._gamma_url}/markets"
-                    params = {"_q": term, "closed": "false", "limit": 100}
-                    async with session.get(
-                        url,
-                        params=params,
-                        headers={"User-Agent": "Mozilla/5.0"},
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as resp:
-                        if resp.status != 200:
-                            continue
-                        raw_markets = await resp.json()
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as session:
 
-                        for mkt in raw_markets:
-                            market = self._parse_market(mkt)
-                            if not market:
-                                continue
-                            if market.condition_id in self._markets:
-                                # Update prices on existing markets
-                                self._markets[market.condition_id].outcome_prices = market.outcome_prices
-                            else:
-                                self._markets[market.condition_id] = market
-                                discovered.append(market)
+            async def _fetch_one(
+                slug: str, city: str, date_str: str,
+            ) -> Optional[WeatherMarket]:
+                async with sem:
+                    try:
+                        url = f"{self._gamma_url}/events"
+                        params = {"slug": slug}
+                        async with session.get(url, params=params) as resp:
+                            if resp.status != 200:
+                                return None
+                            data = await resp.json()
+                            if not data:
+                                return None
+                            event = data[0] if isinstance(data, list) else data
+                            return self._parse_event(event, city, date_str)
+                    except Exception:
+                        return None
 
-        except Exception as e:
-            logger.warning("weather_scan_error", error=str(e))
+            tasks = [_fetch_one(s, c, d) for s, c, d in slugs]
+            results = await asyncio.gather(*tasks)
 
+        for market in results:
+            if not market:
+                continue
+            if market.condition_id in self._markets:
+                self._markets[market.condition_id].outcome_prices = (
+                    market.outcome_prices
+                )
+            else:
+                self._markets[market.condition_id] = market
+                discovered.append(market)
+
+        logger.info(
+            "weather_scan_complete",
+            slugs_queried=len(slugs),
+            new=len(discovered),
+            total=len(self._markets),
+        )
         return discovered
 
-    def _parse_market(self, mkt: dict[str, Any]) -> Optional[WeatherMarket]:
-        """Parse a Gamma API market into a WeatherMarket."""
-        try:
-            question = mkt.get("question", "") or mkt.get("title", "")
-            city = self._extract_city(question)
-            if not city:
-                return None
-
-            target_date = self._extract_target_date(question)
-            if not target_date:
-                return None
-
-            condition_id = mkt.get("conditionId", "")
-            slug = mkt.get("slug", "")
-            outcomes_raw = json.loads(mkt.get("outcomes", "[]"))
-            prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
-            tokens_raw = json.loads(mkt.get("clobTokenIds", "[]"))
-            end_date = mkt.get("endDate", "")
-            description = mkt.get("description", "")
-
-            outcomes = {}
-            outcome_prices = {}
-            for i, outcome_label in enumerate(outcomes_raw):
-                token_id = tokens_raw[i] if i < len(tokens_raw) else ""
-                price = float(prices_raw[i]) if i < len(prices_raw) else 0.0
-                outcomes[outcome_label] = token_id
-                outcome_prices[outcome_label] = price
-
-            return WeatherMarket(
-                condition_id=condition_id,
-                slug=slug,
-                title=question,
-                city=city,
-                target_date=target_date,
-                outcomes=outcomes,
-                outcome_prices=outcome_prices,
-                end_date=end_date,
-                resolution_source=description,
-            )
-        except Exception as e:
-            logger.warning("parse_weather_market_error", error=str(e))
+    def _parse_event(
+        self, event: dict[str, Any], city: str, date_str: str,
+    ) -> Optional[WeatherMarket]:
+        """Turn a Gamma event (with sub-markets) into a WeatherMarket."""
+        sub_markets = event.get("markets", [])
+        if not sub_markets:
             return None
 
-    def _extract_city(self, title: str) -> Optional[str]:
-        """Extract city name from market title."""
-        match = self._TITLE_PATTERN.search(title)
-        if not match:
-            return None
-        city_raw = match.group(1).strip()
-        for known_city in CITY_STATIONS:
-            if known_city.lower() == city_raw.lower():
-                return known_city
-        return None
+        outcomes: dict[str, str] = {}
+        outcome_prices: dict[str, float] = {}
 
-    def _extract_target_date(self, title: str) -> Optional[str]:
-        """Extract target date as YYYY-MM-DD from market title."""
-        match = self._TITLE_PATTERN.search(title)
-        if not match:
+        for sm in sub_markets:
+            question = sm.get("question", "")
+            match = self._OUTCOME_EXTRACT.search(question)
+            if not match:
+                continue
+            outcome_label = match.group(1).strip()
+
+            prices_raw = json.loads(sm.get("outcomePrices", "[]"))
+            tokens_raw = json.loads(sm.get("clobTokenIds", "[]"))
+
+            yes_price = float(prices_raw[0]) if prices_raw else 0.0
+            yes_token = tokens_raw[0] if tokens_raw else ""
+
+            outcomes[outcome_label] = yes_token
+            outcome_prices[outcome_label] = yes_price
+
+        if not outcomes:
             return None
-        month_str = match.group(2).lower()
-        day = int(match.group(3))
-        month = self._MONTH_MAP.get(month_str)
-        if not month:
-            return None
-        today = datetime.now(timezone.utc).date()
-        year = today.year
-        try:
-            target = date_type(year, month, day)
-            # If date is in the past, it likely refers to next year
-            if target < today:
-                target = date_type(year + 1, month, day)
-            return target.isoformat()
-        except ValueError:
-            return None
+
+        event_slug = event.get("slug", "")
+        event_title = event.get("title", "")
+        end_date = event.get("endDate", "")
+        if not end_date and sub_markets:
+            end_date = sub_markets[0].get("endDate", "")
+        description = event.get("description", "")
+
+        return WeatherMarket(
+            condition_id=event_slug,
+            slug=event_slug,
+            title=event_title,
+            city=city,
+            target_date=date_str,
+            outcomes=outcomes,
+            outcome_prices=outcome_prices,
+            end_date=end_date,
+            resolution_source=description,
+        )
 
 
 class WeatherOracleEngine:
     """Main engine: matches forecasts to markets and generates buy signals."""
 
     _THRESHOLD_HIGH = re.compile(r"(-?\d+)\s*°[FC]\s+or\s+higher", re.IGNORECASE)
-    _THRESHOLD_LOW = re.compile(r"(-?\d+)\s*°[FC]\s+or\s+lower", re.IGNORECASE)
-    _RANGE = re.compile(r"(-?\d+)\s*[-–]\s*(-?\d+)\s*°[FC]", re.IGNORECASE)
+    _THRESHOLD_LOW = re.compile(r"(-?\d+)\s*°[FC]\s+or\s+(?:lower|below)", re.IGNORECASE)
+    _RANGE = re.compile(r"(?:between\s+)?(-?\d+)\s*[-–]\s*(-?\d+)\s*°[FC]", re.IGNORECASE)
     _EXACT = re.compile(r"^(-?\d+)\s*°[FC]$", re.IGNORECASE)
 
     def __init__(
@@ -664,26 +674,46 @@ class WeatherOracleEngine:
             try:
                 new_markets = await self.scanner.scan()
                 if new_markets:
-                    logger.info("weather_markets_discovered", count=len(new_markets))
+                    for m in new_markets:
+                        logger.info(
+                            "weather_event_found",
+                            city=m.city, date=m.target_date,
+                            outcomes=len(m.outcomes),
+                            prices={k: v for k, v in m.outcome_prices.items() if v <= 0.10},
+                        )
 
                 cities_needed = {m.city for m in self.scanner.markets.values()}
                 for city in cities_needed:
                     await self.fetcher.fetch_city(city)
 
                 total_signals = 0
+                total_evaluated = 0
                 for market in self.scanner.markets.values():
                     forecast = self.fetcher.get_forecast(market.city, market.target_date)
                     if not forecast:
                         continue
 
+                    total_evaluated += 1
                     signals = self.evaluate_market(market, forecast)
                     for signal in signals:
+                        logger.info(
+                            "weather_signal_candidate",
+                            city=signal.market.city,
+                            outcome=signal.outcome,
+                            price=signal.entry_price,
+                            confidence=round(signal.confidence, 3),
+                            forecast_max=signal.forecast.temp_max,
+                        )
                         trade = self.enter_paper_trade(signal)
                         if trade:
                             total_signals += 1
 
-                if total_signals:
-                    logger.info("weather_signals_entered", count=total_signals)
+                logger.info(
+                    "weather_eval_complete",
+                    markets=len(self.scanner.markets),
+                    evaluated=total_evaluated,
+                    signals=total_signals,
+                )
 
                 resolved = await self.resolve_trades()
                 if resolved:
