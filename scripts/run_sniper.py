@@ -42,16 +42,23 @@ TwoSidedPaperRecorder: Any = None
 
 logger = structlog.get_logger()
 
-GAMMA_API = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS_API = "https://gamma-api.polymarket.com/events"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 
 async def fetch_sport_markets(
     client: httpx.AsyncClient,
-    limit: int = 1500,
+    limit: int = 5000,
     event_prefixes: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
-    """Fetch active binary sport markets from Gamma API."""
+    """Fetch active sport match markets via Gamma /events endpoint.
+
+    Individual match markets (moneyline, O/U, BTTS, spread) only appear
+    in the /events endpoint, not in the /markets listing.  Each event
+    contains a ``markets`` array; we flatten those into individual market
+    dicts with an injected ``events`` field so the EventConditionMapper
+    can extract the slug.
+    """
     all_markets: list[dict[str, Any]] = []
     batch = 100
     offset = 0
@@ -59,7 +66,7 @@ async def fetch_sport_markets(
     while len(all_markets) < limit:
         try:
             resp = await client.get(
-                GAMMA_API,
+                GAMMA_EVENTS_API,
                 params={
                     "limit": min(batch, limit - len(all_markets)),
                     "offset": offset,
@@ -77,33 +84,39 @@ async def fetch_sport_markets(
         if not isinstance(rows, list) or not rows:
             break
 
-        for raw in rows:
-            outcomes = json.loads(raw.get("outcomes", "[]")) if isinstance(raw.get("outcomes"), str) else (raw.get("outcomes") or [])
-            clob_ids = json.loads(raw.get("clobTokenIds", "[]")) if isinstance(raw.get("clobTokenIds"), str) else (raw.get("clobTokenIds") or [])
-            if len(outcomes) != 2 or len(clob_ids) < 2:
+        for evt in rows:
+            slug = evt.get("slug", "")
+            if not slug:
                 continue
-            # Skip already-resolved markets (any outcome price >= 0.95)
-            try:
-                raw_prices = json.loads(raw.get("outcomePrices", "[]")) if isinstance(raw.get("outcomePrices"), str) else (raw.get("outcomePrices") or [])
-                if raw_prices and any(float(p) >= 0.95 for p in raw_prices):
-                    continue
-            except (ValueError, TypeError):
-                pass
+
             # Event prefix filter
-            events = raw.get("events", [])
-            if isinstance(events, str):
-                try:
-                    events = json.loads(events)
-                except Exception:
-                    events = []
-            slug = events[0].get("slug", "") if isinstance(events, list) and events and isinstance(events[0], dict) else ""
-            if event_prefixes and slug:
+            if event_prefixes:
                 prefix = slug.split("-", 1)[0]
                 if prefix not in event_prefixes:
                     continue
-            elif event_prefixes and not slug:
+
+            markets = evt.get("markets", [])
+            if not isinstance(markets, list):
                 continue
-            all_markets.append(raw)
+
+            for mkt in markets:
+                outcomes = json.loads(mkt.get("outcomes", "[]")) if isinstance(mkt.get("outcomes"), str) else (mkt.get("outcomes") or [])
+                clob_ids = json.loads(mkt.get("clobTokenIds", "[]")) if isinstance(mkt.get("clobTokenIds"), str) else (mkt.get("clobTokenIds") or [])
+                if len(outcomes) != 2 or len(clob_ids) < 2:
+                    continue
+                # Skip already-resolved markets
+                try:
+                    raw_prices = json.loads(mkt.get("outcomePrices", "[]")) if isinstance(mkt.get("outcomePrices"), str) else (mkt.get("outcomePrices") or [])
+                    if raw_prices and any(float(p) >= 0.95 for p in raw_prices):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+                # Inject events field so EventConditionMapper can extract slug
+                enriched = dict(mkt)
+                enriched["events"] = [{"slug": slug}]
+                all_markets.append(enriched)
+
         offset += batch
         if len(rows) < batch:
             break
