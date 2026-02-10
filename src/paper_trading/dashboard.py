@@ -1349,8 +1349,8 @@ def main():
         trades = []
 
     # --- Tabs ---
-    tab_two_sided, tab_sniper, tab_crypto, tab_weather, tab_maker = st.tabs(
-        ["Two-Sided", "Sniper Sports", "Crypto Minute", "Weather Oracle", "Crypto Maker"]
+    tab_maker, tab_sniper, tab_crypto, tab_weather, tab_two_sided = st.tabs(
+        ["Crypto Maker", "Sniper Sports", "Crypto Minute", "Weather Oracle", "Two-Sided"]
     )
 
     # ===== TWO-SIDED TAB =====
