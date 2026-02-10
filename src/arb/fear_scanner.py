@@ -37,13 +37,18 @@ logger = structlog.get_logger()
 
 FEAR_KEYWORDS: dict[str, list[str]] = {
     "high": [
-        "strike", "invade", "nuclear", "war", "attack",
+        "strike", "invade", "invasion", "nuclear", "war", "attack",
         "bomb", "collapse", "fall", "regime change",
         "die", "killed", "coup", "assassinate",
+        "missile", "drone strike", "terrorist", "terrorism",
+        "pandemic", "outbreak",
     ],
     "medium": [
         "ceasefire", "resign", "impeach", "default", "recession",
         "shutdown", "sanctions", "regime", "annex", "deploy", "mobilize",
+        "embargo", "blockade", "martial law",
+        "hurricane", "earthquake", "tsunami", "disaster",
+        "virus", "epidemic",
     ],
     "low": [
         "ban", "tariff", "out by", "out as", "fired",
@@ -64,6 +69,8 @@ CLUSTER_PATTERNS: dict[str, list[str]] = {
     "north_korea": ["north korea", "pyongyang", "kim jong"],
     "us_military": ["us strike", "us invade", "pentagon", "us troops"],
     "middle_east": ["gaza", "israel", "hamas", "hezbollah", "lebanon"],
+    "climate": ["hurricane", "earthquake", "tsunami", "wildfire", "flood", "disaster"],
+    "pandemic": ["pandemic", "outbreak", "epidemic", "bird flu", "virus", "h5n1"],
 }
 
 # Annualised base rates per cluster (probability of *any* qualifying event
@@ -75,6 +82,8 @@ _ANNUAL_RATES: dict[str, float] = {
     "north_korea": 0.03,
     "us_military": 0.08,
     "middle_east": 0.12,
+    "climate": 0.20,
+    "pandemic": 0.08,
     "other": 0.10,
 }
 
