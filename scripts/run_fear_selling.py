@@ -35,10 +35,12 @@ logger = structlog.get_logger()
 
 from config.settings import settings
 from src.arb.fear_classifier import FearClassifier
-from src.arb.fear_engine import FearSellingEngine
+from src.arb.fear_engine import FearSellingEngine, FearTradeSignal
 from src.arb.fear_scanner import FearMarketScanner
 from src.arb.fear_spike_detector import FearSpikeDetector
 from src.arb.polymarket_executor import PolymarketExecutor
+from src.db.database import get_sync_session, init_db
+from src.db.models import FearPosition
 from src.risk.manager import UnifiedRiskManager
 
 
@@ -57,6 +59,51 @@ def parse_args() -> argparse.Namespace:
         help=f"Seconds between scan cycles (default: {settings.FEAR_SELLING_SCAN_INTERVAL})",
     )
     return parser.parse_args()
+
+
+def _persist_signal(sig: FearTradeSignal) -> None:
+    """Save a trade signal as an open FearPosition in the database."""
+    try:
+        session = get_sync_session()
+        # Skip if we already have an open position for this market
+        existing = (
+            session.query(FearPosition)
+            .filter_by(condition_id=sig.condition_id, is_open=True)
+            .first()
+        )
+        if existing:
+            logger.debug("position_already_open", condition_id=sig.condition_id)
+            session.close()
+            return
+
+        pos = FearPosition(
+            condition_id=sig.condition_id,
+            token_id=sig.token_id,
+            title=sig.title,
+            cluster=sig.cluster,
+            side=sig.outcome,
+            entry_price=sig.price,
+            size_usd=sig.size_usd,
+            shares=sig.size_usd / sig.price if sig.price > 0 else 0.0,
+            fear_score=sig.fear_score,
+            yes_price_at_entry=1.0 - sig.price,
+            entry_trigger=sig.trigger,
+            is_open=True,
+        )
+        session.add(pos)
+        session.commit()
+        logger.info(
+            "fear_position_persisted",
+            condition_id=sig.condition_id,
+            size_usd=round(sig.size_usd, 2),
+        )
+    except Exception as exc:
+        logger.warning("fear_position_persist_error", error=str(exc))
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -124,6 +171,10 @@ async def main(args: argparse.Namespace) -> None:
         classifier=classifier,
     )
 
+    # --- Database (paper trade persistence) -------------------------------
+    init_db()
+    logger.info("fear_selling_db_initialized")
+
     logger.info(
         "fear_selling_bot_started",
         autopilot=args.autopilot,
@@ -159,6 +210,9 @@ async def main(args: argparse.Namespace) -> None:
                     fear_score=round(signal_result.fear_score, 3),
                     cluster=signal_result.cluster,
                 )
+
+                # Persist paper position to DB for dashboard visibility
+                _persist_signal(signal_result)
 
                 if args.autopilot and executor is not None:
                     try:
