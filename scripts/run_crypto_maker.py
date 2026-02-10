@@ -100,6 +100,7 @@ class CryptoMaker:
         max_order_usd: float = 10.0,
         min_order_usd: float = 1.0,
         max_outcome_inv_usd: float = 25.0,
+        min_pair_profit: float = 0.01,
         strategy_tag: str = "crypto_maker",
     ) -> None:
         self.engine = engine
@@ -116,6 +117,7 @@ class CryptoMaker:
         self.max_order_usd = max_order_usd
         self.min_order_usd = min_order_usd
         self.max_outcome_inv_usd = max_outcome_inv_usd
+        self.min_pair_profit = min_pair_profit
         self.strategy_tag = strategy_tag
 
         # State
@@ -429,14 +431,33 @@ class CryptoMaker:
             if not outcomes or len(outcomes) < 2:
                 continue
 
+            # Read both outcomes' books up front for pair cost check.
+            book: dict[str, tuple] = {}  # outcome -> (bid, bid_sz, ask, ask_sz)
             for outcome in outcomes:
-                token_id = self.market_tokens.get((cid, outcome))
-                if not token_id:
+                levels = self.polymarket.get_best_levels(cid, outcome)
+                if levels[0] is not None:
+                    book[outcome] = levels
+
+            # Pair cost filter: bid_up + bid_down must be < $1.00 - min_pair_profit.
+            # If not profitable as a pair, skip the entire market.
+            if len(book) == 2:
+                pair_cost = sum(v[0] for v in book.values())
+                fee_cost = pair_cost * self.engine.fee_pct
+                if pair_cost + fee_cost >= 1.0 - self.min_pair_profit:
+                    # Still need to handle existing orders (cancel or fill).
+                    for outcome in outcomes:
+                        existing = self._find_order(cid, outcome, "BUY")
+                        if existing is not None:
+                            cancel_ids.append(existing.order_id)
                     continue
 
-                # Read book from WS — instant, no HTTP (pre-computed cache).
-                bid, bid_sz, ask, ask_sz = self.polymarket.get_best_levels(cid, outcome)
-                if bid is None:
+            for outcome in outcomes:
+                if outcome not in book:
+                    continue
+                bid, bid_sz, ask, ask_sz = book[outcome]
+
+                token_id = self.market_tokens.get((cid, outcome))
+                if not token_id:
                     continue
 
                 fair = (bid + ask) / 2 if ask is not None else bid + 0.005
@@ -851,6 +872,7 @@ class CryptoMaker:
                 paper=self.paper_mode,
                 markets=len(self.known_markets),
                 maker_interval=self.maker_loop_interval,
+                min_pair_profit=self.min_pair_profit,
                 user_ws=self.user_feed is not None,
             )
 
@@ -885,6 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--discovery-interval", type=float, default=60.0, help="Market discovery interval")
     p.add_argument("--fill-check-interval", type=float, default=3.0, help="Fill check polling interval")
     p.add_argument("--min-edge", type=float, default=0.001, help="Minimum edge to place order")
+    p.add_argument("--min-pair-profit", type=float, default=0.01, help="Min profit per $1 pair (bid_up+bid_down < 1-this)")
     p.add_argument("--min-order", type=float, default=1.0, help="Minimum order USD")
     p.add_argument("--max-order", type=float, default=10.0, help="Maximum order USD")
     p.add_argument("--max-outcome-inv", type=float, default=25.0, help="Max inventory per outcome USD")
@@ -977,6 +1000,7 @@ async def main() -> None:
         max_order_usd=args.max_order,
         min_order_usd=args.min_order,
         max_outcome_inv_usd=args.max_outcome_inv,
+        min_pair_profit=args.min_pair_profit,
         strategy_tag=strategy_tag,
     )
 
