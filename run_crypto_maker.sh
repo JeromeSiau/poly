@@ -6,16 +6,32 @@ set -euo pipefail
 # Uses BinanceFeed (WS) + PolymarketFeed (WS) for real-time data,
 # places GTC limit orders at the bid, and earns the spread.
 #
-# Args:
-#   1: symbols    -> "BTCUSDT,ETHUSDT" (default)
-#   2: mode       -> "paper" (default) or "live"
-#   3: wallet USD -> 200 (default)
+# Usage:
+#   run_crypto_maker.sh [--symbols BTCUSDT,ETHUSDT] [--paper|--live] [--wallet 200]
+#   run_crypto_maker.sh BTCUSDT,ETHUSDT paper 200   # positional (legacy)
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
 
-SYMBOLS="${1:-BTCUSDT,ETHUSDT}"
-MODE="${2:-paper}"
-WALLET_USD="${3:-${WALLET_USD:-200}}"
+# Defaults
+SYMBOLS="BTCUSDT,ETHUSDT"
+MODE="paper"
+WALLET_USD="${WALLET_USD:-200}"
+
+# Parse args: support both named (--symbols X) and positional (X paper 200)
+_positional=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --symbols)   SYMBOLS="$2"; shift 2 ;;
+    --paper)     MODE="paper"; shift ;;
+    --live)      MODE="live"; shift ;;
+    --wallet)    WALLET_USD="$2"; shift 2 ;;
+    *)           _positional+=("$1"); shift ;;
+  esac
+done
+# Fallback to positional args
+[[ ${#_positional[@]} -ge 1 ]] && SYMBOLS="${_positional[0]}"
+[[ ${#_positional[@]} -ge 2 ]] && MODE="${_positional[1]}"
+[[ ${#_positional[@]} -ge 3 ]] && WALLET_USD="${_positional[2]}"
 
 TAG="crypto_maker_${SYMBOLS//,/_}_${WALLET_USD}usd"
 
