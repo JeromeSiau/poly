@@ -113,6 +113,7 @@ class CryptoMaker:
 
         # State
         self.active_orders: dict[str, ActiveOrder] = {}
+        self._orders_by_key: dict[tuple[str, str, str], str] = {}  # (cid,outcome,side)->order_id
         self.known_markets: dict[str, dict[str, Any]] = {}   # condition_id -> raw market
         self.market_symbol: dict[str, str] = {}               # condition_id -> "BTCUSDT"
         self.market_outcomes: dict[str, list[str]] = {}       # condition_id -> ["Up","Down"]
@@ -223,20 +224,25 @@ class CryptoMaker:
     # ------------------------------------------------------------------
 
     async def maker_loop(self) -> None:
-        """Fast loop: read WS state, manage GTC orders."""
+        """Event-driven loop: wake on book update or timeout."""
         # Wait for initial discovery.
         await asyncio.sleep(2.0)
 
         while True:
-            t0 = time.time()
+            # Wake on WS book update OR max interval — whichever comes first.
+            try:
+                await asyncio.wait_for(
+                    self.polymarket.book_updated.wait(),
+                    timeout=self.maker_loop_interval,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self.polymarket.book_updated.clear()
+
             try:
                 await self._maker_tick()
             except Exception as exc:
                 logger.error("maker_tick_error", error=str(exc))
-
-            elapsed = time.time() - t0
-            sleep_time = max(0.0, self.maker_loop_interval - elapsed)
-            await asyncio.sleep(sleep_time)
 
     async def _maker_tick(self) -> None:
         now = time.time()
@@ -247,56 +253,54 @@ class CryptoMaker:
             await self._check_fills(now)
             self._last_fill_check = now
 
-        orders_placed = 0
-        orders_cancelled = 0
+        # Single inventory snapshot for the entire tick.
+        inv = self.engine.get_open_inventory()
+
+        # Phase 1: collect cancels and new intents (no I/O yet).
+        cancel_ids: list[str] = []
+        place_intents: list[TradeIntent] = []
 
         for cid, mkt in list(self.known_markets.items()):
             symbol = self.market_symbol.get(cid)
             if not symbol:
                 continue
 
-            binance_fair = self.binance.get_fair_value(symbol)
-            outcomes = self.market_outcomes.get(cid, [])
-            if len(outcomes) < 2:
+            outcomes = self.market_outcomes.get(cid)
+            if not outcomes or len(outcomes) < 2:
                 continue
 
             for outcome in outcomes:
-                token_id = self.market_tokens.get((cid, outcome), "")
+                token_id = self.market_tokens.get((cid, outcome))
                 if not token_id:
                     continue
 
-                # Read book from WS — instant, no HTTP.
+                # Read book from WS — instant, no HTTP (pre-computed cache).
                 bid, bid_sz, ask, ask_sz = self.polymarket.get_best_levels(cid, outcome)
                 if bid is None:
                     continue
 
-                # Fair price: midpoint from WS book.
-                # If Binance feed is up, we could refine with direction, but
-                # for now midpoint is the same baseline the engine uses.
                 fair = (bid + ask) / 2 if ask is not None else bid + 0.005
 
-                # Check existing order on this side.
+                # O(1) lookup via index.
                 existing = self._find_order(cid, outcome, "BUY")
 
-                # Should we cancel? (bid moved, order is stale)
                 if existing is not None:
                     if existing.intent.price != bid:
-                        # Bid moved — cancel and replace.
-                        await self._cancel_order(existing.order_id)
-                        orders_cancelled += 1
+                        cancel_ids.append(existing.order_id)
                         existing = None
 
-                # Place new order if none active.
                 if existing is None:
                     edge = fair - bid - (bid * self.engine.fee_pct)
                     if edge < self.engine.min_edge_pct:
                         continue
 
-                    # Size: respect inventory limits.
-                    inv = self.engine.get_open_inventory()
+                    # Size: respect inventory limits (using cached inv).
                     current_inv = 0.0
-                    if cid in inv and outcome in inv[cid]:
-                        current_inv = inv[cid][outcome].shares * inv[cid][outcome].avg_price
+                    cid_inv = inv.get(cid)
+                    if cid_inv:
+                        out_state = cid_inv.get(outcome)
+                        if out_state:
+                            current_inv = out_state.shares * out_state.avg_price
                     remaining = self.max_outcome_inv_usd - current_inv
                     if remaining <= self.min_order_usd:
                         continue
@@ -307,7 +311,7 @@ class CryptoMaker:
                     if size_usd < self.min_order_usd:
                         continue
 
-                    intent = TradeIntent(
+                    place_intents.append(TradeIntent(
                         condition_id=cid,
                         title=str(mkt.get("question", "")),
                         outcome=outcome,
@@ -318,19 +322,31 @@ class CryptoMaker:
                         edge_pct=edge,
                         reason="maker_ws_bid",
                         timestamp=now,
-                    )
-                    order_id = await self._place_order(intent)
-                    if order_id:
-                        orders_placed += 1
+                    ))
+
+        # Phase 2: execute cancels in parallel.
+        if cancel_ids:
+            await asyncio.gather(
+                *(self._cancel_order(oid) for oid in cancel_ids),
+                return_exceptions=True,
+            )
+
+        # Phase 3: execute placements in parallel.
+        orders_placed = 0
+        if place_intents:
+            results = await asyncio.gather(
+                *(self._place_order(intent) for intent in place_intents),
+                return_exceptions=True,
+            )
+            orders_placed = sum(1 for r in results if r and not isinstance(r, BaseException))
 
         # Periodic status log.
         if self._cycle_count % 20 == 0:
-            inv = self.engine.get_open_inventory()
             n_positions = sum(len(by_out) for by_out in inv.values())
             print(
                 f"[{time.strftime('%H:%M:%S')}] markets={len(self.known_markets)} "
                 f"active_orders={len(self.active_orders)} positions={n_positions} "
-                f"placed={orders_placed} cancelled={orders_cancelled} "
+                f"placed={orders_placed} cancelled={len(cancel_ids)} "
                 f"realized_pnl=${self.engine.get_realized_pnl():,.4f}"
             )
 
@@ -339,12 +355,8 @@ class CryptoMaker:
     # ------------------------------------------------------------------
 
     def _find_order(self, condition_id: str, outcome: str, side: str) -> Optional[ActiveOrder]:
-        for order in self.active_orders.values():
-            if (order.condition_id == condition_id
-                    and order.outcome == outcome
-                    and order.intent.side == side):
-                return order
-        return None
+        order_id = self._orders_by_key.get((condition_id, outcome, side))
+        return self.active_orders.get(order_id) if order_id else None
 
     async def _place_order(self, intent: TradeIntent) -> Optional[str]:
         """Place a GTC order (or simulate in paper mode). Returns order_id or None."""
@@ -367,7 +379,7 @@ class CryptoMaker:
                 logger.warning("order_place_failed", response=resp)
                 return None
 
-        self.active_orders[order_id] = ActiveOrder(
+        active = ActiveOrder(
             order_id=order_id,
             intent=intent,
             placed_at=intent.timestamp,
@@ -375,6 +387,8 @@ class CryptoMaker:
             outcome=intent.outcome,
             token_id=intent.token_id,
         )
+        self.active_orders[order_id] = active
+        self._orders_by_key[(intent.condition_id, intent.outcome, intent.side)] = order_id
         logger.info(
             "maker_order_placed",
             order_id=order_id,
@@ -392,6 +406,10 @@ class CryptoMaker:
         order = self.active_orders.pop(order_id, None)
         if order is None:
             return
+
+        key = (order.condition_id, order.outcome, order.intent.side)
+        if self._orders_by_key.get(key) == order_id:
+            del self._orders_by_key[key]
 
         if not self.paper_mode and self.executor:
             try:
@@ -454,31 +472,40 @@ class CryptoMaker:
                         logger.warning("persist_fill_failed", error=str(exc))
 
         for oid in filled_ids:
-            self.active_orders.pop(oid, None)
+            order = self.active_orders.pop(oid, None)
+            if order is not None:
+                key = (order.condition_id, order.outcome, order.intent.side)
+                if self._orders_by_key.get(key) == oid:
+                    del self._orders_by_key[key]
 
     async def _check_fills_live(self, now: float) -> None:
-        """Check live order status via HTTP API."""
+        """Check live order status via HTTP API (parallel queries)."""
         if not self.executor:
             return
 
-        # Batch: get all open orders for each market we have active orders on.
-        markets_to_check = {o.condition_id for o in self.active_orders.values()}
-        live_order_ids: set[str] = set()
+        markets_to_check = list({o.condition_id for o in self.active_orders.values()})
+        if not markets_to_check:
+            return
 
-        for market in markets_to_check:
-            try:
-                open_orders = await self.executor.get_open_orders(market)
-                for o in open_orders:
-                    oid = o.get("id") or o.get("orderID") or ""
-                    if oid:
-                        live_order_ids.add(oid)
-            except Exception as exc:
-                logger.warning("get_orders_failed", market=market, error=str(exc))
+        # Parallel HTTP queries for all markets at once.
+        results = await asyncio.gather(
+            *(self.executor.get_open_orders(m) for m in markets_to_check),
+            return_exceptions=True,
+        )
+
+        live_order_ids: set[str] = set()
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                logger.warning("get_orders_failed", market=markets_to_check[i], error=str(result))
+                continue
+            for o in result:
+                oid = o.get("id") or o.get("orderID") or ""
+                if oid:
+                    live_order_ids.add(oid)
 
         # Any active order not in live_order_ids is filled or cancelled.
         for order_id, order in list(self.active_orders.items()):
             if order_id not in live_order_ids:
-                # Assume filled (could also be cancelled by someone else).
                 fill = self.engine.apply_fill(order.intent)
                 logger.info(
                     "maker_order_filled",
@@ -503,6 +530,9 @@ class CryptoMaker:
                         )
                     except Exception as exc:
                         logger.warning("persist_fill_failed", error=str(exc))
+                key = (order.condition_id, order.outcome, order.intent.side)
+                if self._orders_by_key.get(key) == order_id:
+                    del self._orders_by_key[key]
                 del self.active_orders[order_id]
 
     def _build_snapshot(self, condition_id: str) -> Optional[MarketSnapshot]:

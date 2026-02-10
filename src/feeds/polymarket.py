@@ -96,6 +96,10 @@ class PolymarketFeed(BaseFeed):
         self._token_map: dict[tuple[str, str], str] = {}
         self._keepalive_task: Optional[asyncio.Task] = None
         self._receive_task: Optional[asyncio.Task] = None
+        # Pre-computed best levels cache: token_id -> (best_bid, bid_sz, best_ask, ask_sz)
+        self._best_cache: dict[str, tuple[Optional[float], Optional[float], Optional[float], Optional[float]]] = {}
+        # Event signaled on every book update (for event-driven consumers).
+        self.book_updated: asyncio.Event = asyncio.Event()
 
     async def connect(self) -> None:
         """Establish WebSocket connection to Polymarket CLOB Market channel."""
@@ -134,6 +138,7 @@ class PolymarketFeed(BaseFeed):
         self._subscribed_tokens.clear()
         self._token_map.clear()
         self._local_orderbook.clear()
+        self._best_cache.clear()
 
     async def subscribe(self, game: str, match_id: str) -> None:
         """Subscribe to events for a specific match/market (BaseFeed interface).
@@ -196,6 +201,7 @@ class PolymarketFeed(BaseFeed):
             del self._token_map[key]
             self._subscribed_tokens.discard(token_id)
             self._local_orderbook.pop(token_id, None)
+            self._best_cache.pop(token_id, None)
             tokens_to_unsub.append(token_id)
 
         if tokens_to_unsub and self._ws and self._connected:
@@ -229,14 +235,10 @@ class PolymarketFeed(BaseFeed):
         token_id = self._token_map.get((market_id, outcome))
         if token_id is None:
             return (None, None)
-
-        book = self._local_orderbook.get(token_id, {})
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-
-        best_bid = bids[0][0] if bids else None
-        best_ask = asks[0][0] if asks else None
-        return (best_bid, best_ask)
+        cached = self._best_cache.get(token_id)
+        if cached is None:
+            return (None, None)
+        return (cached[0], cached[2])
 
     def get_best_levels(
         self, market_id: str, outcome: str
@@ -253,16 +255,7 @@ class PolymarketFeed(BaseFeed):
         token_id = self._token_map.get((market_id, outcome))
         if token_id is None:
             return (None, None, None, None)
-
-        book = self._local_orderbook.get(token_id, {})
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-
-        best_bid = bids[0][0] if bids else None
-        bid_size = bids[0][1] if bids else None
-        best_ask = asks[0][0] if asks else None
-        ask_size = asks[0][1] if asks else None
-        return (best_bid, bid_size, best_ask, ask_size)
+        return self._best_cache.get(token_id, (None, None, None, None))
 
     def calculate_implied_probability(
         self, best_bid: Optional[float], best_ask: Optional[float]
@@ -366,6 +359,7 @@ class PolymarketFeed(BaseFeed):
         asks.sort(key=lambda x: x[0])
 
         self._local_orderbook[token_id] = {"bids": bids, "asks": asks}
+        self._refresh_best_cache(token_id, bids, asks)
 
     def _handle_price_change(self, data: dict[str, Any]) -> None:
         """Handle incremental price level changes.
@@ -392,6 +386,22 @@ class PolymarketFeed(BaseFeed):
                 book["asks"] = self._merge_levels(
                     book["asks"], [(price, size)], descending=False
                 )
+            self._refresh_best_cache(token_id, book["bids"], book["asks"])
+
+    def _refresh_best_cache(
+        self,
+        token_id: str,
+        bids: list[tuple[float, float]],
+        asks: list[tuple[float, float]],
+    ) -> None:
+        """Update the pre-computed best-levels cache and signal consumers."""
+        self._best_cache[token_id] = (
+            bids[0][0] if bids else None,
+            bids[0][1] if bids else None,
+            asks[0][0] if asks else None,
+            asks[0][1] if asks else None,
+        )
+        self.book_updated.set()
 
     def _merge_levels(
         self,

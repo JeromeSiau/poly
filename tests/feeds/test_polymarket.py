@@ -99,6 +99,10 @@ class TestPolymarketFeed:
             "token_yes": {"bids": [(0.64, 100), (0.63, 200)], "asks": [(0.66, 150)]},
             "token_no": {"bids": [(0.34, 100)], "asks": [(0.36, 150)]},
         }
+        feed._best_cache = {
+            "token_yes": (0.64, 100, 0.66, 150),
+            "token_no": (0.34, 100, 0.36, 150),
+        }
 
         best_bid, best_ask = feed.get_best_prices("cond_123", "YES")
         assert best_bid == 0.64
@@ -114,6 +118,7 @@ class TestPolymarketFeed:
         feed._local_orderbook = {
             "token_up": {"bids": [(0.64, 100), (0.63, 200)], "asks": [(0.66, 150)]},
         }
+        feed._best_cache = {"token_up": (0.64, 100, 0.66, 150)}
 
         best_bid, bid_size, best_ask, ask_size = feed.get_best_levels("cond_123", "Up")
         assert best_bid == 0.64
@@ -242,6 +247,10 @@ class TestPolymarketFeed:
         feed._local_orderbook = {
             "tok_up": {"bids": [(0.49, 100)], "asks": [(0.51, 50)]},
             "tok_down": {"bids": [(0.48, 80)], "asks": [(0.52, 60)]},
+        }
+        feed._best_cache = {
+            "tok_up": (0.49, 100, 0.51, 50),
+            "tok_down": (0.48, 80, 0.52, 60),
         }
 
         prices = feed.get_market_prices("cond_1")
