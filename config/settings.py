@@ -173,7 +173,7 @@ class Settings(BaseSettings):
     WEATHER_ORACLE_GAMMA_URL: str = "https://gamma-api.polymarket.com"
     WEATHER_ORACLE_OPEN_METEO_URL: str = "https://api.open-meteo.com/v1/forecast"
     WEATHER_ORACLE_FORECAST_DAYS: int = 7  # look ahead 7 days
-    WEATHER_ORACLE_MAX_DAILY_SPEND: float = 50.0  # max $50/day
+    WEATHER_ORACLE_MAX_DAILY_SPEND: float = 500.0  # max $500/day (paper)
     WEATHER_ORACLE_PAPER_FILE: str = "data/weather_oracle_paper.jsonl"
 
     # Type 3 – Lottery YES (cheap tail bets)
