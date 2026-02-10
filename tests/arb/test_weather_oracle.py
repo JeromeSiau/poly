@@ -248,8 +248,32 @@ from src.arb.weather_oracle import (
 )
 
 
+def _make_engine(**overrides):
+    """Helper to build a minimal WeatherOracleEngine for unit tests."""
+    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+    engine.max_entry_price = overrides.get("max_entry_price", 0.05)
+    engine.min_confidence = overrides.get("min_confidence", 0.90)
+    engine.yield_enabled = overrides.get("yield_enabled", False)
+    engine.yield_size = overrides.get("yield_size", 50.0)
+    engine.yield_min_confidence = overrides.get("yield_min_confidence", 0.95)
+    engine.yield_min_yes_price = overrides.get("yield_min_yes_price", 0.80)
+    engine.yield_max_yes_price = overrides.get("yield_max_yes_price", 0.97)
+    engine.no_enabled = overrides.get("no_enabled", False)
+    engine.no_size = overrides.get("no_size", 50.0)
+    engine.no_max_confidence = overrides.get("no_max_confidence", 0.10)
+    engine.no_max_yes_price = overrides.get("no_max_yes_price", 0.05)
+    engine.paper_size = overrides.get("paper_size", 3.0)
+    engine.max_daily_spend = overrides.get("max_daily_spend", 50.0)
+    engine._entered_markets = overrides.get("_entered_markets", set())
+    engine._open_trades = overrides.get("_open_trades", [])
+    engine._daily_spend = overrides.get("_daily_spend", 0.0)
+    engine._daily_spend_date = overrides.get("_daily_spend_date", "")
+    engine._stats = overrides.get("_stats", {"trades": 0, "wins": 0, "pnl": 0.0})
+    return engine
+
+
 def test_engine_detects_cheap_certain_outcome():
-    """Engine should signal when forecast makes a cheap outcome near-certain."""
+    """Engine should signal when forecast makes a cheap outcome near-certain (lottery)."""
     market = WeatherMarket(
         condition_id="0xabc",
         slug="highest-temp-dallas-feb-12",
@@ -267,20 +291,19 @@ def test_engine_detects_cheap_certain_outcome():
         temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
-    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
-    engine.max_entry_price = 0.05
-    engine.min_confidence = 0.90
-    engine._entered_markets = set()
+    engine = _make_engine()
 
     signals = engine.evaluate_market(market, forecast)
-    assert len(signals) == 1
-    assert signals[0].outcome == "58°F or higher"
-    assert signals[0].entry_price == 0.03
-    assert signals[0].confidence >= 0.90
+    lottery = [s for s in signals if s.trade_type == "lottery"]
+    assert len(lottery) == 1
+    assert lottery[0].outcome == "58°F or higher"
+    assert lottery[0].entry_price == 0.03
+    assert lottery[0].confidence >= 0.90
+    assert lottery[0].side == "BUY_YES"
 
 
 def test_engine_skips_expensive_outcomes():
-    """Engine should NOT signal outcomes priced above max_entry_price."""
+    """Engine should NOT signal lottery for outcomes priced above max_entry_price."""
     market = WeatherMarket(
         condition_id="0xdef",
         slug="highest-temp-miami-feb-12",
@@ -298,10 +321,7 @@ def test_engine_skips_expensive_outcomes():
         temp_max=75.0, temp_min=65.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
-    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
-    engine.max_entry_price = 0.05
-    engine.min_confidence = 0.90
-    engine._entered_markets = set()
+    engine = _make_engine()  # yield disabled by default
 
     signals = engine.evaluate_market(market, forecast)
     assert len(signals) == 0
@@ -326,14 +346,11 @@ def test_engine_handles_range_outcomes():
         temp_max=38.5, temp_min=28.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
-    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
-    engine.max_entry_price = 0.05
-    engine.min_confidence = 0.90
-    engine._entered_markets = set()
+    engine = _make_engine()
 
     signals = engine.evaluate_market(market, forecast)
-    outcome_labels = [s.outcome for s in signals]
-    assert "38-39°F" in outcome_labels
+    lottery_outcomes = [s.outcome for s in signals if s.trade_type == "lottery"]
+    assert "38-39°F" in lottery_outcomes
 
 
 def test_engine_skips_already_entered():
@@ -355,13 +372,13 @@ def test_engine_skips_already_entered():
         temp_max=65.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
-    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
-    engine.max_entry_price = 0.05
-    engine.min_confidence = 0.90
-    engine._entered_markets = {"0xabc:58°F or higher"}
+    engine = _make_engine(
+        _entered_markets={"0xabc:BUY_YES:lottery:58°F or higher"},
+    )
 
     signals = engine.evaluate_market(market, forecast)
-    assert len(signals) == 0
+    lottery = [s for s in signals if s.trade_type == "lottery"]
+    assert len(lottery) == 0
 
 
 def test_outcome_confidence_threshold_high():
@@ -420,23 +437,19 @@ def test_engine_enter_paper_trade():
     signal = WeatherSignal(
         market=market, outcome="58°F or higher", entry_price=0.03,
         forecast=forecast, confidence=0.95, reason="test",
+        side="BUY_YES", trade_type="lottery",
     )
 
-    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
-    engine.paper_size = 3.0
-    engine.max_daily_spend = 50.0
-    engine._open_trades = []
-    engine._entered_markets = set()
-    engine._daily_spend = 0.0
-    engine._daily_spend_date = ""
-    engine._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+    engine = _make_engine()
 
     trade = engine.enter_paper_trade(signal)
     assert trade is not None
     assert trade.city == "Dallas"
     assert trade.entry_price == 0.03
     assert trade.size_usd == 3.0
-    assert "0xabc:58°F or higher" in engine._entered_markets
+    assert trade.side == "BUY_YES"
+    assert trade.trade_type == "lottery"
+    assert "0xabc:BUY_YES:lottery:58°F or higher" in engine._entered_markets
     assert len(engine._open_trades) == 1
 
 
@@ -444,14 +457,12 @@ def test_engine_daily_spend_limit():
     """Engine should respect daily spend limit."""
     from datetime import datetime, timezone
 
-    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
-    engine.paper_size = 30.0
-    engine.max_daily_spend = 50.0
-    engine._open_trades = []
-    engine._entered_markets = set()
-    engine._daily_spend = 40.0
-    engine._daily_spend_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    engine._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+    engine = _make_engine(
+        paper_size=30.0,
+        max_daily_spend=50.0,
+        _daily_spend=40.0,
+        _daily_spend_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+    )
 
     market = WeatherMarket(
         condition_id="0x1", slug="test", title="test",
@@ -467,15 +478,151 @@ def test_engine_daily_spend_limit():
     signal = WeatherSignal(
         market=market, outcome="58°F or higher", entry_price=0.03,
         forecast=forecast, confidence=0.95, reason="test",
+        side="BUY_YES", trade_type="lottery",
     )
 
     result = engine.enter_paper_trade(signal)
     assert result is None  # exceeded daily limit
 
 
+def test_engine_yield_yes_signal():
+    """Engine should generate yield YES signal for high-confidence likely outcome."""
+    market = WeatherMarket(
+        condition_id="0xabc",
+        slug="highest-temp-dallas-feb-12",
+        title="Highest temperature in Dallas on February 12?",
+        city="Dallas",
+        target_date="2026-02-12",
+        outcomes={"58°F or higher": "tok1", "56-57°F": "tok2"},
+        outcome_prices={"58°F or higher": 0.92, "56-57°F": 0.05},
+        end_date="2026-02-13T00:00:00Z",
+        resolution_source="Weather Underground",
+    )
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-12",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(yield_enabled=True)
+
+    signals = engine.evaluate_market(market, forecast)
+    yield_yes = [s for s in signals if s.trade_type == "yield_yes"]
+    assert len(yield_yes) == 1
+    assert yield_yes[0].outcome == "58°F or higher"
+    assert yield_yes[0].side == "BUY_YES"
+    assert yield_yes[0].entry_price == 0.92
+
+
+def test_engine_yield_no_signal():
+    """Engine should generate yield NO signal for unlikely outcome with low YES price."""
+    market = WeatherMarket(
+        condition_id="0xabc",
+        slug="highest-temp-dallas-feb-12",
+        title="Highest temperature in Dallas on February 12?",
+        city="Dallas",
+        target_date="2026-02-12",
+        outcomes={"45°F or below": "tok1", "58°F or higher": "tok2"},
+        # 45°F or below is very unlikely if forecast says 66°F
+        outcome_prices={"45°F or below": 0.01, "58°F or higher": 0.92},
+        end_date="2026-02-13T00:00:00Z",
+        resolution_source="Weather Underground",
+    )
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-12",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(no_enabled=True)
+
+    signals = engine.evaluate_market(market, forecast)
+    yield_no = [s for s in signals if s.trade_type == "yield_no"]
+    assert len(yield_no) == 1
+    assert yield_no[0].outcome == "45°F or below"
+    assert yield_no[0].side == "BUY_NO"
+    assert yield_no[0].entry_price == 0.99  # 1 - 0.01
+
+
+def test_engine_yield_sizing():
+    """Yield trades should use yield_size, lottery should use paper_size."""
+    engine = _make_engine(yield_enabled=True, yield_size=50.0, paper_size=3.0)
+
+    market = WeatherMarket(
+        condition_id="0xabc", slug="test", title="test",
+        city="Dallas", target_date="2026-02-12",
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.92},
+        end_date="2026-02-13T00:00:00Z", resolution_source="",
+    )
+    forecast = ForecastData(
+        city="Dallas", date="2026-02-12",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    signals = engine.evaluate_market(market, forecast)
+    yield_yes = [s for s in signals if s.trade_type == "yield_yes"]
+    assert len(yield_yes) == 1
+
+    trade = engine.enter_paper_trade(yield_yes[0])
+    assert trade is not None
+    assert trade.size_usd == 50.0
+
+
+@pytest.mark.asyncio
+async def test_resolve_buy_no_trade_wins():
+    """BUY_NO trade should win when YES price drops below 0.1."""
+    engine = _make_engine()
+    engine.scanner = WeatherMarketScanner()
+    # Manually add a market that has resolved (YES → 0)
+    engine.scanner._markets["slug1"] = WeatherMarket(
+        condition_id="slug1", slug="slug1", title="test",
+        city="Dallas", target_date="2026-02-12",
+        outcomes={"45°F or below": "tok1"},
+        outcome_prices={"45°F or below": 0.0},  # YES resolved to 0
+        end_date="2026-02-10T00:00:00Z", resolution_source="",
+    )
+
+    trade = WeatherPaperTrade(
+        id="t1", condition_id="slug1", outcome="45°F or below",
+        side="BUY_NO", trade_type="yield_no",
+        entry_price=0.99, size_usd=50.0,
+    )
+    engine._open_trades = [trade]
+
+    resolved = await engine.resolve_trades()
+    assert len(resolved) == 1
+    assert resolved[0].won is True
+    assert resolved[0].pnl_usd > 0  # profit = shares * (1 - 0.99)
+
+
+@pytest.mark.asyncio
+async def test_resolve_buy_no_trade_loses():
+    """BUY_NO trade should lose when YES price goes above 0.9."""
+    engine = _make_engine()
+    engine.scanner = WeatherMarketScanner()
+    engine.scanner._markets["slug1"] = WeatherMarket(
+        condition_id="slug1", slug="slug1", title="test",
+        city="Dallas", target_date="2026-02-12",
+        outcomes={"45°F or below": "tok1"},
+        outcome_prices={"45°F or below": 1.0},  # YES resolved to 1
+        end_date="2026-02-10T00:00:00Z", resolution_source="",
+    )
+
+    trade = WeatherPaperTrade(
+        id="t2", condition_id="slug1", outcome="45°F or below",
+        side="BUY_NO", trade_type="yield_no",
+        entry_price=0.99, size_usd=50.0,
+    )
+    engine._open_trades = [trade]
+
+    resolved = await engine.resolve_trades()
+    assert len(resolved) == 1
+    assert resolved[0].won is False
+    assert resolved[0].pnl_usd == -50.0
+
+
 @pytest.mark.asyncio
 async def test_full_cycle_scan_evaluate_enter():
-    """Integration: scan -> forecast -> evaluate -> enter trade."""
+    """Integration: scan -> forecast -> evaluate -> enter trade (all 3 types)."""
     from pathlib import Path
 
     mock_event_resp = [{
@@ -486,17 +633,17 @@ async def test_full_cycle_scan_evaluate_enter():
         "markets": [
             {
                 "question": "Will the highest temperature in Dallas be 60°F or higher on February 15?",
-                "outcomePrices": '["0.02","0.98"]',
+                "outcomePrices": '["0.92","0.08"]',
                 "clobTokenIds": '["t1","t2"]',
             },
             {
                 "question": "Will the highest temperature in Dallas be between 58-59°F on February 15?",
-                "outcomePrices": '["0.08","0.92"]',
+                "outcomePrices": '["0.04","0.96"]',
                 "clobTokenIds": '["t3","t4"]',
             },
             {
                 "question": "Will the highest temperature in Dallas be 57°F or below on February 15?",
-                "outcomePrices": '["0.15","0.85"]',
+                "outcomePrices": '["0.01","0.99"]',
                 "clobTokenIds": '["t5","t6"]',
             },
         ],
@@ -510,19 +657,10 @@ async def test_full_cycle_scan_evaluate_enter():
         },
     }
 
-    engine = WeatherOracleEngine.__new__(WeatherOracleEngine)
+    engine = _make_engine(yield_enabled=True, no_enabled=True)
     engine.fetcher = OpenMeteoFetcher()
     engine.scanner = WeatherMarketScanner()
-    engine.max_entry_price = 0.05
-    engine.min_confidence = 0.90
-    engine.paper_size = 3.0
-    engine.max_daily_spend = 50.0
     engine.paper_file = Path("/tmp/test_weather_oracle.jsonl")
-    engine._open_trades = []
-    engine._entered_markets = set()
-    engine._daily_spend = 0.0
-    engine._daily_spend_date = ""
-    engine._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
     engine._database_url = "sqlite:///data/arb.db"
 
     def make_resp(return_value):
@@ -534,14 +672,12 @@ async def test_full_cycle_scan_evaluate_enter():
         return resp
 
     with patch("aiohttp.ClientSession") as mock_cls:
-        # Scanner calls use events API; fetcher calls use open-meteo
         def side_effect_get(url, **kwargs):
             if "gamma" in url or "events" in str(kwargs):
                 slug = kwargs.get("params", {}).get("slug", "")
                 if "dallas" in slug and "february-15" in slug:
                     return make_resp(mock_event_resp)
                 return make_resp([])
-            # Open-Meteo forecast
             return make_resp(mock_forecast_resp)
 
         mock_session = AsyncMock()
@@ -550,23 +686,24 @@ async def test_full_cycle_scan_evaluate_enter():
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_cls.return_value = mock_session
 
-        # Scan
         await engine.scanner.scan()
         assert len(engine.scanner.markets) >= 1
 
-        # Fetch forecast
         await engine.fetcher.fetch_city("Dallas")
         forecast = engine.fetcher.get_forecast("Dallas", "2026-02-15")
         assert forecast is not None
 
-    # Evaluate
     market = list(engine.scanner.markets.values())[0]
     signals = engine.evaluate_market(market, forecast)
-    assert len(signals) >= 1
-    assert signals[0].outcome == "60°F or higher"
 
-    # Enter trade
-    trade = engine.enter_paper_trade(signals[0])
+    # Should have all 3 types
+    types = {s.trade_type for s in signals}
+    assert "yield_yes" in types  # 60°F or higher at 0.92 with high conf
+    assert "yield_no" in types   # 57°F or below at 0.01 YES, low conf
+
+    # Enter a yield YES trade
+    yield_yes = [s for s in signals if s.trade_type == "yield_yes"][0]
+    trade = engine.enter_paper_trade(yield_yes)
     assert trade is not None
-    assert trade.city == "Dallas"
-    assert trade.entry_price == 0.02
+    assert trade.side == "BUY_YES"
+    assert trade.size_usd == 50.0

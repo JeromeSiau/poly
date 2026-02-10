@@ -172,12 +172,27 @@ class Settings(BaseSettings):
     WEATHER_ORACLE_SCAN_INTERVAL: float = 300.0  # 5 min between scans
     WEATHER_ORACLE_GAMMA_URL: str = "https://gamma-api.polymarket.com"
     WEATHER_ORACLE_OPEN_METEO_URL: str = "https://api.open-meteo.com/v1/forecast"
-    WEATHER_ORACLE_MAX_ENTRY_PRICE: float = 0.05  # max 5¢ entry
-    WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE: float = 0.90  # 90% confidence threshold
-    WEATHER_ORACLE_PAPER_SIZE_USD: float = 3.0  # $3 per ticket
-    WEATHER_ORACLE_MAX_DAILY_SPEND: float = 50.0  # max $50/day
     WEATHER_ORACLE_FORECAST_DAYS: int = 7  # look ahead 7 days
+    WEATHER_ORACLE_MAX_DAILY_SPEND: float = 50.0  # max $50/day
     WEATHER_ORACLE_PAPER_FILE: str = "data/weather_oracle_paper.jsonl"
+
+    # Type 3 – Lottery YES (cheap tail bets)
+    WEATHER_ORACLE_MAX_ENTRY_PRICE: float = 0.05  # max 5¢ entry
+    WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE: float = 0.90  # 90% confidence
+    WEATHER_ORACLE_PAPER_SIZE_USD: float = 3.0  # $3 per lottery ticket
+
+    # Type 1 – Yield YES (buy likely outcome at 80-97¢)
+    WEATHER_ORACLE_YIELD_ENABLED: bool = True
+    WEATHER_ORACLE_YIELD_SIZE_USD: float = 50.0  # $50 per yield trade
+    WEATHER_ORACLE_YIELD_MIN_CONFIDENCE: float = 0.95
+    WEATHER_ORACLE_YIELD_MIN_YES_PRICE: float = 0.80
+    WEATHER_ORACLE_YIELD_MAX_YES_PRICE: float = 0.97
+
+    # Type 2 – Yield NO (sell unlikely outcomes, buy NO at 1-yes_price)
+    WEATHER_ORACLE_NO_ENABLED: bool = True
+    WEATHER_ORACLE_NO_SIZE_USD: float = 50.0  # $50 per NO trade
+    WEATHER_ORACLE_NO_MAX_CONFIDENCE: float = 0.10  # outcome must be unlikely
+    WEATHER_ORACLE_NO_MAX_YES_PRICE: float = 0.05  # YES must be ≤5¢ (NO ≥95¢)
 
     model_config = {"env_file": ".env"}
 

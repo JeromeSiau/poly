@@ -116,6 +116,8 @@ class WeatherSignal:
     forecast: ForecastData
     confidence: float  # how certain the forecast makes this outcome
     reason: str  # human-readable explanation
+    side: str = "BUY_YES"  # "BUY_YES" or "BUY_NO"
+    trade_type: str = "lottery"  # "lottery", "yield_yes", "yield_no"
 
 
 @dataclass
@@ -128,6 +130,8 @@ class WeatherPaperTrade:
     market_slug: str = ""
     condition_id: str = ""
     outcome: str = ""
+    side: str = "BUY_YES"  # "BUY_YES" or "BUY_NO"
+    trade_type: str = "lottery"  # "lottery", "yield_yes", "yield_no"
     entry_price: float = 0.0
     size_usd: float = 0.0
     forecast_temp_max: float = 0.0
@@ -390,14 +394,29 @@ class WeatherOracleEngine:
         self.scanner = scanner or WeatherMarketScanner()
         self._database_url = database_url
 
+        # Lottery YES (Type 3) – cheap tail bets
         self.max_entry_price = settings.WEATHER_ORACLE_MAX_ENTRY_PRICE
         self.min_confidence = settings.WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE
         self.paper_size = settings.WEATHER_ORACLE_PAPER_SIZE_USD
+
+        # Yield YES (Type 1) – buy likely outcome at 80-97¢
+        self.yield_enabled = settings.WEATHER_ORACLE_YIELD_ENABLED
+        self.yield_size = settings.WEATHER_ORACLE_YIELD_SIZE_USD
+        self.yield_min_confidence = settings.WEATHER_ORACLE_YIELD_MIN_CONFIDENCE
+        self.yield_min_yes_price = settings.WEATHER_ORACLE_YIELD_MIN_YES_PRICE
+        self.yield_max_yes_price = settings.WEATHER_ORACLE_YIELD_MAX_YES_PRICE
+
+        # Yield NO (Type 2) – buy NO on unlikely outcomes
+        self.no_enabled = settings.WEATHER_ORACLE_NO_ENABLED
+        self.no_size = settings.WEATHER_ORACLE_NO_SIZE_USD
+        self.no_max_confidence = settings.WEATHER_ORACLE_NO_MAX_CONFIDENCE
+        self.no_max_yes_price = settings.WEATHER_ORACLE_NO_MAX_YES_PRICE
+
         self.max_daily_spend = settings.WEATHER_ORACLE_MAX_DAILY_SPEND
         self.paper_file = Path(settings.WEATHER_ORACLE_PAPER_FILE)
 
         self._open_trades: list[WeatherPaperTrade] = []
-        self._entered_markets: set[str] = set()  # "condition_id:outcome"
+        self._entered_markets: set[str] = set()  # "condition_id:side:outcome"
         self._daily_spend: float = 0.0
         self._daily_spend_date: str = ""
 
@@ -406,29 +425,69 @@ class WeatherOracleEngine:
     def evaluate_market(
         self, market: WeatherMarket, forecast: ForecastData,
     ) -> list[WeatherSignal]:
-        """Evaluate a single market against a forecast, return buy signals."""
+        """Evaluate a single market against a forecast, return buy signals.
+
+        Generates up to 3 signal types per outcome:
+        - Type 3 (lottery YES): cheap YES on high-confidence tail outcomes
+        - Type 1 (yield YES): buy YES at 80-97¢ on the most likely outcome
+        - Type 2 (yield NO): buy NO on very unlikely outcomes (YES ≤ 5¢)
+        """
         signals: list[WeatherSignal] = []
         temp_max = forecast.temp_max
 
-        for outcome_label, price in market.outcome_prices.items():
-            if price > self.max_entry_price or price <= 0:
-                continue
-
-            entry_key = f"{market.condition_id}:{outcome_label}"
-            if entry_key in self._entered_markets:
+        for outcome_label, yes_price in market.outcome_prices.items():
+            if yes_price <= 0:
                 continue
 
             confidence = self._outcome_confidence(outcome_label, temp_max)
 
-            if confidence >= self.min_confidence:
-                signals.append(WeatherSignal(
-                    market=market,
-                    outcome=outcome_label,
-                    entry_price=price,
-                    forecast=forecast,
-                    confidence=confidence,
-                    reason=f"Forecast {temp_max:.0f}° → {outcome_label} (conf={confidence:.0%})",
-                ))
+            # --- Type 3: Lottery YES (cheap tail bet) ---
+            if yes_price <= self.max_entry_price:
+                key = f"{market.condition_id}:BUY_YES:lottery:{outcome_label}"
+                if key not in self._entered_markets and confidence >= self.min_confidence:
+                    signals.append(WeatherSignal(
+                        market=market,
+                        outcome=outcome_label,
+                        entry_price=yes_price,
+                        forecast=forecast,
+                        confidence=confidence,
+                        reason=f"Lottery YES {temp_max:.0f}° → {outcome_label} @{yes_price:.3f} (conf={confidence:.0%})",
+                        side="BUY_YES",
+                        trade_type="lottery",
+                    ))
+
+            # --- Type 1: Yield YES (buy likely outcome at 80-97¢) ---
+            if self.yield_enabled:
+                if self.yield_min_yes_price <= yes_price <= self.yield_max_yes_price:
+                    key = f"{market.condition_id}:BUY_YES:yield_yes:{outcome_label}"
+                    if key not in self._entered_markets and confidence >= self.yield_min_confidence:
+                        signals.append(WeatherSignal(
+                            market=market,
+                            outcome=outcome_label,
+                            entry_price=yes_price,
+                            forecast=forecast,
+                            confidence=confidence,
+                            reason=f"Yield YES {temp_max:.0f}° → {outcome_label} @{yes_price:.3f} (conf={confidence:.0%})",
+                            side="BUY_YES",
+                            trade_type="yield_yes",
+                        ))
+
+            # --- Type 2: Yield NO (buy NO on unlikely outcomes) ---
+            if self.no_enabled:
+                if yes_price <= self.no_max_yes_price and confidence <= self.no_max_confidence:
+                    no_price = 1.0 - yes_price
+                    key = f"{market.condition_id}:BUY_NO:yield_no:{outcome_label}"
+                    if key not in self._entered_markets:
+                        signals.append(WeatherSignal(
+                            market=market,
+                            outcome=outcome_label,
+                            entry_price=no_price,
+                            forecast=forecast,
+                            confidence=confidence,
+                            reason=f"Yield NO {temp_max:.0f}° → {outcome_label} YES@{yes_price:.3f} NO@{no_price:.3f} (conf={confidence:.0%})",
+                            side="BUY_NO",
+                            trade_type="yield_no",
+                        ))
 
         return signals
 
@@ -482,6 +541,14 @@ class WeatherOracleEngine:
 
         return 0.0
 
+    def _size_for_signal(self, signal: WeatherSignal) -> float:
+        """Return position size in USD based on trade type."""
+        if signal.trade_type == "yield_yes":
+            return self.yield_size
+        if signal.trade_type == "yield_no":
+            return self.no_size
+        return self.paper_size  # lottery
+
     def enter_paper_trade(self, signal: WeatherSignal) -> Optional[WeatherPaperTrade]:
         """Record a paper trade entry."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -489,7 +556,9 @@ class WeatherOracleEngine:
             self._daily_spend = 0.0
             self._daily_spend_date = today
 
-        if self._daily_spend + self.paper_size > self.max_daily_spend:
+        size = self._size_for_signal(signal)
+
+        if self._daily_spend + size > self.max_daily_spend:
             logger.info("daily_spend_limit", spend=self._daily_spend, limit=self.max_daily_spend)
             return None
 
@@ -501,8 +570,10 @@ class WeatherOracleEngine:
             market_slug=signal.market.slug,
             condition_id=signal.market.condition_id,
             outcome=signal.outcome,
+            side=signal.side,
+            trade_type=signal.trade_type,
             entry_price=signal.entry_price,
-            size_usd=self.paper_size,
+            size_usd=size,
             forecast_temp_max=signal.forecast.temp_max,
             forecast_temp_min=signal.forecast.temp_min,
             confidence=signal.confidence,
@@ -510,15 +581,18 @@ class WeatherOracleEngine:
         )
 
         self._open_trades.append(trade)
-        entry_key = f"{signal.market.condition_id}:{signal.outcome}"
+        entry_key = f"{signal.market.condition_id}:{signal.side}:{signal.trade_type}:{signal.outcome}"
         self._entered_markets.add(entry_key)
-        self._daily_spend += self.paper_size
+        self._daily_spend += size
 
         logger.info(
             "weather_paper_trade_entered",
             city=trade.city,
             outcome=trade.outcome,
+            side=trade.side,
+            trade_type=trade.trade_type,
             entry_price=trade.entry_price,
+            size_usd=trade.size_usd,
             confidence=trade.confidence,
             reason=trade.reason,
         )
@@ -544,21 +618,35 @@ class WeatherOracleEngine:
                 still_open.append(trade)
                 continue
 
-            final_price = market.outcome_prices.get(trade.outcome, 0.0)
+            final_yes_price = market.outcome_prices.get(trade.outcome, 0.0)
 
-            if final_price > 0.9:
-                trade.won = True
-                shares = trade.size_usd / trade.entry_price
-                trade.pnl_usd = round(shares * (1.0 - trade.entry_price), 2)
-            elif final_price < 0.1:
-                trade.won = False
-                trade.pnl_usd = round(-trade.size_usd, 2)
+            if trade.side == "BUY_NO":
+                # BUY_NO wins when YES resolves to 0 (NO resolves to 1)
+                if final_yes_price < 0.1:
+                    trade.won = True
+                    shares = trade.size_usd / trade.entry_price
+                    trade.pnl_usd = round(shares * (1.0 - trade.entry_price), 2)
+                elif final_yes_price > 0.9:
+                    trade.won = False
+                    trade.pnl_usd = round(-trade.size_usd, 2)
+                else:
+                    still_open.append(trade)
+                    continue
             else:
-                still_open.append(trade)
-                continue
+                # BUY_YES wins when YES resolves to 1
+                if final_yes_price > 0.9:
+                    trade.won = True
+                    shares = trade.size_usd / trade.entry_price
+                    trade.pnl_usd = round(shares * (1.0 - trade.entry_price), 2)
+                elif final_yes_price < 0.1:
+                    trade.won = False
+                    trade.pnl_usd = round(-trade.size_usd, 2)
+                else:
+                    still_open.append(trade)
+                    continue
 
             trade.resolved = True
-            trade.resolution_price = final_price
+            trade.resolution_price = final_yes_price
             trade.resolution_time = datetime.now(timezone.utc).isoformat()
 
             self._stats["trades"] += 1
@@ -590,13 +678,14 @@ class WeatherOracleEngine:
             "target_date": trade.target_date,
             "condition_id": trade.condition_id,
             "outcome": trade.outcome,
-            "side": "BUY",
+            "side": trade.side,
+            "trade_type": trade.trade_type,
             "slug": trade.market_slug,
             "forecast_temp_max": trade.forecast_temp_max,
             "forecast_temp_min": trade.forecast_temp_min,
             "confidence": trade.confidence,
             "reason": trade.reason,
-            "title": f"{trade.city} {trade.target_date} → {trade.outcome}",
+            "title": f"{trade.city} {trade.target_date} → {trade.side} {trade.outcome}",
         }
 
         edge = trade.pnl_usd / trade.size_usd if trade.size_usd > 0 else 0.0
@@ -612,7 +701,7 @@ class WeatherOracleEngine:
 
         db_trade = PaperTradeDB(
             observation_id=0,
-            side="BUY",
+            side=trade.side,
             entry_price=trade.entry_price,
             simulated_fill_price=trade.entry_price,
             size=trade.size_usd,
@@ -665,9 +754,13 @@ class WeatherOracleEngine:
         logger.info(
             "weather_oracle_started",
             scan_interval=scan_interval,
-            max_entry_price=self.max_entry_price,
-            min_confidence=self.min_confidence,
-            paper_size=self.paper_size,
+            lottery_max_price=self.max_entry_price,
+            lottery_min_conf=self.min_confidence,
+            lottery_size=self.paper_size,
+            yield_yes_enabled=self.yield_enabled,
+            yield_yes_size=self.yield_size,
+            yield_no_enabled=self.no_enabled,
+            yield_no_size=self.no_size,
         )
 
         while True:
@@ -700,6 +793,8 @@ class WeatherOracleEngine:
                             "weather_signal_candidate",
                             city=signal.market.city,
                             outcome=signal.outcome,
+                            side=signal.side,
+                            trade_type=signal.trade_type,
                             price=signal.entry_price,
                             confidence=round(signal.confidence, 3),
                             forecast_max=signal.forecast.temp_max,
