@@ -3,7 +3,12 @@ import pytest
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.feeds.polymarket import PolymarketFeed, OrderBookUpdate
+from src.feeds.polymarket import (
+    PolymarketFeed,
+    PolymarketUserFeed,
+    OrderBookUpdate,
+    UserTradeEvent,
+)
 
 
 class TestOrderBookUpdate:
@@ -306,3 +311,156 @@ class TestPolymarketFeed:
         await feed._process_message(msg)
 
         assert (0.50, 200.0) in feed._local_orderbook["tok_a"]["bids"]
+
+
+class TestUserTradeEvent:
+    def test_from_raw_taker(self):
+        raw = {
+            "event_type": "trade",
+            "taker_order_id": "0xabc123",
+            "market": "0xcond_1",
+            "asset_id": "token_up",
+            "side": "BUY",
+            "price": "0.49",
+            "size": "100",
+            "status": "MATCHED",
+            "timestamp": "1672290701",
+        }
+        evt = UserTradeEvent.from_raw(raw)
+        assert evt.order_id == "0xabc123"
+        assert evt.market == "0xcond_1"
+        assert evt.asset_id == "token_up"
+        assert evt.side == "BUY"
+        assert evt.price == 0.49
+        assert evt.size == 100.0
+        assert evt.status == "MATCHED"
+
+    def test_from_raw_maker_fallback(self):
+        raw = {
+            "event_type": "trade",
+            "taker_order_id": "",
+            "maker_orders": [{"order_id": "0xmaker1"}],
+            "market": "0xcond_2",
+            "asset_id": "token_down",
+            "side": "SELL",
+            "price": "0.51",
+            "size": "50",
+            "status": "CONFIRMED",
+            "timestamp": "1672290800",
+        }
+        evt = UserTradeEvent.from_raw(raw)
+        assert evt.order_id == "0xmaker1"
+        assert evt.status == "CONFIRMED"
+
+
+class TestPolymarketUserFeed:
+    def test_initialization(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        assert feed.is_connected is False
+        assert feed._subscribed_markets == set()
+        assert feed.fills.empty()
+
+    @pytest.mark.asyncio
+    async def test_subscribe_markets_first_includes_auth(self):
+        feed = PolymarketUserFeed("mykey", "mysecret", "mypass")
+        feed._ws = AsyncMock()
+        feed._connected = True
+
+        await feed.subscribe_markets(["0xcond_1", "0xcond_2"])
+
+        feed._ws.send.assert_called_once()
+        msg = json.loads(feed._ws.send.call_args[0][0])
+        assert msg["type"] == "user"
+        assert msg["auth"]["apiKey"] == "mykey"
+        assert msg["auth"]["secret"] == "mysecret"
+        assert msg["auth"]["passphrase"] == "mypass"
+        assert "0xcond_1" in msg["markets"]
+        assert "0xcond_2" in msg["markets"]
+        assert feed._authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_subscribe_markets_subsequent_no_auth(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        feed._ws = AsyncMock()
+        feed._connected = True
+        feed._authenticated = True
+        feed._subscribed_markets = {"0xcond_1"}
+
+        await feed.subscribe_markets(["0xcond_2"])
+
+        msg = json.loads(feed._ws.send.call_args[0][0])
+        assert "auth" not in msg
+        assert msg["operation"] == "subscribe"
+        assert "0xcond_2" in msg["markets"]
+
+    @pytest.mark.asyncio
+    async def test_subscribe_dedup(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        feed._ws = AsyncMock()
+        feed._connected = True
+        feed._authenticated = True
+        feed._subscribed_markets = {"0xcond_1"}
+
+        await feed.subscribe_markets(["0xcond_1"])
+        feed._ws.send.assert_not_called()
+
+    def test_process_message_trade_matched(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        data = {
+            "event_type": "trade",
+            "taker_order_id": "0xabc",
+            "market": "0xcond_1",
+            "asset_id": "token_up",
+            "side": "BUY",
+            "price": "0.49",
+            "size": "100",
+            "status": "MATCHED",
+            "timestamp": "1672290701",
+        }
+        feed._process_message(data)
+        assert not feed.fills.empty()
+        evt = feed.fills.get_nowait()
+        assert evt.order_id == "0xabc"
+        assert evt.status == "MATCHED"
+
+    def test_process_message_trade_retrying_ignored(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        data = {
+            "event_type": "trade",
+            "taker_order_id": "0xabc",
+            "market": "0xcond_1",
+            "asset_id": "token_up",
+            "side": "BUY",
+            "price": "0.49",
+            "size": "100",
+            "status": "RETRYING",
+            "timestamp": "1672290701",
+        }
+        feed._process_message(data)
+        assert feed.fills.empty()
+
+    def test_process_message_order_ignored(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        data = {
+            "event_type": "order",
+            "id": "0xord1",
+            "type": "PLACEMENT",
+        }
+        feed._process_message(data)
+        assert feed.fills.empty()
+
+    @pytest.mark.asyncio
+    async def test_unsubscribe_markets(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        feed._ws = AsyncMock()
+        feed._connected = True
+        feed._subscribed_markets = {"0xcond_1", "0xcond_2"}
+
+        await feed.unsubscribe_markets(["0xcond_1"])
+
+        feed._ws.send.assert_called_once()
+        msg = json.loads(feed._ws.send.call_args[0][0])
+        assert msg["operation"] == "unsubscribe"
+        assert "0xcond_1" in msg["markets"]
+        assert "0xcond_1" not in feed._subscribed_markets
+        assert "0xcond_2" in feed._subscribed_markets

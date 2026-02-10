@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+try:
+    import orjson
+    _json_loads = orjson.loads
+except ImportError:
+    _json_loads = json.loads
+
 import structlog
 import websockets
 
@@ -305,14 +311,14 @@ class PolymarketFeed(BaseFeed):
                     continue  # skip binary or empty frames
                 if message.strip() in ("pong", "ping"):
                     continue  # skip keepalive responses
-                data = json.loads(message)
+                data = _json_loads(message)
                 await self._process_message(data)
             except asyncio.CancelledError:
                 break
             except websockets.exceptions.ConnectionClosed:
                 self._connected = False
                 break
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 continue  # skip non-JSON messages
             except Exception as e:
                 logger.error("receive_loop_error", error=str(e))
@@ -430,3 +436,205 @@ class PolymarketFeed(BaseFeed):
         result = [(price, size) for price, size in levels.items()]
         result.sort(key=lambda x: x[0], reverse=descending)
         return result
+
+
+# ---------------------------------------------------------------------------
+# User channel — real-time order/trade notifications (authenticated)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UserTradeEvent:
+    """A fill notification from the Polymarket User WS channel."""
+
+    order_id: str
+    market: str  # condition_id
+    asset_id: str  # token_id
+    side: str
+    price: float
+    size: float
+    status: str  # MATCHED / MINED / CONFIRMED / FAILED
+    timestamp: float
+
+    @classmethod
+    def from_raw(cls, data: dict[str, Any]) -> "UserTradeEvent":
+        maker_orders = data.get("maker_orders") or []
+        order_id = data.get("taker_order_id", "")
+        if not order_id and maker_orders:
+            order_id = maker_orders[0].get("order_id", "")
+        return cls(
+            order_id=order_id,
+            market=str(data.get("market", "")),
+            asset_id=str(data.get("asset_id", "")),
+            side=str(data.get("side", "")),
+            price=float(data.get("price", 0)),
+            size=float(data.get("size", 0)),
+            status=str(data.get("status", "")),
+            timestamp=float(data.get("timestamp", 0)),
+        )
+
+
+class PolymarketUserFeed:
+    """Real-time order/trade notifications via Polymarket User WS channel.
+
+    Pushes ``UserTradeEvent`` into an ``asyncio.Queue`` for consumers to drain.
+    Requires API credentials (obtained from py-clob-client).
+    """
+
+    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+    PING_INTERVAL = 10.0
+
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        api_passphrase: str,
+    ) -> None:
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._api_passphrase = api_passphrase
+        self._ws: Optional[ClientConnection] = None
+        self._connected = False
+        self._authenticated = False
+        self._subscribed_markets: set[str] = set()
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._receive_task: Optional[asyncio.Task] = None
+        # Consumers drain this queue for fill events.
+        self.fills: asyncio.Queue[UserTradeEvent] = asyncio.Queue()
+        # Event signaled on every new fill.
+        self.fill_received: asyncio.Event = asyncio.Event()
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def connect(self) -> None:
+        if self._connected:
+            return
+        self._ws = await websockets.connect(self.WS_URL)
+        self._connected = True
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def disconnect(self) -> None:
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+            self._keepalive_task = None
+
+        if self._receive_task:
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+            self._receive_task = None
+
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+
+        self._connected = False
+        self._authenticated = False
+        self._subscribed_markets.clear()
+
+    async def subscribe_markets(self, market_ids: list[str]) -> None:
+        """Subscribe to trade/order events for condition IDs."""
+        if not self._ws or not self._connected:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        new_ids = [m for m in market_ids if m not in self._subscribed_markets]
+        if not new_ids:
+            return
+
+        if not self._authenticated:
+            # First subscription includes auth credentials.
+            msg = json.dumps({
+                "markets": new_ids,
+                "type": "user",
+                "auth": {
+                    "apiKey": self._api_key,
+                    "secret": self._api_secret,
+                    "passphrase": self._api_passphrase,
+                },
+            })
+            self._authenticated = True
+        else:
+            msg = json.dumps({
+                "markets": new_ids,
+                "operation": "subscribe",
+            })
+
+        await self._ws.send(msg)
+        self._subscribed_markets.update(new_ids)
+        logger.debug("user_ws_subscribed", markets=len(new_ids))
+
+    async def unsubscribe_markets(self, market_ids: list[str]) -> None:
+        """Unsubscribe from trade/order events."""
+        ids = [m for m in market_ids if m in self._subscribed_markets]
+        if not ids or not self._ws or not self._connected:
+            return
+        try:
+            await self._ws.send(json.dumps({
+                "markets": ids,
+                "operation": "unsubscribe",
+            }))
+        except Exception:
+            pass
+        self._subscribed_markets -= set(ids)
+
+    async def _keepalive_loop(self) -> None:
+        while self._connected and self._ws:
+            try:
+                await asyncio.sleep(self.PING_INTERVAL)
+                if self._ws:
+                    await self._ws.send("PING")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("user_ws_keepalive_error", error=str(e))
+                break
+
+    async def _receive_loop(self) -> None:
+        while self._connected and self._ws:
+            try:
+                message = await self._ws.recv()
+                if not isinstance(message, str) or not message.strip():
+                    continue
+                txt = message.strip()
+                if txt in ("PONG", "pong", "ping", "PING"):
+                    continue
+                data = _json_loads(message)
+                self._process_message(data)
+            except asyncio.CancelledError:
+                break
+            except websockets.exceptions.ConnectionClosed:
+                self._connected = False
+                break
+            except (json.JSONDecodeError, ValueError):
+                continue
+            except Exception as e:
+                logger.error("user_ws_receive_error", error=str(e))
+                continue
+
+    def _process_message(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        event_type = data.get("event_type", "")
+        if event_type == "trade":
+            status = data.get("status", "")
+            if status in ("MATCHED", "CONFIRMED"):
+                evt = UserTradeEvent.from_raw(data)
+                self.fills.put_nowait(evt)
+                self.fill_received.set()
+                logger.debug(
+                    "user_ws_fill",
+                    order_id=evt.order_id[:16],
+                    market=evt.market[:16],
+                    side=evt.side,
+                    price=evt.price,
+                    size=evt.size,
+                    status=evt.status,
+                )

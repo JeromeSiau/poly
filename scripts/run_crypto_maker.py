@@ -27,6 +27,11 @@ from typing import Any, Optional
 import httpx
 import structlog
 
+try:
+    import uvloop
+except ImportError:
+    uvloop = None
+
 _project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(_project_root))
 
@@ -40,7 +45,7 @@ from src.arb.two_sided_inventory import (
     TwoSidedInventoryEngine,
 )
 from src.feeds.binance import BinanceFeed
-from src.feeds.polymarket import PolymarketFeed
+from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEvent
 
 # Reuse crypto market discovery from the two-sided runner.
 from scripts.run_two_sided_inventory import (
@@ -85,6 +90,7 @@ class CryptoMaker:
         executor: Optional[PolymarketExecutor],
         binance: BinanceFeed,
         polymarket: PolymarketFeed,
+        user_feed: Optional[PolymarketUserFeed],
         paper_recorder: Optional[TwoSidedPaperRecorder],
         symbols: list[str],
         paper_mode: bool = True,
@@ -100,6 +106,7 @@ class CryptoMaker:
         self.executor = executor
         self.binance = binance
         self.polymarket = polymarket
+        self.user_feed = user_feed
         self.paper_recorder = paper_recorder
         self.symbols = symbols
         self.paper_mode = paper_mode
@@ -176,6 +183,13 @@ class CryptoMaker:
             except Exception as exc:
                 logger.warning("ws_subscribe_failed", condition_id=cid, error=str(exc))
 
+            # Subscribe User channel for real-time fill notifications.
+            if self.user_feed and self.user_feed.is_connected:
+                try:
+                    await self.user_feed.subscribe_markets([cid])
+                except Exception as exc:
+                    logger.warning("user_ws_subscribe_failed", condition_id=cid, error=str(exc))
+
             new_count += 1
 
         if new_count:
@@ -212,6 +226,11 @@ class CryptoMaker:
                 await self.polymarket.unsubscribe_market(cid)
             except Exception:
                 pass
+            if self.user_feed and self.user_feed.is_connected:
+                try:
+                    await self.user_feed.unsubscribe_markets([cid])
+                except Exception:
+                    pass
             self.known_markets.pop(cid, None)
             self.market_symbol.pop(cid, None)
             self.market_outcomes.pop(cid, None)
@@ -535,6 +554,58 @@ class CryptoMaker:
                     del self._orders_by_key[key]
                 del self.active_orders[order_id]
 
+    async def _fill_listener(self) -> None:
+        """Drain fills from WS User channel in real time (replaces HTTP polling)."""
+        if not self.user_feed:
+            return
+        while True:
+            try:
+                evt: UserTradeEvent = await self.user_feed.fills.get()
+            except asyncio.CancelledError:
+                break
+
+            # Find matching active order by checking maker_orders or taker_order.
+            matched_order: Optional[ActiveOrder] = None
+            matched_id: Optional[str] = None
+            for oid, order in self.active_orders.items():
+                if order.token_id == evt.asset_id and order.condition_id == evt.market:
+                    matched_order = order
+                    matched_id = oid
+                    break
+
+            if not matched_order or not matched_id:
+                continue
+
+            fill = self.engine.apply_fill(matched_order.intent)
+            logger.info(
+                "maker_ws_fill_detected",
+                order_id=matched_id,
+                condition_id=matched_order.condition_id,
+                outcome=matched_order.outcome,
+                side=matched_order.intent.side,
+                price=matched_order.intent.price,
+                status=evt.status,
+            )
+
+            if self.paper_recorder is not None:
+                snapshot = self._build_snapshot(matched_order.condition_id)
+                fair = self.engine.compute_fair_prices(snapshot) if snapshot else {}
+                try:
+                    self.paper_recorder.persist_fill(
+                        intent=matched_order.intent,
+                        fill=fill,
+                        snapshot=snapshot,
+                        fair_prices=fair,
+                        execution_mode="maker_ws_live_rt",
+                    )
+                except Exception as exc:
+                    logger.warning("persist_fill_failed", error=str(exc))
+
+            key = (matched_order.condition_id, matched_order.outcome, matched_order.intent.side)
+            if self._orders_by_key.get(key) == matched_id:
+                del self._orders_by_key[key]
+            del self.active_orders[matched_id]
+
     def _build_snapshot(self, condition_id: str) -> Optional[MarketSnapshot]:
         """Build a MarketSnapshot from WS book state for a condition."""
         outcomes = self.market_outcomes.get(condition_id, [])
@@ -575,8 +646,20 @@ class CryptoMaker:
         await self.binance.connect()
         await self.polymarket.connect()
 
+        # Connect User WS channel for real-time fill detection (live mode).
+        if self.user_feed:
+            try:
+                await self.user_feed.connect()
+                # When we have real-time fills, relax HTTP polling to a safety-net (30s).
+                self.fill_check_interval = max(self.fill_check_interval, 30.0)
+                logger.info("user_ws_connected")
+            except Exception as exc:
+                logger.warning("user_ws_connect_failed", error=str(exc))
+                self.user_feed = None
+
         timeout = httpx.Timeout(20.0, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        async with httpx.AsyncClient(timeout=timeout, limits=limits, http2=True) as client:
             self._http_client = client
             # Initial discovery before starting loops.
             await self._discover_markets()
@@ -587,16 +670,23 @@ class CryptoMaker:
                 paper=self.paper_mode,
                 markets=len(self.known_markets),
                 maker_interval=self.maker_loop_interval,
+                user_ws=self.user_feed is not None,
             )
 
+            tasks: list[Any] = [
+                self.binance.listen(),
+                self.market_discovery_loop(),
+                self.maker_loop(),
+            ]
+            if self.user_feed:
+                tasks.append(self._fill_listener())
+
             try:
-                await asyncio.gather(
-                    self.binance.listen(),
-                    self.market_discovery_loop(),
-                    self.maker_loop(),
-                )
+                await asyncio.gather(*tasks)
             finally:
                 self._http_client = None
+                if self.user_feed:
+                    await self.user_feed.disconnect()
                 await self.polymarket.disconnect()
                 await self.binance.disconnect()
 
@@ -678,11 +768,25 @@ async def main() -> None:
     binance = BinanceFeed(symbols=symbols)
     polymarket = PolymarketFeed()
 
+    # User WS channel for real-time fill detection (live mode only, requires API creds).
+    user_feed: Optional[PolymarketUserFeed] = None
+    if not paper_mode and settings.POLYMARKET_API_KEY:
+        api_key = settings.POLYMARKET_API_KEY
+        api_secret = settings.POLYMARKET_API_SECRET
+        api_passphrase = settings.POLYMARKET_API_PASSPHRASE
+        if api_key and api_secret and api_passphrase:
+            user_feed = PolymarketUserFeed(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+
     maker = CryptoMaker(
         engine=engine,
         executor=executor,
         binance=binance,
         polymarket=polymarket,
+        user_feed=user_feed,
         paper_recorder=paper_recorder,
         symbols=symbols,
         paper_mode=paper_mode,
@@ -699,4 +803,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if uvloop is not None:
+        uvloop.install()
     asyncio.run(main())
