@@ -19,8 +19,10 @@ scaled to the market's time window via exponential decay.
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 import structlog
 
 logger = structlog.get_logger()
@@ -249,4 +251,105 @@ class FearMarketScanner:
             ):
                 candidates.append(market)
 
+        return candidates
+
+    # ------------------------------------------------------------------
+    # Gamma API market discovery
+    # ------------------------------------------------------------------
+
+    async def discover_markets(
+        self,
+        gamma_url: str = "https://gamma-api.polymarket.com",
+        limit: int = 100,
+    ) -> list[FearMarketCandidate]:
+        """Fetch active events from the Gamma API and build scored candidates.
+
+        Queries ``{gamma_url}/events`` for active, non-closed events, then
+        iterates each event's markets to extract YES/NO prices and token IDs.
+        Markets are filtered by YES price range, scored, clustered, and
+        enriched with a base-rate edge estimate.
+
+        Returns candidates sorted by *fear_score* descending.  On any API
+        error the method logs a warning and returns an empty list.
+        """
+        now = datetime.now(timezone.utc)
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{gamma_url}/events",
+                    params={"limit": limit, "active": "true", "closed": "false"},
+                )
+                resp.raise_for_status()
+                events = resp.json()
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.warning("gamma_api_error", error=str(exc))
+            return []
+
+        candidates: list[FearMarketCandidate] = []
+
+        for event in events:
+            title = event.get("title", "")
+            end_date_str = event.get("endDate", "")
+
+            # Compute days to resolution
+            try:
+                end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                end_date_days = max(1, (end_dt - now).days)
+            except (ValueError, TypeError):
+                end_date_days = 90  # fallback
+
+            for market in event.get("markets", []):
+                tokens = market.get("tokens", [])
+
+                # Extract YES / NO prices and token IDs
+                yes_price: float | None = None
+                no_price: float | None = None
+                no_token_id: str = ""
+                for token in tokens:
+                    outcome = token.get("outcome", "")
+                    if outcome == "Yes":
+                        yes_price = float(token.get("price", 1.0))
+                    elif outcome == "No":
+                        no_price = float(token.get("price", 0.0))
+                        no_token_id = token.get("token_id", "")
+
+                if yes_price is None or no_price is None:
+                    continue
+
+                # Filter by YES price range
+                if not (self.min_yes_price <= yes_price <= self.max_yes_price):
+                    continue
+
+                question = market.get("question", title)
+                volume_24h = float(market.get("volumeNum", market.get("volume", 0)))
+                liquidity = float(market.get("liquidityNum", market.get("liquidity", 0)))
+                condition_id = market.get("conditionId", market.get("id", ""))
+
+                # Scoring, clustering, base-rate
+                fear_score = self.score_market(question, yes_price, volume_24h, end_date_days)
+                cluster = self.detect_cluster(question)
+                estimated_yes_prob = self.estimate_base_rate(end_date_days, cluster)
+                estimated_no_prob = 1.0 - estimated_yes_prob
+                edge = estimated_no_prob - no_price
+
+                candidates.append(
+                    FearMarketCandidate(
+                        condition_id=condition_id,
+                        token_id=no_token_id,
+                        title=question,
+                        yes_price=yes_price,
+                        no_price=no_price,
+                        estimated_no_probability=estimated_no_prob,
+                        edge_pct=edge,
+                        volume_24h=volume_24h,
+                        liquidity=liquidity,
+                        end_date_iso=end_date_str,
+                        fear_score=fear_score,
+                        cluster=cluster,
+                    )
+                )
+
+        # Sort by fear_score descending
+        candidates.sort(key=lambda c: c.fear_score, reverse=True)
         return candidates
