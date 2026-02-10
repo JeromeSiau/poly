@@ -13,7 +13,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-StrategyType = Literal["reality", "crossmarket", "crypto", "nobet"]
+StrategyType = Literal["reality", "crossmarket", "crypto", "nobet", "fear"]
 
 
 class UnifiedRiskManager:
@@ -32,6 +32,7 @@ class UnifiedRiskManager:
         daily_loss_limit_pct: float,
         crypto_allocation_pct: float = 0.0,
         nobet_allocation_pct: float = 0.0,
+        fear_allocation_pct: float = 0.0,
     ) -> None:
         """Initialize the Unified Risk Manager.
 
@@ -43,12 +44,14 @@ class UnifiedRiskManager:
             daily_loss_limit_pct: Daily loss limit as a fraction of global capital (0-1)
             crypto_allocation_pct: Percentage of capital allocated to Crypto Arb (0-100)
             nobet_allocation_pct: Percentage of capital allocated to NO Bet strategy (0-100)
+            fear_allocation_pct: Percentage of capital allocated to Fear Selling strategy (0-100)
         """
         self._global_capital = global_capital
         self._reality_allocation_pct = reality_allocation_pct
         self._crossmarket_allocation_pct = crossmarket_allocation_pct
         self._crypto_allocation_pct = crypto_allocation_pct
         self._nobet_allocation_pct = nobet_allocation_pct
+        self._fear_allocation_pct = fear_allocation_pct
         self._max_position_pct = max_position_pct
         self._daily_loss_limit_pct = daily_loss_limit_pct
 
@@ -59,6 +62,7 @@ class UnifiedRiskManager:
             "crossmarket": 0.0,
             "crypto": 0.0,
             "nobet": 0.0,
+            "fear": 0.0,
         }
 
         # Trading halt flag
@@ -71,6 +75,7 @@ class UnifiedRiskManager:
             crossmarket_allocation_pct=crossmarket_allocation_pct,
             max_position_pct=max_position_pct,
             daily_loss_limit_pct=daily_loss_limit_pct,
+            fear_allocation_pct=fear_allocation_pct,
         )
 
     @property
@@ -100,6 +105,8 @@ class UnifiedRiskManager:
             allocation_pct = self._crypto_allocation_pct
         elif strategy == "nobet":
             allocation_pct = self._nobet_allocation_pct
+        elif strategy == "fear":
+            allocation_pct = self._fear_allocation_pct
         else:
             logger.warning("unknown_strategy", strategy=strategy)
             return 0.0
@@ -261,6 +268,7 @@ class UnifiedRiskManager:
             "crossmarket": 0.0,
             "crypto": 0.0,
             "nobet": 0.0,
+            "fear": 0.0,
         }
         self._is_halted = False
 
@@ -298,4 +306,5 @@ class UnifiedRiskManager:
             "crossmarket_capital": self.get_available_capital("crossmarket"),
             "crypto_capital": self.get_available_capital("crypto"),
             "nobet_capital": self.get_available_capital("nobet"),
+            "fear_capital": self.get_available_capital("fear"),
         }
