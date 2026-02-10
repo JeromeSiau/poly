@@ -113,6 +113,23 @@ class Settings(BaseSettings):
     NO_BET_MAX_PER_MARKET_PCT: float = 0.02
     CAPITAL_ALLOCATION_NOBET_PCT: float = 0.0
 
+    # === Fear Selling Strategy (SwissMiss / tail risk selling) ===
+    FEAR_SELLING_ENABLED: bool = False
+    FEAR_SELLING_SCAN_INTERVAL: float = 300.0
+    FEAR_SELLING_MIN_FEAR_SCORE: float = 0.5
+    FEAR_SELLING_MIN_YES_PRICE: float = 0.05
+    FEAR_SELLING_MAX_YES_PRICE: float = 0.65
+    FEAR_SELLING_MIN_LIQUIDITY: float = 1_000.0
+    FEAR_SELLING_MIN_VOLUME_24H: float = 5_000.0
+    FEAR_SELLING_SPIKE_THRESHOLD_PCT: float = 0.05
+    FEAR_SELLING_SPIKE_WINDOW_SECONDS: float = 600.0
+    FEAR_SELLING_MAX_CLUSTER_PCT: float = 0.30
+    FEAR_SELLING_MAX_POSITION_PCT: float = 0.10
+    FEAR_SELLING_KELLY_FRACTION: float = 0.25
+    FEAR_SELLING_EXIT_NO_PRICE: float = 0.95
+    FEAR_SELLING_STOP_YES_PRICE: float = 0.70
+    CAPITAL_ALLOCATION_FEAR_PCT: float = 0.0
+
     # === Two-Sided Inventory Arb ===
     TWO_SIDED_SCAN_INTERVAL: float = 20.0
     TWO_SIDED_MIN_EDGE_PCT: float = 0.015

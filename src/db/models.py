@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     Text,
     Boolean,
+    func,
 )
 from sqlalchemy.orm import declarative_base
 
@@ -292,3 +293,28 @@ class OddsApiCache(Base):
 
     def __repr__(self) -> str:
         return f"<OddsApiCache(id={self.id}, key={self.cache_key[:24]}...)>"
+
+
+class FearPosition(Base):
+    """Tracks positions in fear-selling strategy."""
+
+    __tablename__ = "fear_positions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    condition_id = Column(String, nullable=False, index=True)
+    token_id = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    cluster = Column(String, nullable=False, index=True)
+    side = Column(String, nullable=False, default="NO")
+    entry_price = Column(Float, nullable=False)
+    size_usd = Column(Float, nullable=False)
+    shares = Column(Float, nullable=False)
+    fear_score = Column(Float, nullable=False)
+    yes_price_at_entry = Column(Float, nullable=False)
+    exit_price = Column(Float, nullable=True)
+    realized_pnl = Column(Float, nullable=True)
+    unrealized_pnl = Column(Float, default=0.0)
+    is_open = Column(Boolean, default=True, index=True)
+    entry_trigger = Column(String, nullable=True)  # "scan" | "spike" | "manual"
+    opened_at = Column(DateTime, server_default=func.now())
+    closed_at = Column(DateTime, nullable=True)
