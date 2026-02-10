@@ -102,7 +102,7 @@ class TestFearMarketScanner:
 
     def test_filter_candidates_yes_range(self):
         """Only markets with YES price in the configured range should pass."""
-        scanner = FearMarketScanner()  # default range: 0.05 - 0.65
+        scanner = FearMarketScanner()  # default range: 0.15 - 0.65
         markets = [
             {
                 "condition_id": "a",
@@ -135,8 +135,8 @@ class TestFearMarketScanner:
         ]
         candidates = scanner.filter_candidates(markets)
         ids = [c["condition_id"] for c in candidates]
-        assert "a" in ids  # 0.30 in [0.05, 0.65]
-        assert "d" in ids  # 0.65 in [0.05, 0.65]
+        assert "a" in ids  # 0.30 in [0.15, 0.65]
+        assert "d" in ids  # 0.65 in [0.15, 0.65]
         assert "b" not in ids  # 0.90 too high
         assert "c" not in ids  # 0.03 too low
 

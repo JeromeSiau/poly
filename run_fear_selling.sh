@@ -12,7 +12,7 @@ SCAN_INTERVAL="${2:-${SCAN_INTERVAL:-300}}"
 
 # Fear scoring (overridable via env)
 MIN_FEAR_SCORE="${MIN_FEAR_SCORE:-0.5}"
-MIN_YES_PRICE="${MIN_YES_PRICE:-0.05}"
+MIN_YES_PRICE="${MIN_YES_PRICE:-0.15}"
 MAX_YES_PRICE="${MAX_YES_PRICE:-0.65}"
 
 # Risk limits (overridable via env)

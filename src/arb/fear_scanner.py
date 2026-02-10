@@ -169,7 +169,7 @@ class FearMarketScanner:
 
     def __init__(
         self,
-        min_yes_price: float = 0.05,
+        min_yes_price: float = 0.15,
         max_yes_price: float = 0.65,
         min_liquidity: float = 1000.0,
         min_volume_24h: float = 5000.0,
