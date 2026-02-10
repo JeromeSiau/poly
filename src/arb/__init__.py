@@ -15,6 +15,9 @@ from .two_sided_inventory import (
     InventoryState,
     FillResult,
 )
+from .fear_scanner import FearMarketScanner, FearMarketCandidate
+from .fear_spike_detector import FearSpikeDetector, FearSpike
+from .fear_engine import FearSellingEngine, FearTradeSignal
 
 __all__ = [
     "RealityArbEngine",
@@ -35,4 +38,10 @@ __all__ = [
     "TradeIntent",
     "InventoryState",
     "FillResult",
+    "FearMarketScanner",
+    "FearMarketCandidate",
+    "FearSpikeDetector",
+    "FearSpike",
+    "FearSellingEngine",
+    "FearTradeSignal",
 ]
