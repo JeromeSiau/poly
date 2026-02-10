@@ -104,7 +104,6 @@ class FearClassifier:
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            "temperature": 0,
         }
 
         try:
