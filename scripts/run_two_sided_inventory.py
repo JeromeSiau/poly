@@ -779,11 +779,15 @@ class TwoSidedPaperRecorder:
         edge_realized: Optional[float] = None
         pnl: Optional[float] = None
         exit_price: Optional[float] = None
+        is_open = True
+        closed_at: Optional[datetime] = None
         if intent.side == "SELL":
             pnl = fill.realized_pnl_delta
             if not intent.reason.startswith("settlement_") and intent.reason != "pair_merge":
                 edge_realized = pnl / intent.size_usd if intent.size_usd > 0 else 0.0
             exit_price = fill.fill_price
+            is_open = False
+            closed_at = observation_ts
 
         observation = LiveObservation(
             timestamp=observation_ts,
@@ -804,7 +808,9 @@ class TwoSidedPaperRecorder:
             edge_realized=edge_realized,
             exit_price=exit_price,
             pnl=pnl,
+            is_open=is_open,
             created_at=observation_ts,
+            closed_at=closed_at,
         )
 
         session = get_sync_session(self._database_url)
@@ -813,12 +819,46 @@ class TwoSidedPaperRecorder:
             session.flush()
             trade.observation_id = int(observation.id)
             session.add(trade)
+            # When settling, mark related BUY records as closed
+            if intent.side == "SELL":
+                self._close_buy_records(session, intent.condition_id, closed_at)
             session.commit()
         except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+    def _close_buy_records(
+        self,
+        session: Any,
+        condition_id: str,
+        closed_at: Optional[datetime],
+    ) -> None:
+        """Mark open BUY PaperTrades for a settled condition as closed."""
+        from sqlalchemy import and_
+
+        buy_obs_ids = (
+            session.query(LiveObservation.id)
+            .filter(
+                LiveObservation.match_id == condition_id,
+                LiveObservation.event_type == self._event_type,
+            )
+            .all()
+        )
+        if not buy_obs_ids:
+            return
+        obs_id_list = [row[0] for row in buy_obs_ids]
+        session.query(PaperTrade).filter(
+            and_(
+                PaperTrade.observation_id.in_(obs_id_list),
+                PaperTrade.side == "BUY",
+                PaperTrade.is_open.is_(True),
+            )
+        ).update(
+            {"is_open": False, "closed_at": closed_at},
+            synchronize_session="fetch",
+        )
 
 
 async def fetch_markets(

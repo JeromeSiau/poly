@@ -81,6 +81,8 @@ def list_trades(
                     "pnl": trade.pnl,
                     "edge_theoretical": trade.edge_theoretical,
                     "edge_realized": trade.edge_realized,
+                    "is_open": bool(trade.is_open) if trade.is_open is not None else None,
+                    "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
                 })
 
             # Extra fields from game_state for crypto_minute
@@ -97,6 +99,7 @@ def list_trades(
         pnls = [t["pnl"] for t in trades if t.get("pnl") is not None]
         wins = sum(1 for p in pnls if p > 0)
         losses = sum(1 for p in pnls if p <= 0)
+        still_open = sum(1 for t in trades if t.get("is_open") is True)
 
         return {
             "count": len(trades),
@@ -104,6 +107,7 @@ def list_trades(
             "wins": wins,
             "losses": losses,
             "winrate": round(wins / len(pnls) * 100, 1) if pnls else 0,
+            "still_open": still_open,
             "filters": {"tag": tag, "event_type": event_type, "hours": hours},
             "trades": trades,
         }

@@ -22,6 +22,10 @@ from pathlib import Path
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import json
+from datetime import datetime, timezone
+
+import httpx
 import structlog
 
 structlog.configure(
@@ -104,6 +108,126 @@ def _persist_signal(sig: FearTradeSignal) -> None:
             session.close()
         except Exception:
             pass
+
+
+GAMMA_MARKETS_API = "https://gamma-api.polymarket.com/markets"
+
+
+async def _check_exits(engine: FearSellingEngine) -> int:
+    """Check open FearPositions for exit signals or market resolution.
+
+    Returns number of positions closed.
+    """
+    session = get_sync_session()
+    try:
+        open_positions = (
+            session.query(FearPosition)
+            .filter_by(is_open=True)
+            .all()
+        )
+        if not open_positions:
+            return 0
+
+        # Fetch current prices from Gamma API for all open condition_ids
+        cid_to_pos: dict[str, list[FearPosition]] = {}
+        for pos in open_positions:
+            cid_to_pos.setdefault(pos.condition_id, []).append(pos)
+
+        closed_count = 0
+        now = datetime.now(timezone.utc)
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            cids = list(cid_to_pos.keys())
+            # Fetch in chunks of 20
+            for i in range(0, len(cids), 20):
+                chunk = cids[i:i + 20]
+                try:
+                    params = [("condition_ids", cid) for cid in chunk]
+                    resp = await client.get(GAMMA_MARKETS_API, params=params)
+                    if resp.status_code != 200:
+                        continue
+                    rows = resp.json()
+                except Exception as exc:
+                    logger.warning("fear_exit_fetch_error", error=str(exc))
+                    continue
+
+                if not isinstance(rows, list):
+                    continue
+
+                for raw in rows:
+                    cid = str(raw.get("conditionId", ""))
+                    positions = cid_to_pos.get(cid, [])
+                    if not positions:
+                        continue
+
+                    # Parse outcome prices
+                    try:
+                        prices_raw = raw.get("outcomePrices", [])
+                        if isinstance(prices_raw, str):
+                            prices_raw = json.loads(prices_raw)
+                        outcomes = raw.get("outcomes", [])
+                        if isinstance(outcomes, str):
+                            outcomes = json.loads(outcomes)
+                        if len(prices_raw) < 2 or len(outcomes) < 2:
+                            continue
+
+                        price_map = {}
+                        for outcome, price in zip(outcomes, prices_raw):
+                            price_map[str(outcome)] = float(price)
+                    except (ValueError, TypeError):
+                        continue
+
+                    yes_price = price_map.get("Yes", 0.0)
+                    no_price = price_map.get("No", 0.0)
+
+                    # Check market resolution (prices near 0/1)
+                    is_resolved = (
+                        max(yes_price, no_price) >= 0.985
+                        and min(yes_price, no_price) <= 0.015
+                    )
+
+                    for pos in positions:
+                        should_exit = False
+                        reason = ""
+
+                        if is_resolved:
+                            should_exit = True
+                            reason = f"Market resolved: YES={yes_price:.2f} NO={no_price:.2f}"
+                        else:
+                            should_exit, reason = engine.check_exit(
+                                entry_price=pos.entry_price,
+                                current_no_price=no_price,
+                                current_yes_price=yes_price,
+                            )
+
+                        if should_exit:
+                            exit_price = no_price  # fear selling is always NO side
+                            realized_pnl = (exit_price - pos.entry_price) * pos.shares
+
+                            pos.is_open = False
+                            pos.closed_at = now
+                            pos.exit_price = exit_price
+                            pos.realized_pnl = round(realized_pnl, 4)
+
+                            logger.info(
+                                "fear_position_closed",
+                                condition_id=cid,
+                                title=pos.title,
+                                reason=reason,
+                                entry=pos.entry_price,
+                                exit=exit_price,
+                                pnl=pos.realized_pnl,
+                            )
+                            closed_count += 1
+
+        session.commit()
+        return closed_count
+    except Exception as exc:
+        session.rollback()
+        logger.warning("fear_exit_check_error", error=str(exc))
+        return 0
+    finally:
+        session.close()
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -236,6 +360,11 @@ async def main(args: argparse.Namespace) -> None:
                         )
 
             logger.info("scan_cycle_complete", cycle=cycle, signals=signals_count)
+
+            # Check exit conditions for open positions
+            closed = await _check_exits(engine)
+            if closed:
+                logger.info("fear_exits_triggered", cycle=cycle, closed=closed)
 
         except Exception as exc:
             logger.error("scan_cycle_error", cycle=cycle, error=str(exc))

@@ -36,6 +36,11 @@ from src.arb.sniper_router import SniperRouter, SniperAction
 from src.arb.two_sided_inventory import TradeIntent, FillResult, TwoSidedInventoryEngine
 from src.feeds.odds_api import OddsApiClient, ScoreTracker
 from src.feeds.spike_detector import SpikeDetector
+from scripts.run_two_sided_inventory import (
+    fetch_resolved_conditions,
+    settle_resolved_inventory,
+    ResolvedCondition,
+)
 
 # Lazy import to avoid circular deps at module level
 TwoSidedPaperRecorder: Any = None
@@ -300,6 +305,17 @@ async def execution_loop(
 
             intent = action_to_intent(action, mapper, price=ask_price, size_usd=max_order_usd)
 
+            # Dedup: skip if we already hold this outcome
+            state = engine.get_state(intent.condition_id, intent.outcome)
+            if state.is_open():
+                logger.debug(
+                    "sniper_skip_duplicate",
+                    condition_id=action.condition_id,
+                    outcome=action.outcome,
+                    shares=f"{state.shares:.4f}",
+                )
+                continue
+
             if dry_run:
                 logger.info(
                     "sniper_dry_run",
@@ -341,6 +357,101 @@ async def execution_loop(
             action_queue.task_done()
 
 
+SETTLEMENT_WINNER_MIN_PRICE = 0.985
+SETTLEMENT_LOSER_MAX_PRICE = 0.015
+SETTLEMENT_ENDDATE_GRACE_SECONDS = 300.0
+SETTLEMENT_MAX_HOLD_SECONDS = 24 * 3600  # 24h force-settle
+
+
+async def settlement_loop(
+    client: httpx.AsyncClient,
+    engine: TwoSidedInventoryEngine,
+    paper_recorder: Any,
+    interval: float = 120.0,
+) -> None:
+    """Periodically check open positions for market resolution and settle them."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            inv = engine.get_open_inventory()
+            if not inv:
+                continue
+
+            open_cids = list(inv.keys())
+            now_ts = time.time()
+
+            # Force-settle positions held longer than max hold
+            for cid, by_outcome in inv.items():
+                for outcome, state in by_outcome.items():
+                    if not state.opened_at or not state.shares:
+                        continue
+                    hold_age = now_ts - state.opened_at
+                    if hold_age >= SETTLEMENT_MAX_HOLD_SECONDS:
+                        fill = engine.settle_position(cid, outcome, 0.0, timestamp=now_ts)
+                        if fill.shares > 0:
+                            logger.info(
+                                "sniper_force_settled_timeout",
+                                condition_id=cid[:16],
+                                outcome=outcome,
+                                hold_hours=round(hold_age / 3600, 1),
+                                pnl=round(fill.realized_pnl_delta, 4),
+                            )
+                            if paper_recorder is not None:
+                                intent = TradeIntent(
+                                    condition_id=cid,
+                                    title="",
+                                    outcome=outcome,
+                                    token_id="",
+                                    side="SELL",
+                                    price=0.0,
+                                    size_usd=0.0,
+                                    edge_pct=0.0,
+                                    reason="settlement_timeout",
+                                    timestamp=now_ts,
+                                )
+                                try:
+                                    paper_recorder.persist_fill(
+                                        intent=intent,
+                                        fill=fill,
+                                        snapshot=None,
+                                        fair_prices={outcome: 0.0},
+                                        execution_mode="paper_settlement",
+                                    )
+                                except Exception as exc:
+                                    logger.warning("settle_persist_failed", error=repr(exc))
+
+            # Re-check inventory after timeout settlements
+            inv = engine.get_open_inventory()
+            open_cids = list(inv.keys())
+            if not open_cids:
+                continue
+
+            # Check Gamma API for resolved markets
+            resolved = await fetch_resolved_conditions(
+                client,
+                open_cids,
+                now_ts=now_ts,
+                winner_min_price=SETTLEMENT_WINNER_MIN_PRICE,
+                loser_max_price=SETTLEMENT_LOSER_MAX_PRICE,
+                allow_ended_open=True,
+                enddate_grace_seconds=SETTLEMENT_ENDDATE_GRACE_SECONDS,
+                fetch_chunk_size=40,
+            )
+
+            if resolved:
+                settled = settle_resolved_inventory(
+                    engine,
+                    resolved,
+                    paper_recorder=paper_recorder,
+                    now_ts=now_ts,
+                )
+                if settled:
+                    logger.info("sniper_positions_settled", count=settled, resolved_markets=len(resolved))
+
+        except Exception as exc:
+            logger.warning("settlement_loop_error", error=str(exc))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Event-driven sports sniper")
     p.add_argument("--scores-sports", type=str,
@@ -369,6 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet-usd", type=float, default=200.0)
     p.add_argument("--max-outcome-inv", type=float, default=100.0)
     p.add_argument("--max-market-net", type=float, default=80.0)
+    p.add_argument("--settlement-interval", type=float, default=120.0,
+                    help="Seconds between settlement checks for resolved markets")
     return p
 
 
@@ -442,6 +555,10 @@ async def main() -> None:
                 strategy_tag=args.strategy_tag,
                 paper_recorder=paper_recorder,
                 dry_run=args.dry_run,
+            )),
+            asyncio.create_task(settlement_loop(
+                client, engine, paper_recorder,
+                interval=args.settlement_interval,
             )),
         ]
 

@@ -3,7 +3,7 @@
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     AsyncEngine,
@@ -101,10 +101,30 @@ async def get_session(
 get_async_session = get_session
 
 
+def _migrate_add_columns(connection) -> None:
+    """Add missing columns to existing tables (SQLite-safe)."""
+    insp = inspect(connection)
+    migrations = [
+        ("paper_trades", "is_open", "BOOLEAN DEFAULT 1"),
+        ("paper_trades", "closed_at", "DATETIME"),
+    ]
+    for table, column, col_type in migrations:
+        if table not in insp.get_table_names():
+            continue
+        existing = {c["name"] for c in insp.get_columns(table)}
+        if column not in existing:
+            connection.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            )
+
+
 def init_db(database_url: str = DEFAULT_DATABASE_URL) -> None:
     """Initialize the database by creating all tables."""
     engine = get_sync_engine(database_url)
     Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        _migrate_add_columns(conn)
+        conn.commit()
 
 
 async def init_db_async(database_url: str = DEFAULT_ASYNC_DATABASE_URL) -> None:
@@ -112,6 +132,7 @@ async def init_db_async(database_url: str = DEFAULT_ASYNC_DATABASE_URL) -> None:
     engine = get_async_engine(database_url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_add_columns)
 
 
 async def close_db_async() -> None:

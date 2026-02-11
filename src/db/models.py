@@ -271,7 +271,9 @@ class PaperTrade(Base):
     exit_price = Column(Float, nullable=True)
     pnl = Column(Float, nullable=True)
 
+    is_open = Column(Boolean, default=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
 
     def __repr__(self) -> str:
         return f"<PaperTrade(id={self.id}, side={self.side}, size={self.size}, pnl={self.pnl})>"
