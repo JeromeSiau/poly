@@ -1555,7 +1555,7 @@ def main():
         fear_positions = []
 
     # --- Tabs ---
-    tab_maker, tab_sniper, tab_crypto, tab_weather, tab_fear, tab_two_sided = st.tabs(
+    tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear, tab_two_sided = st.tabs(
         ["Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling", "Two-Sided"]
     )
 
