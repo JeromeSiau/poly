@@ -159,7 +159,9 @@ class Settings(BaseSettings):
     PERPLEXITY_API_KEY: str = ""
 
     # === Crypto 15-Minute Strategies ===
-    CRYPTO_MINUTE_ENABLED: bool = True
+    # Backtest showed +1% time_decay edge, but taker fees (Jan 2026, up to 3%)
+    # completely negate it. Disabled until maker-order approach is viable.
+    CRYPTO_MINUTE_ENABLED: bool = False
     CRYPTO_MINUTE_SCAN_INTERVAL: float = 3.0
     CRYPTO_MINUTE_SYMBOLS: str = "BTCUSDT,ETHUSDT"
     CRYPTO_MINUTE_BINANCE_URL: str = "https://api.binance.com/api/v3/ticker/price"
@@ -169,12 +171,14 @@ class Settings(BaseSettings):
     CRYPTO_MINUTE_MIN_ENTRY_TIME: int = 120
     CRYPTO_MINUTE_MAX_ENTRY_TIME: int = 300
 
-    # Time Decay strategy
-    CRYPTO_MINUTE_TD_THRESHOLD: float = 0.88
+    # Time Decay strategy — backtest: +1% edge at 0.75-0.94, negative >0.95
+    CRYPTO_MINUTE_TD_THRESHOLD: float = 0.80
     CRYPTO_MINUTE_TD_MIN_GAP_PCT: float = 0.3
+    CRYPTO_MINUTE_TD_MAX_PRICE: float = 0.95  # avoid overpriced ultra-favourites
 
-    # Long Vol strategy
-    CRYPTO_MINUTE_LV_THRESHOLD: float = 0.15
+    # Long Vol strategy — backtest: negative EV at all thresholds, disabled
+    CRYPTO_MINUTE_LV_ENABLED: bool = False
+    CRYPTO_MINUTE_LV_THRESHOLD: float = 0.05
     CRYPTO_MINUTE_LV_MAX_GAP_PCT: float = 0.5
 
     # Paper trading

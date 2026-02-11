@@ -325,7 +325,9 @@ class CryptoMinuteEngine:
 
         # Strategy thresholds
         self.td_threshold = settings.CRYPTO_MINUTE_TD_THRESHOLD
+        self.td_max_price = settings.CRYPTO_MINUTE_TD_MAX_PRICE
         self.td_min_gap_pct = settings.CRYPTO_MINUTE_TD_MIN_GAP_PCT
+        self.lv_enabled = settings.CRYPTO_MINUTE_LV_ENABLED
         self.lv_threshold = settings.CRYPTO_MINUTE_LV_THRESHOLD
         self.lv_max_gap_pct = settings.CRYPTO_MINUTE_LV_MAX_GAP_PCT
 
@@ -383,8 +385,8 @@ class CryptoMinuteEngine:
 
             # Find cheap and expensive sides
             for side, price in market.outcome_prices.items():
-                # Time Decay: buy expensive side
-                if price >= self.td_threshold:
+                # Time Decay: buy expensive side (but not ultra-favourites >95c)
+                if self.td_threshold <= price <= self.td_max_price:
                     entered = self._entered_markets.get(slug, set())
                     if "time_decay" not in entered:
                         if gap_pct >= self.td_min_gap_pct:
@@ -400,8 +402,8 @@ class CryptoMinuteEngine:
                             )
                             opportunities.append(opp)
 
-                # Long Vol: buy cheap side
-                if price <= self.lv_threshold:
+                # Long Vol: buy cheap side (disabled by default — negative EV)
+                if self.lv_enabled and price <= self.lv_threshold:
                     entered = self._entered_markets.get(slug, set())
                     if "long_vol" not in entered:
                         if gap_pct <= self.lv_max_gap_pct:
@@ -613,6 +615,8 @@ class CryptoMinuteEngine:
             symbols=settings.CRYPTO_MINUTE_SYMBOLS,
             scan_interval=scan_interval,
             td_threshold=self.td_threshold,
+            td_max_price=self.td_max_price,
+            lv_enabled=self.lv_enabled,
             lv_threshold=self.lv_threshold,
         )
 
