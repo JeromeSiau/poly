@@ -198,12 +198,12 @@ class Settings(BaseSettings):
     WEATHER_ORACLE_PAPER_FILE: str = "data/weather_oracle_paper.jsonl"
 
     # Days-to-resolution filter (0x594ed trades 3-7 days before resolution)
-    WEATHER_ORACLE_MIN_DAYS_TO_RESOLUTION: float = 2.0
+    WEATHER_ORACLE_MIN_DAYS_TO_RESOLUTION: float = 1.0
     WEATHER_ORACLE_MAX_DAYS_TO_RESOLUTION: float = 8.0
 
     # Type 3 – Lottery YES (cheap tail bets on correct YES outcomes)
-    WEATHER_ORACLE_MAX_ENTRY_PRICE: float = 0.05  # max 5¢ entry
-    WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE: float = 0.90  # 90% confidence
+    WEATHER_ORACLE_MAX_ENTRY_PRICE: float = 0.12  # max 12¢ entry
+    WEATHER_ORACLE_MIN_FORECAST_CONFIDENCE: float = 0.65  # 65% confidence
     WEATHER_ORACLE_PAPER_SIZE_USD: float = 3.0  # $3 per lottery ticket
 
     # Type 4 – Lottery NO (the 0x594ed strategy: buy NO at <5¢ when market is wrong)
