@@ -23,6 +23,7 @@ SNIPER_EVENT_TYPE = "sniper_sports"
 CRYPTO_MINUTE_EVENT_TYPE = "crypto_minute"
 WEATHER_ORACLE_EVENT_TYPE = "weather_oracle"
 CRYPTO_MAKER_EVENT_TYPE = "crypto_maker"
+TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
 
@@ -1344,6 +1345,106 @@ def _render_crypto_maker_tab(
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def _render_td_maker_tab(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> None:
+    """Render the TD Maker (passive time-decay) tab content."""
+    rows = extract_two_sided_trade_rows(
+        observations, trades, event_types={TD_MAKER_EVENT_TYPE}
+    )
+
+    if not rows:
+        st.info("No TD maker trades found. Run: ./run_crypto_td_maker.sh")
+        return
+
+    tags = available_two_sided_tags(rows)
+    selected_tag = st.selectbox("Strategy Tag", ["All"] + tags, key="td_maker_tag_select")
+    rows_view = rows if selected_tag == "All" else [r for r in rows if r["strategy_tag"] == selected_tag]
+
+    # Separate entry (BUY) and settlement (SELL) rows.
+    buys = [r for r in rows_view if r["side"] == "BUY"]
+    sells = [r for r in rows_view if r["side"] == "SELL"]
+    sell_wins = sum(1 for r in sells if (r.get("pnl") or 0) > 0)
+    pnls = [r["pnl"] for r in rows_view if r.get("pnl")]
+    total_pnl = sum(pnls)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Fills (entries)", len(buys))
+    c2.metric("Settled", len(sells))
+    c3.metric("Win Rate", f"{sell_wins / len(sells):.1%}" if sells else "N/A")
+    c4.metric("Realized P&L", f"${total_pnl:,.2f}")
+
+    # Open positions (entries without matching settlement).
+    settled_cids = {r.get("condition_id") for r in sells}
+    open_entries = [r for r in buys if r.get("condition_id") not in settled_cids]
+    if open_entries:
+        open_exposure = sum(r["size_usd"] for r in open_entries)
+        c5, c6 = st.columns(2)
+        c5.metric("Open Positions", len(open_entries))
+        c6.metric("Open Exposure", f"${open_exposure:,.2f}")
+
+    st.divider()
+
+    # Cumulative P&L
+    st.subheader("Cumulative P&L")
+    sorted_rows = sorted(rows_view, key=lambda r: r.get("timestamp") or datetime.min)
+    if sorted_rows:
+        mk_df = pd.DataFrame(sorted_rows).sort_values("timestamp")
+        mk_df["cumulative_pnl"] = mk_df["pnl"].cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=mk_df["timestamp"], y=mk_df["cumulative_pnl"],
+            mode="lines+markers", name="Cumulative P&L",
+            line=dict(color="#2ecc71", width=2), marker=dict(size=5),
+        ))
+        fig.update_layout(
+            xaxis_title="Time", yaxis_title="Cumulative P&L ($)",
+            height=350, template="plotly_dark",
+            margin=dict(l=50, r=50, t=30, b=50),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # Win/loss breakdown by entry price bucket
+    if sells:
+        st.subheader("Performance by Entry Price")
+        sell_data = []
+        for r in sells:
+            entry = r.get("fill_price", 0)
+            bucket = f"{int(entry * 20) * 5}c"  # 5c buckets
+            sell_data.append({"bucket": bucket, "won": (r.get("pnl") or 0) > 0, "pnl": r.get("pnl", 0)})
+        sell_df = pd.DataFrame(sell_data)
+        if not sell_df.empty:
+            bucket_stats = sell_df.groupby("bucket").agg(
+                n=("won", "count"),
+                wins=("won", "sum"),
+                total_pnl=("pnl", "sum"),
+            ).reset_index()
+            bucket_stats["win_rate"] = (bucket_stats["wins"] / bucket_stats["n"]).map(lambda x: f"{x:.1%}")
+            bucket_stats["total_pnl"] = bucket_stats["total_pnl"].map(lambda x: f"${x:,.2f}")
+            st.dataframe(bucket_stats, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # Recent trades
+    st.subheader("Recent Trades")
+    recent = sorted(rows_view, key=lambda r: r.get("timestamp") or datetime.min, reverse=True)[:50]
+    if recent:
+        df = pd.DataFrame([{
+            "Time": r["timestamp"].strftime("%m-%d %H:%M") if isinstance(r.get("timestamp"), datetime) else "N/A",
+            "Tag": r.get("strategy_tag", ""),
+            "Title": str(r.get("title", ""))[:50],
+            "Outcome": r.get("outcome", ""),
+            "Side": r.get("side", ""),
+            "Price": f"{r['fill_price']:.3f}",
+            "Size": f"${r['size_usd']:.2f}",
+            "P&L": f"${r['pnl']:.2f}" if r.get("pnl") else "",
+        } for r in recent])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def _render_fear_selling_tab(positions: list) -> None:
     """Render the Fear Selling tab content."""
     if not positions:
@@ -1555,8 +1656,8 @@ def main():
         fear_positions = []
 
     # --- Tabs ---
-    tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear, tab_two_sided = st.tabs(
-        ["Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling", "Two-Sided"]
+    tab_td_maker, tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear, tab_two_sided = st.tabs(
+        ["TD Maker", "Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling", "Two-Sided"]
     )
 
     # ===== TWO-SIDED TAB =====
@@ -1840,6 +1941,10 @@ def main():
     # ===== WEATHER ORACLE TAB =====
     with tab_weather:
         _render_weather_oracle_tab(observations, trades)
+
+    # ===== TD MAKER TAB =====
+    with tab_td_maker:
+        _render_td_maker_tab(observations, trades)
 
     # ===== CRYPTO MAKER TAB =====
     with tab_maker:

@@ -186,6 +186,10 @@ class Settings(BaseSettings):
     CRYPTO_MINUTE_PAPER_CAPITAL: float = 1000.0
     CRYPTO_MINUTE_PAPER_FILE: str = "data/crypto_minute_paper.jsonl"
 
+    # === Kalshi ===
+    KALSHI_API_KEY_ID: str = ""
+    KALSHI_PRIVATE_KEY_PATH: str = ""  # path to RSA PEM file
+
     # === Combinatorial Arbitrage ===
     COMBO_ARB_SCAN_INTERVAL: float = 60.0
     COMBO_ARB_MIN_PROFIT: float = 0.05
