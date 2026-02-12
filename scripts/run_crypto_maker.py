@@ -44,13 +44,13 @@ from src.arb.two_sided_inventory import (
     TradeIntent,
     TwoSidedInventoryEngine,
 )
+from src.execution import TradeManager, TradeIntent as ExecTradeIntent
 from src.feeds.binance import BinanceFeed
 from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEvent
 
 # Reuse crypto market discovery from the two-sided runner.
 from scripts.run_two_sided_inventory import (
     CRYPTO_SYMBOL_TO_SLUG,
-    TwoSidedPaperRecorder,
     fetch_crypto_markets,
     parse_json_list,
     _to_float,
@@ -91,7 +91,7 @@ class CryptoMaker:
         binance: BinanceFeed,
         polymarket: PolymarketFeed,
         user_feed: Optional[PolymarketUserFeed],
-        paper_recorder: Optional[TwoSidedPaperRecorder],
+        manager: Optional[TradeManager] = None,
         symbols: list[str],
         paper_mode: bool = True,
         maker_loop_interval: float = 0.5,
@@ -108,7 +108,7 @@ class CryptoMaker:
         self.binance = binance
         self.polymarket = polymarket
         self.user_feed = user_feed
-        self.paper_recorder = paper_recorder
+        self.manager = manager
         self.symbols = symbols
         self.paper_mode = paper_mode
         self.maker_loop_interval = maker_loop_interval
@@ -230,7 +230,7 @@ class CryptoMaker:
                     del self.active_orders[oid]
 
             # Settle open positions before removing market data.
-            settled_count += self._settle_market(cid, now)
+            settled_count += await self._settle_market(cid, now)
 
             try:
                 await self.polymarket.unsubscribe_market(cid)
@@ -257,7 +257,7 @@ class CryptoMaker:
     # Settlement
     # ------------------------------------------------------------------
 
-    def _settle_market(self, condition_id: str, now: float) -> int:
+    async def _settle_market(self, condition_id: str, now: float) -> int:
         """Settle all open positions for an expired market.
 
         Strategy:
@@ -295,7 +295,7 @@ class CryptoMaker:
                     )
                     if fill.shares > 0:
                         settled += 1
-                        self._persist_settlement(
+                        await self._persist_settlement(
                             condition_id, outcome, slug, fill, 0.50, now,
                         )
                 pair_cost = states[out_a].avg_price + states[out_b].avg_price
@@ -330,7 +330,7 @@ class CryptoMaker:
             )
             if fill.shares > 0:
                 settled += 1
-                self._persist_settlement(
+                await self._persist_settlement(
                     condition_id, outcome, slug, fill, settlement_price, now,
                 )
                 logger.info(
@@ -344,7 +344,7 @@ class CryptoMaker:
 
         return settled
 
-    def _persist_settlement(
+    async def _persist_settlement(
         self,
         condition_id: str,
         outcome: str,
@@ -353,28 +353,16 @@ class CryptoMaker:
         settlement_price: float,
         now: float,
     ) -> None:
-        """Persist a settlement fill to the paper recorder."""
-        if self.paper_recorder is None:
+        """Persist a settlement via TradeManager."""
+        if self.manager is None:
             return
-        intent = TradeIntent(
-            condition_id=condition_id,
-            title=str(self.known_markets.get(condition_id, {}).get("question", "")),
-            outcome=outcome,
-            token_id=self.market_tokens.get((condition_id, outcome), ""),
-            side="SELL",
-            price=settlement_price,
-            size_usd=fill.shares * settlement_price,
-            edge_pct=0.0,
-            reason="settlement_closed_market",
-            timestamp=now,
-        )
+        won = settlement_price >= 0.5
         try:
-            self.paper_recorder.persist_fill(
-                intent=intent,
-                fill=fill,
-                snapshot=None,
-                fair_prices={outcome: settlement_price},
-                execution_mode="maker_ws_settlement",
+            await self.manager.settle(
+                condition_id=condition_id,
+                outcome=outcome,
+                settlement_price=settlement_price,
+                won=won,
             )
         except Exception as exc:
             logger.warning("persist_settlement_failed", error=str(exc))
@@ -553,19 +541,6 @@ class CryptoMaker:
                 paper=True,
                 trigger="bid_drop",
             )
-            if self.paper_recorder is not None:
-                snapshot = self._build_snapshot(order.condition_id)
-                fair = self.engine.compute_fair_prices(snapshot) if snapshot else {}
-                try:
-                    self.paper_recorder.persist_fill(
-                        intent=order.intent,
-                        fill=fill,
-                        snapshot=snapshot,
-                        fair_prices=fair,
-                        execution_mode="maker_ws_paper",
-                    )
-                except Exception as exc:
-                    logger.warning("persist_fill_failed", error=str(exc))
 
         # Phase 2b: execute cancels in parallel.
         if cancel_ids:
@@ -603,25 +578,26 @@ class CryptoMaker:
         return self.active_orders.get(order_id) if order_id else None
 
     async def _place_order(self, intent: TradeIntent) -> Optional[str]:
-        """Place a GTC order (or simulate in paper mode). Returns order_id or None."""
-        if self.paper_mode:
-            self._paper_order_counter += 1
-            order_id = f"paper_{self._paper_order_counter}"
-        else:
-            if self.executor is None:
-                return None
-            resp = await self.executor.place_order(
-                token_id=intent.token_id,
-                side=intent.side,
-                size=intent.size_usd,
-                price=intent.price,
-                outcome=intent.outcome,
-                order_type="GTC",
-            )
-            order_id = resp.get("orderID") or resp.get("id") or ""
-            if not order_id or resp.get("status") == "ERROR":
-                logger.warning("order_place_failed", response=resp)
-                return None
+        """Place a GTC order via TradeManager. Returns order_id or None."""
+        if not self.manager:
+            return None
+
+        exec_intent = ExecTradeIntent(
+            condition_id=intent.condition_id,
+            token_id=intent.token_id,
+            outcome=intent.outcome,
+            side=intent.side,
+            price=intent.price,
+            size_usd=intent.size_usd,
+            reason=intent.reason,
+            title=intent.title,
+            edge_pct=intent.edge_pct,
+            timestamp=intent.timestamp,
+        )
+        pending = await self.manager.place(exec_intent)
+        if not pending.order_id:
+            return None
+        order_id = pending.order_id
 
         active = ActiveOrder(
             order_id=order_id,
@@ -701,19 +677,6 @@ class CryptoMaker:
                     age_seconds=round(now - order.placed_at, 1),
                     paper=True,
                 )
-                if self.paper_recorder is not None:
-                    snapshot = self._build_snapshot(order.condition_id)
-                    fair = self.engine.compute_fair_prices(snapshot) if snapshot else {}
-                    try:
-                        self.paper_recorder.persist_fill(
-                            intent=order.intent,
-                            fill=fill,
-                            snapshot=snapshot,
-                            fair_prices=fair,
-                            execution_mode="maker_ws_paper",
-                        )
-                    except Exception as exc:
-                        logger.warning("persist_fill_failed", error=str(exc))
 
         for oid in filled_ids:
             order = self.active_orders.pop(oid, None)
@@ -761,19 +724,6 @@ class CryptoMaker:
                     age_seconds=round(now - order.placed_at, 1),
                     paper=False,
                 )
-                if self.paper_recorder is not None:
-                    snapshot = self._build_snapshot(order.condition_id)
-                    fair = self.engine.compute_fair_prices(snapshot) if snapshot else {}
-                    try:
-                        self.paper_recorder.persist_fill(
-                            intent=order.intent,
-                            fill=fill,
-                            snapshot=snapshot,
-                            fair_prices=fair,
-                            execution_mode="maker_ws_live",
-                        )
-                    except Exception as exc:
-                        logger.warning("persist_fill_failed", error=str(exc))
                 key = (order.condition_id, order.outcome, order.intent.side)
                 if self._orders_by_key.get(key) == order_id:
                     del self._orders_by_key[key]
@@ -811,20 +761,6 @@ class CryptoMaker:
                 price=matched_order.intent.price,
                 status=evt.status,
             )
-
-            if self.paper_recorder is not None:
-                snapshot = self._build_snapshot(matched_order.condition_id)
-                fair = self.engine.compute_fair_prices(snapshot) if snapshot else {}
-                try:
-                    self.paper_recorder.persist_fill(
-                        intent=matched_order.intent,
-                        fill=fill,
-                        snapshot=snapshot,
-                        fair_prices=fair,
-                        execution_mode="maker_ws_live_rt",
-                    )
-                except Exception as exc:
-                    logger.warning("persist_fill_failed", error=str(exc))
 
             key = (matched_order.condition_id, matched_order.outcome, matched_order.intent.side)
             if self._orders_by_key.get(key) == matched_id:
@@ -915,6 +851,8 @@ class CryptoMaker:
                     await self.user_feed.disconnect()
                 await self.polymarket.disconnect()
                 await self.binance.disconnect()
+                if self.manager:
+                    await self.manager.close()
 
 
 # ---------------------------------------------------------------------------
@@ -938,12 +876,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-hold-seconds", type=float, default=900.0, help="Max hold before stale exit")
     p.add_argument("--strategy-tag", type=str, default="crypto_maker")
     p.add_argument("--db-url", type=str, default=settings.DATABASE_URL)
-    p.add_argument(
-        "--persist-paper",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Persist fills to DB",
-    )
     return p
 
 
@@ -980,17 +912,17 @@ async def main() -> None:
             api_passphrase=settings.POLYMARKET_API_PASSPHRASE or None,
         )
 
-    paper_recorder: Optional[TwoSidedPaperRecorder] = None
-    if args.persist_paper:
-        paper_recorder = TwoSidedPaperRecorder(
-            args.db_url,
-            strategy_tag=strategy_tag,
-            run_id=run_id,
-            min_edge_pct=args.min_edge,
-            exit_edge_pct=args.min_edge / 2,
-            event_type=CRYPTO_MAKER_EVENT_TYPE,
-        )
-        paper_recorder.bootstrap()
+    manager = TradeManager(
+        executor=executor,
+        strategy="CryptoMaker",
+        paper=paper_mode,
+        db_url=args.db_url,
+        event_type=CRYPTO_MAKER_EVENT_TYPE,
+        run_id=run_id,
+        notify_bids=True,
+        notify_fills=True,
+        notify_closes=True,
+    )
 
     binance = BinanceFeed(symbols=symbols)
     polymarket = PolymarketFeed()
@@ -1014,7 +946,7 @@ async def main() -> None:
         binance=binance,
         polymarket=polymarket,
         user_feed=user_feed,
-        paper_recorder=paper_recorder,
+        manager=manager,
         symbols=symbols,
         paper_mode=paper_mode,
         maker_loop_interval=args.maker_interval,
