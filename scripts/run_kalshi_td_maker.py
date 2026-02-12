@@ -38,22 +38,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import httpx
 import structlog
 
 _project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(_project_root))
 
 from config.settings import settings
+from src.execution import TradeManager, TradeIntent
+from src.feeds.kalshi_executor import (
+    KalshiExecutor,
+    KALSHI_API_BASE,
+    KALSHI_DEMO_API_BASE,
+)
 
 logger = structlog.get_logger()
 
-# Kalshi API endpoints
-KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_DEMO_API_BASE = "https://demo-api.kalshi.co/trade-api/v2"
-
 # Crypto event ticker prefixes
 KALSHI_CRYPTO_PREFIXES = ["KXBTCD", "KXETHD"]
+
+KALSHI_TD_MAKER_EVENT_TYPE = "kalshi_td_maker"
 
 
 # ---------------------------------------------------------------------------
@@ -79,18 +82,6 @@ class KalshiStrike:
 
 
 @dataclass(slots=True)
-class PassiveBid:
-    """A GTC bid placed on a Kalshi strike."""
-    order_id: str
-    ticker: str
-    event_ticker: str
-    side: str  # "yes"
-    price_cents: int
-    count: int  # number of contracts
-    placed_at: float
-
-
-@dataclass(slots=True)
 class OpenPosition:
     """A filled passive bid held until settlement."""
     ticker: str
@@ -109,14 +100,16 @@ class KalshiTDMaker:
 
     Scans hourly crypto events, finds the strike with YES price closest
     to target_bid, places a GTC limit buy, and holds to settlement.
+
+    Uses KalshiExecutor for API calls and TradeManager for persistence
+    and Telegram notifications.
     """
 
     def __init__(
         self,
         *,
-        api_base: str = KALSHI_API_BASE,
-        api_key_id: str = "",
-        private_key_pem: str = "",
+        executor: KalshiExecutor,
+        manager: TradeManager,
         target_bid_cents: int = 75,
         min_bid_cents: int = 65,
         max_bid_cents: int = 85,
@@ -126,9 +119,8 @@ class KalshiTDMaker:
         scan_interval: float = 120.0,
         symbols: list[str] | None = None,
     ) -> None:
-        self.api_base = api_base
-        self.api_key_id = api_key_id
-        self.private_key_pem = private_key_pem
+        self.executor = executor
+        self.manager = manager
         self.target_bid_cents = target_bid_cents
         self.min_bid_cents = min_bid_cents
         self.max_bid_cents = max_bid_cents
@@ -140,72 +132,10 @@ class KalshiTDMaker:
 
         # State
         self.known_events: set[str] = set()
-        self.active_bids: dict[str, PassiveBid] = {}  # ticker -> bid
         self.positions: dict[str, OpenPosition] = {}  # ticker -> position
 
-        # Stats
+        # Stats (mirror from manager for status display)
         self.total_fills: int = 0
-        self.total_wins: int = 0
-        self.total_losses: int = 0
-        self.realized_pnl: float = 0.0
-
-        self._client: Optional[httpx.AsyncClient] = None
-        self._paper_order_counter: int = 0
-
-    # ------------------------------------------------------------------
-    # API helpers
-    # ------------------------------------------------------------------
-
-    def _auth_headers(self, method: str, path: str) -> dict[str, str]:
-        """Generate RSA-signed auth headers for Kalshi API."""
-        if self.paper_mode or not self.api_key_id or not self.private_key_pem:
-            return {}
-
-        import hashlib
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
-
-        timestamp_ms = str(int(time.time() * 1000))
-        message = f"{timestamp_ms}{method.upper()}{path}"
-
-        private_key = serialization.load_pem_private_key(
-            self.private_key_pem.encode(), password=None
-        )
-        signature = private_key.sign(
-            message.encode(),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=hashes.SHA256.digest_size,
-            ),
-            hashes.SHA256(),
-        )
-
-        import base64
-        return {
-            "KALSHI-ACCESS-KEY": self.api_key_id,
-            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
-        }
-
-    async def _api_get(self, path: str, params: dict | None = None) -> Any:
-        """GET request to Kalshi API."""
-        if self._client is None:
-            return None
-        url = f"{self.api_base}{path}"
-        headers = self._auth_headers("GET", path)
-        resp = await self._client.get(url, params=params, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
-
-    async def _api_post(self, path: str, body: dict) -> Any:
-        """POST request to Kalshi API."""
-        if self._client is None:
-            return None
-        url = f"{self.api_base}{path}"
-        headers = self._auth_headers("POST", path)
-        resp = await self._client.post(url, json=body, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
 
     # ------------------------------------------------------------------
     # Market scanning
@@ -224,7 +154,7 @@ class KalshiTDMaker:
         """Find new hourly crypto events and place passive bids on best strikes."""
         for prefix in self.symbols:
             try:
-                data = await self._api_get("/markets", params={
+                data = await self.executor.api_get("/markets", params={
                     "event_ticker": prefix,
                     "status": "open",
                     "limit": 200,
@@ -260,7 +190,7 @@ class KalshiTDMaker:
                         "kalshi_events_scanned",
                         prefix=prefix,
                         new_events=new_events,
-                        active_bids=len(self.active_bids),
+                        pending=len(self.manager.get_pending_orders()),
                         positions=len(self.positions),
                     )
 
@@ -285,11 +215,11 @@ class KalshiTDMaker:
         return best
 
     async def _place_bid(self, strike: dict) -> None:
-        """Place a GTC limit buy YES on the selected strike."""
+        """Place a GTC limit buy YES on the selected strike via TradeManager."""
         ticker = strike.get("ticker", "")
         event_ticker = strike.get("event_ticker", "")
 
-        if ticker in self.active_bids or ticker in self.positions:
+        if ticker in self.positions:
             return
 
         # Check exposure limit
@@ -299,20 +229,36 @@ class KalshiTDMaker:
         if current_exposure >= self.max_total_exposure_usd:
             return
 
-        now = time.time()
+        yes_ask = strike.get("yes_ask", 0) or 0
+        price_01 = self.target_bid_cents / 100.0
+        size_usd = self.order_size_contracts * price_01
 
+        intent = TradeIntent(
+            condition_id=event_ticker,
+            token_id=ticker,
+            outcome="yes",
+            side="BUY",
+            price=price_01,
+            size_usd=size_usd,
+            reason="kalshi_td_maker",
+            title=f"{event_ticker} YES @{self.target_bid_cents}c x{self.order_size_contracts}",
+            edge_pct=0.0,
+        )
+
+        pending = await self.manager.place(intent)
+
+        if not pending.order_id:
+            return
+
+        # In paper mode, simulate immediate fill if ask <= target
         if self.paper_mode:
-            self._paper_order_counter += 1
-            order_id = f"kalshi_paper_{self._paper_order_counter}"
-            # In paper mode, simulate immediate fill if ask <= target
-            yes_ask = strike.get("yes_ask", 0) or 0
             if yes_ask <= self.target_bid_cents and yes_ask > 0:
                 pos = OpenPosition(
                     ticker=ticker,
                     event_ticker=event_ticker,
                     entry_price_cents=yes_ask,
                     count=self.order_size_contracts,
-                    filled_at=now,
+                    filled_at=time.time(),
                 )
                 self.positions[ticker] = pos
                 self.total_fills += 1
@@ -323,37 +269,7 @@ class KalshiTDMaker:
                     count=self.order_size_contracts,
                 )
                 return
-        else:
-            body = {
-                "ticker": ticker,
-                "side": "yes",
-                "action": "buy",
-                "type": "limit",
-                "yes_price": self.target_bid_cents,
-                "count": self.order_size_contracts,
-                "time_in_force": "good_till_canceled",
-                "post_only": True,
-            }
-            try:
-                resp = await self._api_post("/portfolio/orders", body)
-                order_id = resp.get("order", {}).get("order_id", "")
-                if not order_id:
-                    logger.warning("kalshi_order_failed", response=resp)
-                    return
-            except Exception as exc:
-                logger.warning("kalshi_order_error", ticker=ticker, error=str(exc))
-                return
 
-        bid = PassiveBid(
-            order_id=order_id,
-            ticker=ticker,
-            event_ticker=event_ticker,
-            side="yes",
-            price_cents=self.target_bid_cents,
-            count=self.order_size_contracts,
-            placed_at=now,
-        )
-        self.active_bids[ticker] = bid
         logger.info(
             "kalshi_bid_placed",
             ticker=ticker,
@@ -380,41 +296,52 @@ class KalshiTDMaker:
 
     async def _check_fills_live(self) -> None:
         """Check if any pending bids have been filled via API."""
-        if not self.active_bids:
+        pending = self.manager.get_pending_orders()
+        if not pending:
             return
 
+        # Build a reverse map: ticker -> order_id for matching fills
+        ticker_to_oid: dict[str, str] = {}
+        for oid, p in pending.items():
+            ticker_to_oid[p.intent.token_id] = oid
+
         try:
-            data = await self._api_get("/portfolio/fills", params={"limit": 100})
+            data = await self.executor.api_get("/portfolio/fills", params={"limit": 100})
             if not data:
                 return
             fills = data.get("fills", [])
         except Exception:
             return
 
-        filled_tickers: list[str] = []
         for fill in fills:
             ticker = fill.get("ticker", "")
-            if ticker in self.active_bids:
-                bid = self.active_bids[ticker]
-                pos = OpenPosition(
-                    ticker=ticker,
-                    event_ticker=bid.event_ticker,
-                    entry_price_cents=fill.get("yes_price", bid.price_cents),
-                    count=fill.get("count", bid.count),
-                    filled_at=time.time(),
-                )
-                self.positions[ticker] = pos
-                self.total_fills += 1
-                filled_tickers.append(ticker)
-                logger.info(
-                    "kalshi_fill_detected",
-                    ticker=ticker,
-                    price_cents=pos.entry_price_cents,
-                    count=pos.count,
-                )
+            if ticker not in ticker_to_oid:
+                continue
 
-        for t in filled_tickers:
-            del self.active_bids[t]
+            oid = ticker_to_oid[ticker]
+            p = pending[oid]
+            entry_cents = fill.get("yes_price", self.target_bid_cents)
+            count = fill.get("count", self.order_size_contracts)
+
+            pos = OpenPosition(
+                ticker=ticker,
+                event_ticker=p.intent.condition_id,
+                entry_price_cents=entry_cents,
+                count=count,
+                filled_at=time.time(),
+            )
+            self.positions[ticker] = pos
+            self.total_fills += 1
+
+            # Remove from manager's pending
+            await self.manager.cancel(oid)
+
+            logger.info(
+                "kalshi_fill_detected",
+                ticker=ticker,
+                price_cents=pos.entry_price_cents,
+                count=pos.count,
+            )
 
     async def _check_settlements(self) -> None:
         """Check if any held positions have settled."""
@@ -422,7 +349,7 @@ class KalshiTDMaker:
 
         for ticker, pos in self.positions.items():
             try:
-                data = await self._api_get(f"/markets/{ticker}")
+                data = await self.executor.api_get(f"/markets/{ticker}")
                 if not data:
                     continue
                 mkt = data.get("market", data)
@@ -431,25 +358,16 @@ class KalshiTDMaker:
 
                 if status in ("settled", "finalized") and result:
                     won = result == "yes"
-                    if won:
-                        pnl = pos.count * (100 - pos.entry_price_cents) / 100.0
-                        self.total_wins += 1
-                    else:
-                        pnl = -pos.count * pos.entry_price_cents / 100.0
-                        self.total_losses += 1
+                    settlement_price = 1.0 if won else 0.0
 
-                    self.realized_pnl += pnl
+                    await self.manager.settle(
+                        condition_id=pos.event_ticker,
+                        outcome="yes",
+                        settlement_price=settlement_price,
+                        won=won,
+                    )
                     settled_tickers.append(ticker)
 
-                    logger.info(
-                        "kalshi_settled",
-                        ticker=ticker,
-                        won=won,
-                        entry_cents=pos.entry_price_cents,
-                        pnl=round(pnl, 4),
-                        total_pnl=round(self.realized_pnl, 4),
-                        record=f"{self.total_wins}W-{self.total_losses}L",
-                    )
             except Exception as exc:
                 logger.debug("kalshi_settlement_check_error", ticker=ticker, error=str(exc))
 
@@ -466,20 +384,21 @@ class KalshiTDMaker:
             exposure = sum(
                 p.count * p.entry_price_cents / 100.0 for p in self.positions.values()
             )
-            winrate = (
-                self.total_wins / self.total_fills * 100
-                if self.total_fills > 0
-                else 0
-            )
+            stats = self.manager.get_stats()
+            total_fills = self.total_fills
+            wins = stats["wins"]
+            losses = stats["losses"]
+            pnl = stats["total_pnl"]
+            winrate = wins / total_fills * 100 if total_fills > 0 else 0
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
                 f"events={len(self.known_events)} "
-                f"bids={len(self.active_bids)} "
+                f"pending={stats['pending_orders']} "
                 f"positions={len(self.positions)} "
-                f"fills={self.total_fills} "
-                f"record={self.total_wins}W-{self.total_losses}L "
+                f"fills={total_fills} "
+                f"record={wins}W-{losses}L "
                 f"winrate={winrate:.1f}% "
-                f"pnl=${self.realized_pnl:+.2f} "
+                f"pnl=${pnl:+.2f} "
                 f"exposure=${exposure:.0f}"
             )
 
@@ -488,10 +407,7 @@ class KalshiTDMaker:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        timeout = httpx.Timeout(20.0, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
-            self._client = client
-
+        try:
             logger.info(
                 "kalshi_td_maker_started",
                 paper=self.paper_mode,
@@ -506,6 +422,9 @@ class KalshiTDMaker:
                 self.fill_check_loop(),
                 self.status_loop(),
             )
+        finally:
+            await self.executor.close()
+            await self.manager.close()
 
 
 # ---------------------------------------------------------------------------
@@ -547,10 +466,23 @@ async def main() -> None:
 
     api_key_id = args.api_key_id or getattr(settings, "KALSHI_API_KEY_ID", "")
 
-    maker = KalshiTDMaker(
+    executor = KalshiExecutor(
         api_base=api_base,
         api_key_id=api_key_id,
         private_key_pem=private_key_pem,
+    )
+
+    manager = TradeManager(
+        executor=executor,
+        strategy="KalshiTDMaker",
+        paper=paper_mode,
+        db_url=settings.DATABASE_URL,
+        event_type=KALSHI_TD_MAKER_EVENT_TYPE,
+    )
+
+    maker = KalshiTDMaker(
+        executor=executor,
+        manager=manager,
         target_bid_cents=args.target_bid,
         min_bid_cents=args.min_bid,
         max_bid_cents=args.max_bid,
