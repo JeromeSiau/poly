@@ -54,12 +54,12 @@ from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEv
 # Reuse crypto market discovery infra.
 from scripts.run_two_sided_inventory import (
     CRYPTO_SYMBOL_TO_SLUG,
-    TwoSidedPaperRecorder,
     fetch_crypto_markets,
     parse_json_list,
     _to_float,
     _first_event_slug,
 )
+from src.execution import TradeManager, TradeIntent
 
 logger = structlog.get_logger()
 
@@ -112,7 +112,7 @@ class CryptoTDMaker:
         executor: Optional[PolymarketExecutor],
         polymarket: PolymarketFeed,
         user_feed: Optional[PolymarketUserFeed],
-        paper_recorder: Optional[TwoSidedPaperRecorder],
+        manager: Optional[TradeManager] = None,
         symbols: list[str],
         target_bid: float = 0.75,
         max_bid: float = 0.85,
@@ -126,7 +126,7 @@ class CryptoTDMaker:
         self.executor = executor
         self.polymarket = polymarket
         self.user_feed = user_feed
-        self.paper_recorder = paper_recorder
+        self.manager = manager
         self.symbols = symbols
         self.target_bid = target_bid
         self.max_bid = max_bid
@@ -145,7 +145,6 @@ class CryptoTDMaker:
         self._orders_by_cid_outcome: dict[tuple[str, str], str] = {}
         self.positions: dict[str, OpenPosition] = {}  # cid -> position
         self._http_client: Optional[httpx.AsyncClient] = None
-        self._paper_order_counter: int = 0
         self._cycle_count: int = 0
         self._last_status_time: float = 0.0
 
@@ -368,47 +367,26 @@ class CryptoTDMaker:
     async def _place_order(
         self, cid: str, outcome: str, token_id: str, price: float, now: float
     ) -> Optional[str]:
-        """Place a GTC buy at the given price."""
-        if self.paper_mode:
-            self._paper_order_counter += 1
-            order_id = f"td_paper_{self._paper_order_counter}"
-        else:
-            if self.executor is None:
-                return None
-            resp = await self.executor.place_order(
-                token_id=token_id,
-                side="BUY",
-                size=self.order_size_usd,
-                price=price,
-                outcome=outcome,
-                order_type="GTC",
-            )
-            order_id = resp.get("orderID") or resp.get("id") or ""
-            if not order_id or resp.get("status") == "ERROR":
-                logger.warning("td_order_failed", response=resp)
-                return None
-
+        """Place a GTC buy at the given price via TradeManager."""
+        if not self.manager:
+            return None
+        slug = _first_event_slug(self.known_markets.get(cid, {}))
+        intent = TradeIntent(
+            condition_id=cid, token_id=token_id, outcome=outcome,
+            side="BUY", price=price, size_usd=self.order_size_usd,
+            reason="td_maker_passive", title=slug, timestamp=now,
+        )
+        pending = await self.manager.place(intent)
+        if not pending.order_id:
+            return None
         order = PassiveOrder(
-            order_id=order_id,
-            condition_id=cid,
-            outcome=outcome,
-            token_id=token_id,
-            price=price,
-            size_usd=self.order_size_usd,
+            order_id=pending.order_id, condition_id=cid, outcome=outcome,
+            token_id=token_id, price=price, size_usd=self.order_size_usd,
             placed_at=now,
         )
-        self.active_orders[order_id] = order
-        self._orders_by_cid_outcome[(cid, outcome)] = order_id
-
-        logger.info(
-            "td_bid_placed",
-            condition_id=cid[:16],
-            outcome=outcome,
-            price=price,
-            size=self.order_size_usd,
-            paper=self.paper_mode,
-        )
-        return order_id
+        self.active_orders[pending.order_id] = order
+        self._orders_by_cid_outcome[(cid, outcome)] = pending.order_id
+        return pending.order_id
 
     # ------------------------------------------------------------------
     # Fill detection
@@ -581,59 +559,15 @@ class CryptoTDMaker:
             record=f"{self.total_wins}W-{self.total_losses}L",
         )
 
-        # Persist to DB.
-        if self.paper_recorder:
-            from src.arb.two_sided_inventory import TradeIntent, FillResult
-            entry_intent = TradeIntent(
-                condition_id=pos.condition_id,
-                title="",
-                outcome=pos.outcome,
-                token_id=pos.token_id,
-                side="BUY",
-                price=pos.entry_price,
-                size_usd=pos.size_usd,
-                edge_pct=0.01,
-                reason="td_maker_passive",
-                timestamp=pos.filled_at,
-            )
-            settle_price = 1.0 if won else 0.0
-            settle_intent = TradeIntent(
-                condition_id=pos.condition_id,
-                title="",
-                outcome=pos.outcome,
-                token_id=pos.token_id,
-                side="SELL",
-                price=settle_price,
-                size_usd=pos.shares * settle_price,
-                edge_pct=0.0,
-                reason="td_maker_settlement",
-                timestamp=now,
-            )
-            entry_fill = FillResult(
-                filled=True,
-                shares=pos.shares,
-                avg_price=pos.entry_price,
-                realized_pnl_delta=0.0,
-            )
-            settle_fill = FillResult(
-                filled=True,
-                shares=pos.shares,
-                avg_price=settle_price,
-                realized_pnl_delta=pnl,
-            )
+        # Manager handles DB persistence + Telegram notification
+        if self.manager:
             try:
-                self.paper_recorder.persist_fill(
-                    intent=entry_intent, fill=entry_fill, snapshot=None,
-                    fair_prices={pos.outcome: pos.entry_price},
-                    execution_mode="td_maker_entry",
-                )
-                self.paper_recorder.persist_fill(
-                    intent=settle_intent, fill=settle_fill, snapshot=None,
-                    fair_prices={pos.outcome: settle_price},
-                    execution_mode="td_maker_settle",
-                )
-            except Exception as exc:
-                logger.warning("td_persist_failed", error=str(exc))
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.manager.settle(
+                    pos.condition_id, pos.outcome, 1.0 if won else 0.0, won,
+                ))
+            except RuntimeError:
+                pass
 
     # ------------------------------------------------------------------
     # Run
@@ -682,6 +616,8 @@ class CryptoTDMaker:
                 if self.user_feed:
                     await self.user_feed.disconnect()
                 await self.polymarket.disconnect()
+                if self.manager:
+                    await self.manager.close()
 
 
 # ---------------------------------------------------------------------------
@@ -709,11 +645,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--maker-interval", type=float, default=0.5, help="Maker loop tick interval")
     p.add_argument("--strategy-tag", type=str, default="crypto_td_maker")
     p.add_argument("--db-url", type=str, default=settings.DATABASE_URL)
-    p.add_argument(
-        "--persist-paper",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     return p
 
 
@@ -738,17 +669,17 @@ async def main() -> None:
             api_passphrase=settings.POLYMARKET_API_PASSPHRASE or None,
         )
 
-    paper_recorder: Optional[TwoSidedPaperRecorder] = None
-    if args.persist_paper:
-        paper_recorder = TwoSidedPaperRecorder(
-            args.db_url,
-            strategy_tag=strategy_tag,
-            run_id=run_id,
-            min_edge_pct=0.01,
-            exit_edge_pct=0.0,
-            event_type=TD_MAKER_EVENT_TYPE,
-        )
-        paper_recorder.bootstrap()
+    manager = TradeManager(
+        executor=executor,
+        strategy="CryptoTDMaker",
+        paper=paper_mode,
+        db_url=args.db_url,
+        event_type=TD_MAKER_EVENT_TYPE,
+        run_id=run_id,
+        notify_bids=True,
+        notify_fills=True,
+        notify_closes=True,
+    )
 
     polymarket = PolymarketFeed()
 
@@ -768,7 +699,7 @@ async def main() -> None:
         executor=executor,
         polymarket=polymarket,
         user_feed=user_feed,
-        paper_recorder=paper_recorder,
+        manager=manager,
         symbols=symbols,
         target_bid=args.target_bid,
         max_bid=args.max_bid,
