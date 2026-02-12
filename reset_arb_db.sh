@@ -84,7 +84,7 @@ row_count() {
   fi
 }
 
-TARGET_TABLES=("paper_trades" "live_observations")
+TARGET_TABLES=("paper_trades" "live_observations" "fear_positions")
 if [[ "$KEEP_CACHE" -eq 0 ]]; then
   TARGET_TABLES+=("odds_api_cache")
 fi
