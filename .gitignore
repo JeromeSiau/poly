@@ -92,3 +92,7 @@ Thumbs.db
 data/*.csv
 data/raw/
 reports/
+
+#AI
+.claude
+docs

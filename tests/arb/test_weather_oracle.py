@@ -275,6 +275,7 @@ def _make_engine(**overrides):
     engine._daily_spend = overrides.get("_daily_spend", 0.0)
     engine._daily_spend_date = overrides.get("_daily_spend_date", "")
     engine._stats = overrides.get("_stats", {"trades": 0, "wins": 0, "pnl": 0.0})
+    engine.manager = overrides.get("manager", None)
     return engine
 
 

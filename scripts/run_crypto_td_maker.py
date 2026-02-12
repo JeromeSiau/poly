@@ -392,14 +392,40 @@ class CryptoTDMaker:
     # Fill detection
     # ------------------------------------------------------------------
 
+    # Paper fill tuning: how long at best bid before simulated fill.
+    PAPER_FILL_TIMEOUT: float = 30.0
+    # Maximum spread for time-based fill to trigger.
+    PAPER_FILL_MAX_SPREAD: float = 0.03
+
     def _check_fills_paper(self, now: float) -> None:
-        """Paper mode: fill when WS ask <= our bid price."""
+        """Paper mode: simulate maker fills via three conditions.
+
+        1. Ask crossed: ask <= our bid price (original).
+        2. Bid-through: bid dropped below our price — our level was consumed.
+        3. Time-at-bid: order at best bid with tight spread for PAPER_FILL_TIMEOUT
+           seconds — simulates queue priority on an active book.
+        """
         filled_ids: list[str] = []
         for order_id, order in self.active_orders.items():
-            _, _, ask, _ = self.polymarket.get_best_levels(
+            bid, _, ask, _ = self.polymarket.get_best_levels(
                 order.condition_id, order.outcome
             )
+            # 1. Ask crossed down to our bid.
             if ask is not None and ask <= order.price:
+                self._process_fill(order, now)
+                filled_ids.append(order_id)
+            # 2. Bid dropped below our price — our level got consumed.
+            elif bid is not None and bid < order.price:
+                self._process_fill(order, now)
+                filled_ids.append(order_id)
+            # 3. Sitting at best bid with tight spread long enough.
+            elif (
+                bid is not None
+                and ask is not None
+                and bid == order.price
+                and (ask - bid) <= self.PAPER_FILL_MAX_SPREAD
+                and (now - order.placed_at) >= self.PAPER_FILL_TIMEOUT
+            ):
                 self._process_fill(order, now)
                 filled_ids.append(order_id)
 

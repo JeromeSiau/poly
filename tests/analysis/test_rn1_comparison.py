@@ -1,4 +1,5 @@
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -144,7 +145,7 @@ def test_fetch_rn1_activity_stops_gracefully_on_400(monkeypatch: pytest.MonkeyPa
                 return _Resp(
                     [
                         {
-                            "timestamp": 1770570981,
+                            "timestamp": int(time.time()) - 600,
                             "conditionId": "cond-1",
                             "type": "TRADE",
                             "usdcSize": 12.0,
@@ -202,7 +203,7 @@ def test_fetch_rn1_activity_treats_missing_type_as_trade(monkeypatch: pytest.Mon
                 return _Resp(
                     [
                         {
-                            "timestamp": 1770570981,
+                            "timestamp": int(time.time()) - 600,
                             "conditionId": "cond-2",
                             # no `type` field on purpose
                             "side": "BUY",
