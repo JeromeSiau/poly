@@ -11,6 +11,10 @@ import asyncio
 
 import structlog
 
+from src.utils.logging import configure_logging
+
+configure_logging()
+
 from config.settings import settings
 from src.screening.market_screener import MarketScreener
 from src.screening.llm_researcher import LLMResearcher

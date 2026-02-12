@@ -17,23 +17,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 import structlog
 
+from src.utils.logging import configure_logging
+
+configure_logging()
+
 try:
     import uvloop
 except ImportError:
     uvloop = None
-
-_project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(_project_root))
 
 from config.settings import settings
 from src.arb.polymarket_executor import PolymarketExecutor
@@ -48,14 +47,9 @@ from src.execution import TradeManager, TradeIntent as ExecTradeIntent
 from src.feeds.binance import BinanceFeed
 from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEvent
 
-# Reuse crypto market discovery from the two-sided runner.
-from scripts.run_two_sided_inventory import (
-    CRYPTO_SYMBOL_TO_SLUG,
-    fetch_crypto_markets,
-    parse_json_list,
-    _to_float,
-    _first_event_slug,
-)
+# Crypto market discovery and parsing utilities.
+from src.utils.crypto_markets import CRYPTO_SYMBOL_TO_SLUG, fetch_crypto_markets
+from src.utils.parsing import parse_json_list, _to_float, _first_event_slug
 
 logger = structlog.get_logger()
 
@@ -902,15 +896,7 @@ async def main() -> None:
 
     executor: Optional[PolymarketExecutor] = None
     if not paper_mode:
-        executor = PolymarketExecutor(
-            host=settings.POLYMARKET_CLOB_HTTP,
-            chain_id=settings.POLYMARKET_CHAIN_ID,
-            private_key=settings.POLYMARKET_PRIVATE_KEY,
-            funder=settings.POLYMARKET_WALLET_ADDRESS,
-            api_key=settings.POLYMARKET_API_KEY or None,
-            api_secret=settings.POLYMARKET_API_SECRET or None,
-            api_passphrase=settings.POLYMARKET_API_PASSPHRASE or None,
-        )
+        executor = PolymarketExecutor.from_settings()
 
     manager = TradeManager(
         executor=executor,

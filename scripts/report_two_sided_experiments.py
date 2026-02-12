@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,8 +17,6 @@ from typing import Any, Optional
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.db.models import LiveObservation, PaperTrade
 

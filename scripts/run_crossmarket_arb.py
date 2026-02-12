@@ -16,24 +16,13 @@ This script:
 import asyncio
 import argparse
 import signal
-import sys
-from pathlib import Path
 from typing import Any, Optional
-
-# Add project root to path for imports
-_project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(_project_root))
 
 import structlog
 
-# Setup logging
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.dev.ConsoleRenderer()
-    ]
-)
+from src.utils.logging import configure_logging
+
+configure_logging()
 logger = structlog.get_logger()
 
 from config.settings import settings

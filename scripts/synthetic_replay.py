@@ -15,15 +15,10 @@ Notes:
 import argparse
 import asyncio
 import json
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-
-# Add project root to path for imports
-_project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(_project_root))
 
 from src.arb.reality_arb import RealityArbEngine
 from src.feeds.base import FeedEvent

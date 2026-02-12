@@ -424,7 +424,8 @@ def test_outcome_confidence_threshold_low():
     assert conf == 0.0
 
 
-def test_engine_enter_paper_trade():
+@pytest.mark.asyncio
+async def test_engine_enter_paper_trade():
     """Engine should record a paper trade from a signal."""
     market = WeatherMarket(
         condition_id="0xabc",
@@ -449,7 +450,7 @@ def test_engine_enter_paper_trade():
 
     engine = _make_engine()
 
-    trade = engine.enter_paper_trade(signal)
+    trade = await engine.enter_paper_trade(signal)
     assert trade is not None
     assert trade.city == "Dallas"
     assert trade.entry_price == 0.03
@@ -460,7 +461,8 @@ def test_engine_enter_paper_trade():
     assert len(engine._open_trades) == 1
 
 
-def test_engine_daily_spend_limit():
+@pytest.mark.asyncio
+async def test_engine_daily_spend_limit():
     """Engine should respect daily spend limit."""
     from datetime import datetime, timezone
 
@@ -488,7 +490,7 @@ def test_engine_daily_spend_limit():
         side="BUY_YES", trade_type="lottery",
     )
 
-    result = engine.enter_paper_trade(signal)
+    result = await engine.enter_paper_trade(signal)
     assert result is None  # exceeded daily limit
 
 
@@ -549,7 +551,8 @@ def test_engine_yield_no_signal():
     assert yield_no[0].entry_price == 0.99  # 1 - 0.01
 
 
-def test_engine_yield_sizing():
+@pytest.mark.asyncio
+async def test_engine_yield_sizing():
     """Yield trades should use yield_size, lottery should use paper_size."""
     engine = _make_engine(yield_enabled=True, yield_size=50.0, paper_size=3.0)
 
@@ -569,7 +572,7 @@ def test_engine_yield_sizing():
     yield_yes = [s for s in signals if s.trade_type == "yield_yes"]
     assert len(yield_yes) == 1
 
-    trade = engine.enter_paper_trade(yield_yes[0])
+    trade = await engine.enter_paper_trade(yield_yes[0])
     assert trade is not None
     assert trade.size_usd == 50.0
 
@@ -710,7 +713,7 @@ async def test_full_cycle_scan_evaluate_enter():
 
     # Enter a yield YES trade
     yield_yes = [s for s in signals if s.trade_type == "yield_yes"][0]
-    trade = engine.enter_paper_trade(yield_yes)
+    trade = await engine.enter_paper_trade(yield_yes)
     assert trade is not None
     assert trade.side == "BUY_YES"
     assert trade.size_usd == 50.0
@@ -870,7 +873,8 @@ def test_lottery_no_skips_when_forecast_agrees_with_market():
     assert len(lottery_no) == 0  # NO confidence = 0, should not trigger
 
 
-def test_lottery_no_sizing():
+@pytest.mark.asyncio
+async def test_lottery_no_sizing():
     """Lottery NO trades should use lottery_no_size."""
     engine = _make_engine(lottery_no_enabled=True, lottery_no_size=5.0)
 
@@ -890,7 +894,7 @@ def test_lottery_no_sizing():
     lottery_no = [s for s in signals if s.trade_type == "lottery_no"]
     assert len(lottery_no) == 1
 
-    trade = engine.enter_paper_trade(lottery_no[0])
+    trade = await engine.enter_paper_trade(lottery_no[0])
     assert trade is not None
     assert trade.size_usd == 5.0
     assert trade.side == "BUY_NO"

@@ -13,13 +13,10 @@ Usage:
 import argparse
 import json
 import re
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 import pandas as pd

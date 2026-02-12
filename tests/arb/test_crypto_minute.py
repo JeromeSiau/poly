@@ -265,7 +265,7 @@ class TestCryptoMinuteEngine:
         # First scan
         opps1 = await engine.scan_once()
         for opp in opps1:
-            engine.enter_paper_trade(opp)
+            await engine.enter_paper_trade(opp)
 
         # Second scan - same market
         opps2 = await engine.scan_once()
@@ -274,7 +274,8 @@ class TestCryptoMinuteEngine:
         entered_strategies = engine._entered_markets.get("btc-updown-15m-123", set())
         assert new_strategies.isdisjoint(entered_strategies)
 
-    def test_enter_paper_trade(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_enter_paper_trade(self, tmp_path):
         engine = self._make_engine(tmp_path)
         market = _make_market()
 
@@ -289,7 +290,7 @@ class TestCryptoMinuteEngine:
             potential_profit=0.92,
         )
 
-        trade = engine.enter_paper_trade(opp)
+        trade = await engine.enter_paper_trade(opp)
         assert trade.strategy == "long_vol"
         assert trade.side == "Down"
         assert trade.entry_price == 0.08

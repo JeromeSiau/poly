@@ -20,6 +20,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src.utils.logging import configure_logging
+
+configure_logging()
+
 from config.settings import settings
 from src.arb.no_bet_scanner import NoBetScanner
 

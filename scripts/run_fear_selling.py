@@ -16,11 +16,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
-import sys
-from pathlib import Path
-
-# Add project root to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
 from datetime import datetime, timezone
@@ -28,13 +23,9 @@ from datetime import datetime, timezone
 import httpx
 import structlog
 
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.dev.ConsoleRenderer(),
-    ]
-)
+from src.utils.logging import configure_logging
+
+configure_logging()
 logger = structlog.get_logger()
 
 from config.settings import settings
@@ -229,36 +220,32 @@ async def _check_exits(
                             # Settle via TradeManager for Telegram + LiveObservation
                             if manager is not None:
                                 try:
-                                    won = realized_pnl >= 0
-                                    # Record settlement in unified DB
-                                    if manager.recorder is not None:
-                                        settle_intent = ExecTradeIntent(
-                                            condition_id=cid,
-                                            token_id=pos.token_id or "",
-                                            outcome=pos.side,  # "No"
-                                            side="SELL",
-                                            price=exit_price,
-                                            size_usd=pos.shares * exit_price,
-                                            reason=f"fear_exit:{reason}",
-                                            title=pos.title or "",
-                                            edge_pct=0.0,
-                                        )
-                                        settle_fill = ExecFillResult(
-                                            filled=True,
-                                            shares=pos.shares,
-                                            avg_price=exit_price,
-                                            pnl_delta=realized_pnl,
-                                        )
-                                        manager.recorder.record_settle(
-                                            intent=settle_intent,
-                                            fill=settle_fill,
-                                            fair_prices={pos.side: exit_price},
-                                            extra_state={
-                                                "cluster": pos.cluster,
-                                                "fear_score": pos.fear_score,
-                                            },
-                                        )
-                                    await manager.settle(cid, pos.side, exit_price, won)
+                                    settle_intent = ExecTradeIntent(
+                                        condition_id=cid,
+                                        token_id=pos.token_id or "",
+                                        outcome=pos.side,  # "No"
+                                        side="SELL",
+                                        price=exit_price,
+                                        size_usd=pos.shares * exit_price,
+                                        reason=f"fear_exit:{reason}",
+                                        title=pos.title or "",
+                                        edge_pct=0.0,
+                                    )
+                                    settle_fill = ExecFillResult(
+                                        filled=True,
+                                        shares=pos.shares,
+                                        avg_price=exit_price,
+                                        pnl_delta=realized_pnl,
+                                    )
+                                    await manager.record_settle_direct(
+                                        intent=settle_intent,
+                                        fill=settle_fill,
+                                        fair_prices={pos.side: exit_price},
+                                        extra_state={
+                                            "cluster": pos.cluster,
+                                            "fear_score": pos.fear_score,
+                                        },
+                                    )
                                 except Exception as exc:
                                     logger.warning(
                                         "fear_settle_manager_error",
@@ -302,23 +289,13 @@ async def main(args: argparse.Namespace) -> None:
 
     # --- Executor (only in autopilot with a private key) ----------------
     executor = None
-    if args.autopilot and settings.POLYMARKET_PRIVATE_KEY:
+    if args.autopilot:
         try:
-            executor = PolymarketExecutor(
-                host=settings.POLYMARKET_CLOB_HTTP,
-                chain_id=settings.POLYMARKET_CHAIN_ID,
-                private_key=settings.POLYMARKET_PRIVATE_KEY,
-                funder=settings.POLYMARKET_WALLET_ADDRESS,
-                api_key=settings.POLYMARKET_API_KEY,
-                api_secret=settings.POLYMARKET_API_SECRET,
-                api_passphrase=settings.POLYMARKET_API_PASSPHRASE,
-            )
+            executor = PolymarketExecutor.from_settings()
             logger.info("polymarket_executor_ready")
         except Exception as exc:
             logger.error("polymarket_executor_init_failed", error=str(exc))
             executor = None
-    elif args.autopilot:
-        logger.warning("autopilot_requested_but_no_private_key")
 
     # --- LLM classifier (GPT-5-nano, optional) --------------------------
     classifier = None
@@ -408,24 +385,22 @@ async def main(args: argparse.Namespace) -> None:
                             title=signal_result.title,
                             edge_pct=signal_result.edge_pct,
                         )
-                        if manager.recorder is not None:
-                            shares = signal_result.size_usd / signal_result.price if signal_result.price > 0 else 0.0
-                            exec_fill = ExecFillResult(
-                                filled=True,
-                                shares=shares,
-                                avg_price=signal_result.price,
-                            )
-                            manager.recorder.record_fill(
-                                intent=exec_intent,
-                                fill=exec_fill,
-                                fair_prices={signal_result.outcome: signal_result.price},
-                                execution_mode="paper" if not args.autopilot else "live",
-                                extra_state={
-                                    "cluster": signal_result.cluster,
-                                    "fear_score": signal_result.fear_score,
-                                },
-                            )
-                        await manager.notify_bid(exec_intent)
+                        shares = signal_result.size_usd / signal_result.price if signal_result.price > 0 else 0.0
+                        exec_fill = ExecFillResult(
+                            filled=True,
+                            shares=shares,
+                            avg_price=signal_result.price,
+                        )
+                        await manager.record_fill_direct(
+                            intent=exec_intent,
+                            fill=exec_fill,
+                            fair_prices={signal_result.outcome: signal_result.price},
+                            execution_mode="paper" if not args.autopilot else "live",
+                            extra_state={
+                                "cluster": signal_result.cluster,
+                                "fear_score": signal_result.fear_score,
+                            },
+                        )
                     except Exception as exc:
                         logger.warning("fear_manager_record_error", error=str(exc))
 

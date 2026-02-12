@@ -51,6 +51,25 @@ class PolymarketExecutor:
         self._api_passphrase = api_passphrase
         self._creds_ready = False
 
+    @classmethod
+    def from_settings(cls) -> "PolymarketExecutor":
+        """Build executor from global settings.
+
+        Raises ConfigError if credentials are missing.
+        """
+        from config.settings import settings
+        from config.validators import validate_polymarket_credentials
+        validate_polymarket_credentials()
+        return cls(
+            host=settings.POLYMARKET_CLOB_HTTP,
+            chain_id=settings.POLYMARKET_CHAIN_ID,
+            private_key=settings.POLYMARKET_PRIVATE_KEY,
+            funder=settings.POLYMARKET_WALLET_ADDRESS,
+            api_key=settings.POLYMARKET_API_KEY or None,
+            api_secret=settings.POLYMARKET_API_SECRET or None,
+            api_passphrase=settings.POLYMARKET_API_PASSPHRASE or None,
+        )
+
     def _ensure_creds(self) -> None:
         if self._creds_ready:
             return
@@ -197,7 +216,8 @@ class PolymarketExecutor:
                 params["market"] = market
             orders = self._client.get_orders(**params)
             return orders if isinstance(orders, list) else []
-        except Exception:
+        except Exception as exc:
+            logger.warning("polymarket_get_orders_failed", error=str(exc))
             return []
 
     async def get_open_orders(self, market: str = "") -> list[dict[str, Any]]:

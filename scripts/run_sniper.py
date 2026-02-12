@@ -19,16 +19,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import sys
 import time
 import uuid
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 import structlog
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.utils.logging import configure_logging
+
+configure_logging()
 
 from config.settings import Settings
 from src.analysis.event_condition_mapper import EventConditionMapper
@@ -359,14 +359,12 @@ async def execution_loop(
                                 shares=fill.shares,
                                 avg_price=fill.fill_price,
                             )
-                            if manager.recorder is not None:
-                                manager.recorder.record_fill(
-                                    intent=exec_intent,
-                                    fill=exec_fill,
-                                    fair_prices={intent.outcome: intent.price},
-                                    execution_mode="paper",
-                                )
-                            await manager.notify_bid(exec_intent)
+                            await manager.record_fill_direct(
+                                intent=exec_intent,
+                                fill=exec_fill,
+                                fair_prices={intent.outcome: intent.price},
+                                execution_mode="paper",
+                            )
                         except Exception as exc:
                             logger.warning("paper_db_persist_failed", error=repr(exc))
         except Exception as exc:
@@ -434,14 +432,11 @@ async def settlement_loop(
                                     pnl_delta=fill.realized_pnl_delta,
                                 )
                                 try:
-                                    if manager.recorder is not None:
-                                        manager.recorder.record_settle(
-                                            intent=exec_intent,
-                                            fill=exec_fill,
-                                            fair_prices={outcome: 0.0},
-                                        )
-                                    won = fill.realized_pnl_delta >= 0
-                                    await manager.settle(cid, outcome, 0.0, won)
+                                    await manager.record_settle_direct(
+                                        intent=exec_intent,
+                                        fill=exec_fill,
+                                        fair_prices={outcome: 0.0},
+                                    )
                                 except Exception as exc:
                                     logger.warning("settle_persist_failed", error=repr(exc))
 

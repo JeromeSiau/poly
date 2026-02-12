@@ -13,7 +13,6 @@ import argparse
 import csv
 import json
 import re
-import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,9 +20,7 @@ from typing import Any, Iterable, Optional
 
 import httpx
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from src.analysis.rn1_comparison import (  # noqa: E402
+from src.analysis.rn1_comparison import (
     DEFAULT_RN1_WALLET,
     ActivityEvent,
     build_rn1_transaction_report,

@@ -17,24 +17,13 @@ This script:
 import asyncio
 import argparse
 import signal
-import sys
-from pathlib import Path
 from typing import Any, Optional
-
-# Add project root to path for imports
-_project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(_project_root))
 
 import structlog
 
-# Setup logging
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.dev.ConsoleRenderer()
-    ]
-)
+from src.utils.logging import configure_logging
+
+configure_logging()
 logger = structlog.get_logger()
 
 from config.settings import settings
@@ -153,23 +142,11 @@ class RealityArbBot:
 
     async def _init_executor(self) -> None:
         """Initialize Polymarket executor if credentials are configured."""
-        if not settings.POLYMARKET_PRIVATE_KEY or not settings.POLYMARKET_WALLET_ADDRESS:
-            logger.warning("polymarket_executor_not_configured")
-            return
-
         try:
-            self.engine.executor = PolymarketExecutor(
-                host=settings.POLYMARKET_CLOB_HTTP,
-                chain_id=settings.POLYMARKET_CHAIN_ID,
-                private_key=settings.POLYMARKET_PRIVATE_KEY,
-                funder=settings.POLYMARKET_WALLET_ADDRESS,
-                api_key=settings.POLYMARKET_API_KEY or None,
-                api_secret=settings.POLYMARKET_API_SECRET or None,
-                api_passphrase=settings.POLYMARKET_API_PASSPHRASE or None,
-            )
+            self.engine.executor = PolymarketExecutor.from_settings()
             logger.info("polymarket_executor_initialized")
         except Exception as e:
-            logger.error("polymarket_executor_init_failed", error=str(e))
+            logger.warning("polymarket_executor_not_configured", error=str(e))
 
     async def _init_telegram(self) -> None:
         """Initialize Telegram bot if configured."""

@@ -10,10 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.analysis.rn1_comparison import DEFAULT_RN1_WALLET, build_comparison_report
 

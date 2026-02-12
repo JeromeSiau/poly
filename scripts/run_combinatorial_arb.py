@@ -9,6 +9,10 @@ import asyncio
 
 import structlog
 
+from src.utils.logging import configure_logging
+
+configure_logging()
+
 from config.settings import settings
 from src.arb.dependency_detector import DependencyDetector
 

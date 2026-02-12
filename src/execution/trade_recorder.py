@@ -13,22 +13,12 @@ from typing import Any, Optional
 import structlog
 
 from src.db.database import get_sync_session, init_db
+from src.exceptions import PersistenceError
 from src.db.models import LiveObservation, PaperTrade
 from src.execution.models import TradeIntent, FillResult
+from src.utils.parsing import _ensure_sync_db_url as _ensure_sync_url
 
 logger = structlog.get_logger()
-
-
-def _ensure_sync_url(database_url: str) -> str:
-    """Strip async driver suffix (e.g. sqlite+aiosqlite -> sqlite)."""
-    if not database_url:
-        return "sqlite:///data/arb.db"
-    if "://" not in database_url:
-        return database_url
-    scheme, suffix = database_url.split("://", 1)
-    if "+" in scheme:
-        scheme = scheme.split("+", 1)[0]
-    return f"{scheme}://{suffix}"
 
 
 class TradeRecorder:
@@ -175,9 +165,9 @@ class TradeRecorder:
                 self._close_buy_records(session, intent.condition_id, closed_at)
             session.commit()
             return int(observation.id)
-        except Exception:
+        except Exception as exc:
             session.rollback()
-            raise
+            raise PersistenceError(str(exc)) from exc
         finally:
             session.close()
 

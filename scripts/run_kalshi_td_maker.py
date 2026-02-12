@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -40,8 +39,9 @@ from typing import Any, Optional
 
 import structlog
 
-_project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(_project_root))
+from src.utils.logging import configure_logging
+
+configure_logging()
 
 from config.settings import settings
 from src.execution import TradeManager, TradeIntent

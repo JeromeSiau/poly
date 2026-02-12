@@ -12,12 +12,12 @@ Usage:
 
 import argparse
 import asyncio
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import structlog
+
+from src.utils.logging import configure_logging
+
+configure_logging()
 
 from config.settings import settings
 from src.arb.weather_oracle import WeatherOracleEngine, WEATHER_ORACLE_EVENT_TYPE

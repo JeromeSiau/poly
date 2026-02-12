@@ -18,15 +18,11 @@ Usage:
 
 import argparse
 import json
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 
 import httpx
 import structlog
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logger = structlog.get_logger()
 

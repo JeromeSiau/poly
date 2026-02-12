@@ -11,12 +11,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.analysis.rn1_comparison import DEFAULT_RN1_WALLET, build_rn1_transaction_report
 

@@ -668,7 +668,7 @@ class WeatherOracleEngine:
             return self.lottery_no_size
         return self.paper_size  # lottery YES
 
-    def enter_paper_trade(self, signal: WeatherSignal) -> Optional[WeatherPaperTrade]:
+    async def enter_paper_trade(self, signal: WeatherSignal) -> Optional[WeatherPaperTrade]:
         """Record a paper trade entry."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._daily_spend_date != today:
@@ -705,7 +705,7 @@ class WeatherOracleEngine:
         self._daily_spend += size
 
         # Persist entry via TradeManager
-        self._record_entry(trade)
+        await self._record_entry(trade)
 
         logger.info(
             "weather_paper_trade_entered",
@@ -776,7 +776,7 @@ class WeatherOracleEngine:
                 self._stats["wins"] += 1
             self._stats["pnl"] += trade.pnl_usd
 
-            self._save_trade(trade)
+            await self._save_trade(trade)
             resolved.append(trade)
 
             logger.info(
@@ -800,9 +800,9 @@ class WeatherOracleEngine:
             "confidence": trade.confidence,
         }
 
-    def _record_entry(self, trade: WeatherPaperTrade) -> None:
-        """Persist entry via TradeManager recorder + Telegram + JSONL backup."""
-        if self.manager and self.manager.recorder:
+    async def _record_entry(self, trade: WeatherPaperTrade) -> None:
+        """Persist entry via TradeManager recorder + Telegram."""
+        if self.manager:
             from src.execution.models import FillResult, TradeIntent
 
             intent = TradeIntent(
@@ -822,27 +822,17 @@ class WeatherOracleEngine:
                 shares=trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0.0,
                 avg_price=trade.entry_price,
             )
-            try:
-                self.manager.recorder.record_fill(
-                    intent=intent,
-                    fill=fill,
-                    fair_prices={trade.outcome: trade.entry_price},
-                    execution_mode="paper",
-                    extra_state=self._extra_state(trade),
-                )
-            except Exception as exc:
-                logger.warning("record_entry_failed", trade_id=trade.id, error=str(exc))
+            await self.manager.record_fill_direct(
+                intent=intent,
+                fill=fill,
+                fair_prices={trade.outcome: trade.entry_price},
+                execution_mode="paper",
+                extra_state=self._extra_state(trade),
+            )
 
-            # Telegram notification (fire-and-forget)
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.manager.notify_bid(intent))
-            except RuntimeError:
-                pass
-
-    def _save_trade(self, trade: WeatherPaperTrade) -> None:
+    async def _save_trade(self, trade: WeatherPaperTrade) -> None:
         """Persist resolved trade via TradeManager recorder + Telegram + JSONL backup."""
-        if self.manager and self.manager.recorder:
+        if self.manager:
             from src.execution.models import FillResult, TradeIntent
 
             title = f"{trade.city} {trade.target_date} \u2192 {trade.side} {trade.outcome}"
@@ -866,36 +856,12 @@ class WeatherOracleEngine:
                 avg_price=settlement_price,
                 pnl_delta=pnl,
             )
-            try:
-                self.manager.recorder.record_settle(
-                    intent=settle_intent,
-                    fill=settle_fill,
-                    fair_prices={trade.outcome: settlement_price},
-                    extra_state=self._extra_state(trade),
-                )
-            except Exception as exc:
-                logger.warning("record_settle_failed", trade_id=trade.id, error=str(exc))
-
-            # Telegram notification (fire-and-forget)
-            try:
-                entry_intent = TradeIntent(
-                    condition_id=trade.condition_id,
-                    token_id="",
-                    outcome=trade.outcome,
-                    side=trade.side,
-                    price=trade.entry_price,
-                    size_usd=trade.size_usd,
-                    reason=trade.reason,
-                    title=title,
-                    edge_pct=trade.confidence,
-                    timestamp=time.time(),
-                )
-                loop = asyncio.get_running_loop()
-                loop.create_task(
-                    self.manager.notify_settle(entry_intent, settlement_price, pnl, trade.won)
-                )
-            except RuntimeError:
-                pass
+            await self.manager.record_settle_direct(
+                intent=settle_intent,
+                fill=settle_fill,
+                fair_prices={trade.outcome: settlement_price},
+                extra_state=self._extra_state(trade),
+            )
 
         # JSONL backup
         try:
@@ -972,7 +938,7 @@ class WeatherOracleEngine:
                             confidence=round(signal.confidence, 3),
                             forecast_max=signal.forecast.temp_max,
                         )
-                        trade = self.enter_paper_trade(signal)
+                        trade = await self.enter_paper_trade(signal)
                         if trade:
                             total_signals += 1
 

@@ -185,6 +185,101 @@ class TradeManager:
 
         return fills
 
+    # --- record_fill_direct ---
+
+    async def record_fill_direct(
+        self,
+        intent: TradeIntent,
+        fill: FillResult,
+        *,
+        fair_prices: dict[str, float] | None = None,
+        execution_mode: str = "paper",
+        extra_state: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a fill detected externally (not via place/check_paper_fills).
+
+        Use when the strategy has its own fill detection logic
+        but wants unified DB persistence and Telegram notifications.
+        """
+        self._positions[(intent.condition_id, intent.outcome)] = PendingOrder(
+            order_id=f"direct_{self._paper_counter}",
+            intent=intent,
+            placed_at=intent.timestamp,
+        )
+        self._paper_counter += 1
+
+        if self.recorder:
+            try:
+                self.recorder.record_fill(
+                    intent=intent,
+                    fill=fill,
+                    fair_prices=fair_prices or {intent.outcome: intent.price},
+                    execution_mode=execution_mode,
+                    extra_state=extra_state,
+                )
+            except Exception as exc:
+                logger.warning("record_fill_direct_failed", error=str(exc))
+
+        if self.notify_fills:
+            await self.notify_fill(intent, fill)
+
+        logger.info(
+            "fill_recorded_direct",
+            strategy=self.strategy,
+            outcome=intent.outcome,
+            price=intent.price,
+            shares=round(fill.shares, 2),
+        )
+
+    # --- record_settle_direct ---
+
+    async def record_settle_direct(
+        self,
+        intent: TradeIntent,
+        fill: FillResult,
+        *,
+        fair_prices: dict[str, float] | None = None,
+        extra_state: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a settlement detected externally.
+
+        Use when the strategy resolves positions with its own logic
+        but wants unified DB persistence and Telegram notifications.
+        """
+        pnl = fill.pnl_delta
+        won = pnl > 0
+        if won:
+            self._wins += 1
+        else:
+            self._losses += 1
+        self._total_pnl += pnl
+
+        # Remove from tracked positions if present
+        self._positions.pop((intent.condition_id, intent.outcome), None)
+
+        if self.recorder:
+            try:
+                self.recorder.record_settle(
+                    intent=intent,
+                    fill=fill,
+                    fair_prices=fair_prices or {intent.outcome: intent.price},
+                    extra_state=extra_state,
+                )
+            except Exception as exc:
+                logger.warning("record_settle_direct_failed", error=str(exc))
+
+        if self.notify_closes:
+            await self.notify_settle(intent, fill.avg_price, pnl, won)
+
+        logger.info(
+            "settle_recorded_direct",
+            strategy=self.strategy,
+            outcome=intent.outcome,
+            price=fill.avg_price,
+            pnl=round(pnl, 4),
+            record=f"{self._wins}W-{self._losses}L",
+        )
+
     # --- settle ---
 
     async def settle(
@@ -263,8 +358,8 @@ class TradeManager:
         if not self.paper and self.executor:
             try:
                 await self.executor.cancel_order(order_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("cancel_failed", order_id=order_id, error=str(exc))
         return True
 
     # --- queries ---
@@ -296,8 +391,8 @@ class TradeManager:
         )
         try:
             await self._alerter.send_custom_alert(msg)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("notify_bid_failed", error=str(exc))
 
     async def notify_fill(self, intent: TradeIntent, fill: FillResult) -> None:
         """Send Telegram FILL notification."""
@@ -309,8 +404,8 @@ class TradeManager:
         )
         try:
             await self._alerter.send_custom_alert(msg)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("notify_fill_failed", error=str(exc))
 
     async def notify_settle(
         self, intent: TradeIntent, exit_price: float, pnl: float, won: bool,
@@ -327,8 +422,8 @@ class TradeManager:
         )
         try:
             await self._alerter.send_custom_alert(msg)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("notify_settle_failed", error=str(exc))
 
     # --- internal ---
 

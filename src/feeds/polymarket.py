@@ -217,8 +217,8 @@ class PolymarketFeed(BaseFeed):
                     "operation": "unsubscribe",
                 })
                 await self._ws.send(msg)
-            except Exception:
-                pass  # best-effort
+            except Exception as exc:
+                logger.warning("unsubscribe_market_failed", market_id=market_id, error=str(exc))
 
         self._subscriptions.discard(("prediction", market_id))
 
@@ -581,8 +581,8 @@ class PolymarketUserFeed:
                 "markets": ids,
                 "operation": "unsubscribe",
             }))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("user_ws_unsubscribe_failed", error=str(exc))
         self._subscribed_markets -= set(ids)
 
     async def _keepalive_loop(self) -> None:

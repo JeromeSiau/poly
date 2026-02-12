@@ -423,7 +423,7 @@ class CryptoMinuteEngine:
 
         return opportunities
 
-    def enter_paper_trade(self, opp: MinuteOpportunity) -> PaperTrade:
+    async def enter_paper_trade(self, opp: MinuteOpportunity) -> PaperTrade:
         """Record a paper trade entry."""
         trade = PaperTrade(
             id=str(uuid.uuid4())[:8],
@@ -449,7 +449,7 @@ class CryptoMinuteEngine:
         self._entered_markets[opp.market.slug].add(opp.strategy)
 
         # Persist entry via TradeManager
-        self._record_entry(trade)
+        await self._record_entry(trade)
 
         logger.info(
             "paper_trade_entered",
@@ -507,7 +507,7 @@ class CryptoMinuteEngine:
                     self._stats[trade.strategy]["wins"] += 1
                 self._stats[trade.strategy]["pnl"] += trade.pnl_usd
 
-                self._save_trade(trade)
+                await self._save_trade(trade)
                 resolved.append(trade)
 
                 logger.info(
@@ -540,9 +540,9 @@ class CryptoMinuteEngine:
             "time_bucket": trade.time_bucket,
         }
 
-    def _record_entry(self, trade: PaperTrade) -> None:
+    async def _record_entry(self, trade: PaperTrade) -> None:
         """Persist entry via TradeManager recorder + Telegram."""
-        if self.manager and self.manager.recorder:
+        if self.manager:
             from src.execution.models import FillResult, TradeIntent
 
             title = f"{trade.symbol} {trade.side} ({trade.strategy})"
@@ -563,27 +563,17 @@ class CryptoMinuteEngine:
                 shares=trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0.0,
                 avg_price=trade.entry_price,
             )
-            try:
-                self.manager.recorder.record_fill(
-                    intent=intent,
-                    fill=fill,
-                    fair_prices={trade.side: trade.entry_price},
-                    execution_mode="paper",
-                    extra_state=self._extra_state(trade),
-                )
-            except Exception as exc:
-                logger.warning("record_entry_failed", trade_id=trade.id, error=str(exc))
+            await self.manager.record_fill_direct(
+                intent=intent,
+                fill=fill,
+                fair_prices={trade.side: trade.entry_price},
+                execution_mode="paper",
+                extra_state=self._extra_state(trade),
+            )
 
-            # Telegram notification (fire-and-forget)
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.manager.notify_bid(intent))
-            except RuntimeError:
-                pass
-
-    def _save_trade(self, trade: PaperTrade) -> None:
+    async def _save_trade(self, trade: PaperTrade) -> None:
         """Persist resolved trade via TradeManager recorder + Telegram + JSONL backup."""
-        if self.manager and self.manager.recorder:
+        if self.manager:
             from src.execution.models import FillResult, TradeIntent
 
             title = f"{trade.symbol} {trade.side} ({trade.strategy})"
@@ -607,36 +597,12 @@ class CryptoMinuteEngine:
                 avg_price=settlement_price,
                 pnl_delta=pnl,
             )
-            try:
-                self.manager.recorder.record_settle(
-                    intent=settle_intent,
-                    fill=settle_fill,
-                    fair_prices={trade.side: settlement_price},
-                    extra_state=self._extra_state(trade),
-                )
-            except Exception as exc:
-                logger.warning("record_settle_failed", trade_id=trade.id, error=str(exc))
-
-            # Telegram notification (fire-and-forget)
-            try:
-                entry_intent = TradeIntent(
-                    condition_id=trade.market_slug,
-                    token_id="",
-                    outcome=trade.side,
-                    side="BUY",
-                    price=trade.entry_price,
-                    size_usd=trade.size_usd,
-                    reason=trade.strategy,
-                    title=title,
-                    edge_pct=0.0,
-                    timestamp=time.time(),
-                )
-                loop = asyncio.get_running_loop()
-                loop.create_task(
-                    self.manager.notify_settle(entry_intent, settlement_price, pnl, trade.won)
-                )
-            except RuntimeError:
-                pass
+            await self.manager.record_settle_direct(
+                intent=settle_intent,
+                fill=settle_fill,
+                fair_prices={trade.side: settlement_price},
+                extra_state=self._extra_state(trade),
+            )
 
         # JSONL backup
         try:
@@ -679,7 +645,7 @@ class CryptoMinuteEngine:
                 # Scan for opportunities
                 opportunities = await self.scan_once()
                 for opp in opportunities:
-                    self.enter_paper_trade(opp)
+                    await self.enter_paper_trade(opp)
 
                 # Resolve expired trades
                 await self.resolve_expired_trades()

@@ -20,8 +20,6 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import pandas as pd
 import numpy as np
 import structlog
