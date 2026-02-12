@@ -147,6 +147,7 @@ class CryptoTDMaker:
         self._http_client: Optional[httpx.AsyncClient] = None
         self._paper_order_counter: int = 0
         self._cycle_count: int = 0
+        self._last_status_time: float = 0.0
 
         # Stats
         self.total_fills: int = 0
@@ -333,21 +334,31 @@ class CryptoTDMaker:
                 placed += 1
                 budget_left -= self.order_size_usd
 
-        # Periodic status.
-        if self._cycle_count % 60 == 0:
+        # Periodic status (every 30s wall-clock).
+        if now - self._last_status_time >= 30.0:
+            self._last_status_time = now
             exposure = sum(p.size_usd for p in self.positions.values())
             winrate = self.total_wins / self.total_fills * 100 if self.total_fills else 0
+
+            # Snapshot of current best bids per outcome.
+            price_parts: list[str] = []
+            for cid in list(self.known_markets)[:4]:
+                for outcome in self.market_outcomes.get(cid, []):
+                    bid, _, ask, _ = self.polymarket.get_best_levels(cid, outcome)
+                    bid_s = f"{bid:.2f}" if bid else "?"
+                    ask_s = f"{ask:.2f}" if ask else "?"
+                    price_parts.append(f"{outcome[:1]}:{bid_s}/{ask_s}")
+
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
-                f"markets={len(self.known_markets)} "
+                f"mkts={len(self.known_markets)} "
                 f"orders={len(self.active_orders)} "
-                f"positions={len(self.positions)} "
+                f"pos={len(self.positions)} "
                 f"fills={self.total_fills} "
-                f"record={self.total_wins}W-{self.total_losses}L "
-                f"winrate={winrate:.1f}% "
+                f"{self.total_wins}W-{self.total_losses}L "
                 f"pnl=${self.realized_pnl:+.2f} "
-                f"exposure=${exposure:.0f} "
-                f"placed={placed} cancelled={len(cancel_ids)}"
+                f"exp=${exposure:.0f} "
+                f"prices=[{' '.join(price_parts)}]"
             )
 
     # ------------------------------------------------------------------
