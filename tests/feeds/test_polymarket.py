@@ -361,12 +361,13 @@ class TestPolymarketUserFeed:
         assert feed.fills.empty()
 
     @pytest.mark.asyncio
-    async def test_subscribe_markets_first_includes_auth(self):
+    async def test_resubscribe_all_includes_auth(self):
         feed = PolymarketUserFeed("mykey", "mysecret", "mypass")
         feed._ws = AsyncMock()
         feed._connected = True
+        feed._subscribed_markets = {"0xcond_1", "0xcond_2"}
 
-        await feed.subscribe_markets(["0xcond_1", "0xcond_2"])
+        await feed._resubscribe_all()
 
         feed._ws.send.assert_called_once()
         msg = json.loads(feed._ws.send.call_args[0][0])
@@ -374,31 +375,36 @@ class TestPolymarketUserFeed:
         assert msg["auth"]["apiKey"] == "mykey"
         assert msg["auth"]["secret"] == "mysecret"
         assert msg["auth"]["passphrase"] == "mypass"
-        assert "0xcond_1" in msg["markets"]
-        assert "0xcond_2" in msg["markets"]
-        assert feed._authenticated is True
+        assert set(msg["markets"]) == {"0xcond_1", "0xcond_2"}
 
     @pytest.mark.asyncio
-    async def test_subscribe_markets_subsequent_no_auth(self):
+    async def test_subscribe_markets_sends_plain_subscribe(self):
         feed = PolymarketUserFeed("key", "secret", "pass")
         feed._ws = AsyncMock()
         feed._connected = True
-        feed._authenticated = True
-        feed._subscribed_markets = {"0xcond_1"}
 
-        await feed.subscribe_markets(["0xcond_2"])
+        await feed.subscribe_markets(["0xcond_1", "0xcond_2"])
 
+        feed._ws.send.assert_called_once()
         msg = json.loads(feed._ws.send.call_args[0][0])
         assert "auth" not in msg
         assert msg["operation"] == "subscribe"
-        assert "0xcond_2" in msg["markets"]
+        assert set(msg["markets"]) == {"0xcond_1", "0xcond_2"}
+
+    @pytest.mark.asyncio
+    async def test_subscribe_markets_queued_when_disconnected(self):
+        feed = PolymarketUserFeed("key", "secret", "pass")
+        feed._connected = False
+
+        await feed.subscribe_markets(["0xcond_1"])
+
+        assert "0xcond_1" in feed._subscribed_markets
 
     @pytest.mark.asyncio
     async def test_subscribe_dedup(self):
         feed = PolymarketUserFeed("key", "secret", "pass")
         feed._ws = AsyncMock()
         feed._connected = True
-        feed._authenticated = True
         feed._subscribed_markets = {"0xcond_1"}
 
         await feed.subscribe_markets(["0xcond_1"])

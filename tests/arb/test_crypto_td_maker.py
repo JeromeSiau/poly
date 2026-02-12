@@ -21,8 +21,8 @@ def _make_feed_with_book(
     feed._connected = False
     feed._local_orderbook = {}
     feed._subscribed_tokens = set()
-    feed._keepalive_task = None
-    feed._receive_task = None
+    feed._connection_task = None
+    feed._shutdown = False
     feed._ws = None
     return feed
 

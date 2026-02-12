@@ -87,10 +87,15 @@ class PolymarketFeed(BaseFeed):
 
     Connects to the Market channel, maintains a local copy of the order book
     keyed by token_id, and provides fast price lookups via (condition_id, outcome).
+
+    Auto-reconnects on connection drops with exponential backoff, preserving
+    subscriptions across reconnections.
     """
 
     WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     PING_INTERVAL = 10.0  # seconds
+    RECONNECT_BASE = 1.0  # initial backoff seconds
+    RECONNECT_MAX = 30.0  # max backoff seconds
 
     def __init__(self) -> None:
         super().__init__()
@@ -100,51 +105,91 @@ class PolymarketFeed(BaseFeed):
         self._subscribed_tokens: set[str] = set()
         # (condition_id, outcome) -> token_id  for backward-compat lookup
         self._token_map: dict[tuple[str, str], str] = {}
-        self._keepalive_task: Optional[asyncio.Task] = None
-        self._receive_task: Optional[asyncio.Task] = None
+        self._connection_task: Optional[asyncio.Task] = None
         # Pre-computed best levels cache: token_id -> (best_bid, bid_sz, best_ask, ask_sz)
         self._best_cache: dict[str, tuple[Optional[float], Optional[float], Optional[float], Optional[float]]] = {}
         # Event signaled on every book update (for event-driven consumers).
         self.book_updated: asyncio.Event = asyncio.Event()
+        self._shutdown = False
 
     async def connect(self) -> None:
-        """Establish WebSocket connection to Polymarket CLOB Market channel."""
-        if self._connected:
+        """Start the auto-reconnecting connection loop."""
+        if self._connection_task and not self._connection_task.done():
             return
-
-        self._ws = await websockets.connect(self.WS_URL)
-        self._connected = True
-
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-        self._receive_task = asyncio.create_task(self._receive_loop())
+        self._shutdown = False
+        self._connection_task = asyncio.create_task(self._connection_loop())
 
     async def disconnect(self) -> None:
-        """Close WebSocket connection."""
-        if self._keepalive_task:
-            self._keepalive_task.cancel()
+        """Close WebSocket connection and stop reconnecting."""
+        self._shutdown = True
+
+        if self._connection_task:
+            self._connection_task.cancel()
             try:
-                await self._keepalive_task
+                await self._connection_task
             except asyncio.CancelledError:
                 pass
-            self._keepalive_task = None
+            self._connection_task = None
 
-        if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
-            self._receive_task = None
-
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
-
-        self._connected = False
+        await self._close_ws()
         self._subscribed_tokens.clear()
         self._token_map.clear()
         self._local_orderbook.clear()
         self._best_cache.clear()
+
+    async def _close_ws(self) -> None:
+        """Close the raw WebSocket if open."""
+        self._connected = False
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    async def _connection_loop(self) -> None:
+        """Connect, run, and auto-reconnect on failure."""
+        backoff = self.RECONNECT_BASE
+        while not self._shutdown:
+            try:
+                self._ws = await websockets.connect(self.WS_URL)
+                self._connected = True
+                backoff = self.RECONNECT_BASE
+                logger.info("polymarket_ws_connected")
+
+                # Re-subscribe all tokens from previous session.
+                await self._resubscribe_all()
+
+                # Run keepalive + receive until one fails.
+                await asyncio.gather(
+                    self._keepalive_loop(),
+                    self._receive_loop(),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("polymarket_ws_disconnected", error=str(exc), reconnect_in=backoff)
+
+            # Clean up stale data before reconnecting.
+            await self._close_ws()
+            self._local_orderbook.clear()
+            self._best_cache.clear()
+
+            if self._shutdown:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self.RECONNECT_MAX)
+
+    async def _resubscribe_all(self) -> None:
+        """Re-subscribe all previously tracked tokens after reconnect."""
+        if not self._subscribed_tokens or not self._ws:
+            return
+        tokens = list(self._subscribed_tokens)
+        for tid in tokens:
+            self._local_orderbook.setdefault(tid, {"bids": [], "asks": []})
+        msg = json.dumps({"assets_ids": tokens, "type": "MARKET"})
+        await self._ws.send(msg)
+        logger.info("polymarket_ws_resubscribed", tokens=len(tokens))
 
     async def subscribe(self, game: str, match_id: str) -> None:
         """Subscribe to events for a specific match/market (BaseFeed interface).
@@ -169,10 +214,10 @@ class PolymarketFeed(BaseFeed):
             token_map: ``{outcome: token_id}`` mapping.  Required for the CLOB WS
                        to know which token streams to open.  If ``None``, the call
                        is a no-op.
-        """
-        if not self._ws or not self._connected:
-            raise RuntimeError("Not connected. Call connect() first.")
 
+        If the WebSocket is temporarily disconnected, the subscription is
+        recorded locally and will be sent on the next reconnect.
+        """
         if not token_map:
             logger.warning("subscribe_market_no_tokens", market_id=market_id)
             return
@@ -185,7 +230,7 @@ class PolymarketFeed(BaseFeed):
                 self._subscribed_tokens.add(token_id)
                 self._local_orderbook.setdefault(token_id, {"bids": [], "asks": []})
 
-        if new_tokens:
+        if new_tokens and self._ws and self._connected:
             msg = json.dumps({
                 "assets_ids": new_tokens,
                 "type": "MARKET",
@@ -193,6 +238,12 @@ class PolymarketFeed(BaseFeed):
             await self._ws.send(msg)
             logger.debug(
                 "clob_ws_subscribed",
+                market_id=market_id,
+                tokens=len(new_tokens),
+            )
+        elif new_tokens:
+            logger.debug(
+                "clob_ws_queued_for_reconnect",
                 market_id=market_id,
                 tokens=len(new_tokens),
             )
@@ -297,10 +348,10 @@ class PolymarketFeed(BaseFeed):
                 if self._ws:
                     await self._ws.ping()
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
-                logger.error("keepalive_error", error=str(e))
-                break
+                logger.warning("keepalive_error", error=str(e))
+                return  # exit so _connection_loop reconnects
 
     async def _receive_loop(self) -> None:
         """Receive and process incoming WebSocket messages."""
@@ -314,10 +365,10 @@ class PolymarketFeed(BaseFeed):
                 data = _json_loads(message)
                 await self._process_message(data)
             except asyncio.CancelledError:
-                break
+                raise
             except websockets.exceptions.ConnectionClosed:
-                self._connected = False
-                break
+                logger.warning("polymarket_ws_connection_closed")
+                return  # exit so _connection_loop reconnects
             except (json.JSONDecodeError, ValueError):
                 continue  # skip non-JSON messages
             except Exception as e:
@@ -478,10 +529,15 @@ class PolymarketUserFeed:
 
     Pushes ``UserTradeEvent`` into an ``asyncio.Queue`` for consumers to drain.
     Requires API credentials (obtained from py-clob-client).
+
+    Auto-reconnects on connection drops with exponential backoff, preserving
+    market subscriptions and re-authenticating on each reconnect.
     """
 
     WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
     PING_INTERVAL = 10.0
+    RECONNECT_BASE = 1.0
+    RECONNECT_MAX = 30.0
 
     def __init__(
         self,
@@ -494,10 +550,9 @@ class PolymarketUserFeed:
         self._api_passphrase = api_passphrase
         self._ws: Optional[ClientConnection] = None
         self._connected = False
-        self._authenticated = False
         self._subscribed_markets: set[str] = set()
-        self._keepalive_task: Optional[asyncio.Task] = None
-        self._receive_task: Optional[asyncio.Task] = None
+        self._connection_task: Optional[asyncio.Task] = None
+        self._shutdown = False
         # Consumers drain this queue for fill events.
         self.fills: asyncio.Queue[UserTradeEvent] = asyncio.Queue()
         # Event signaled on every new fill.
@@ -508,73 +563,111 @@ class PolymarketUserFeed:
         return self._connected
 
     async def connect(self) -> None:
-        if self._connected:
+        if self._connection_task and not self._connection_task.done():
             return
-        self._ws = await websockets.connect(self.WS_URL)
-        self._connected = True
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-        self._receive_task = asyncio.create_task(self._receive_loop())
+        self._shutdown = False
+        self._connection_task = asyncio.create_task(self._connection_loop())
 
     async def disconnect(self) -> None:
-        if self._keepalive_task:
-            self._keepalive_task.cancel()
+        self._shutdown = True
+
+        if self._connection_task:
+            self._connection_task.cancel()
             try:
-                await self._keepalive_task
+                await self._connection_task
             except asyncio.CancelledError:
                 pass
-            self._keepalive_task = None
+            self._connection_task = None
 
-        if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
-            self._receive_task = None
-
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
-
-        self._connected = False
-        self._authenticated = False
+        await self._close_ws()
         self._subscribed_markets.clear()
 
-    async def subscribe_markets(self, market_ids: list[str]) -> None:
-        """Subscribe to trade/order events for condition IDs."""
-        if not self._ws or not self._connected:
-            raise RuntimeError("Not connected. Call connect() first.")
+    async def _close_ws(self) -> None:
+        self._connected = False
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
 
+    async def _connection_loop(self) -> None:
+        """Connect, authenticate, run, and auto-reconnect on failure."""
+        backoff = self.RECONNECT_BASE
+        while not self._shutdown:
+            try:
+                self._ws = await websockets.connect(self.WS_URL)
+                self._connected = True
+                backoff = self.RECONNECT_BASE
+                logger.info("user_ws_connected")
+
+                # Re-authenticate and re-subscribe.
+                await self._resubscribe_all()
+
+                await asyncio.gather(
+                    self._keepalive_loop(),
+                    self._receive_loop(),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("user_ws_disconnected", error=str(exc), reconnect_in=backoff)
+
+            await self._close_ws()
+
+            if self._shutdown:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self.RECONNECT_MAX)
+
+    async def _resubscribe_all(self) -> None:
+        """Re-authenticate and re-subscribe all markets after reconnect."""
+        if not self._subscribed_markets or not self._ws:
+            return
+        market_ids = list(self._subscribed_markets)
+        msg = json.dumps({
+            "markets": market_ids,
+            "type": "user",
+            "auth": {
+                "apiKey": self._api_key,
+                "secret": self._api_secret,
+                "passphrase": self._api_passphrase,
+            },
+        })
+        await self._ws.send(msg)
+        logger.info("user_ws_resubscribed", markets=len(market_ids))
+
+    async def subscribe_markets(self, market_ids: list[str]) -> None:
+        """Subscribe to trade/order events for condition IDs.
+
+        If disconnected, subscriptions are recorded and will be sent on reconnect.
+        """
         new_ids = [m for m in market_ids if m not in self._subscribed_markets]
         if not new_ids:
             return
 
-        if not self._authenticated:
-            # First subscription includes auth credentials.
-            msg = json.dumps({
-                "markets": new_ids,
-                "type": "user",
-                "auth": {
-                    "apiKey": self._api_key,
-                    "secret": self._api_secret,
-                    "passphrase": self._api_passphrase,
-                },
-            })
-            self._authenticated = True
-        else:
-            msg = json.dumps({
-                "markets": new_ids,
-                "operation": "subscribe",
-            })
-
-        await self._ws.send(msg)
         self._subscribed_markets.update(new_ids)
+
+        if not self._ws or not self._connected:
+            logger.debug("user_ws_queued_for_reconnect", markets=len(new_ids))
+            return
+
+        # Check if this is the first subscribe (needs auth) on this connection.
+        # After reconnect, _resubscribe_all already sent auth, so use plain subscribe.
+        msg = json.dumps({
+            "markets": new_ids,
+            "operation": "subscribe",
+        })
+        await self._ws.send(msg)
         logger.debug("user_ws_subscribed", markets=len(new_ids))
 
     async def unsubscribe_markets(self, market_ids: list[str]) -> None:
         """Unsubscribe from trade/order events."""
         ids = [m for m in market_ids if m in self._subscribed_markets]
-        if not ids or not self._ws or not self._connected:
+        if not ids:
+            return
+        self._subscribed_markets -= set(ids)
+        if not self._ws or not self._connected:
             return
         try:
             await self._ws.send(json.dumps({
@@ -583,7 +676,6 @@ class PolymarketUserFeed:
             }))
         except Exception as exc:
             logger.warning("user_ws_unsubscribe_failed", error=str(exc))
-        self._subscribed_markets -= set(ids)
 
     async def _keepalive_loop(self) -> None:
         while self._connected and self._ws:
@@ -592,10 +684,10 @@ class PolymarketUserFeed:
                 if self._ws:
                     await self._ws.send("PING")
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
-                logger.error("user_ws_keepalive_error", error=str(e))
-                break
+                logger.warning("user_ws_keepalive_error", error=str(e))
+                return  # exit so _connection_loop reconnects
 
     async def _receive_loop(self) -> None:
         while self._connected and self._ws:
@@ -609,10 +701,10 @@ class PolymarketUserFeed:
                 data = _json_loads(message)
                 self._process_message(data)
             except asyncio.CancelledError:
-                break
+                raise
             except websockets.exceptions.ConnectionClosed:
-                self._connected = False
-                break
+                logger.warning("user_ws_connection_closed")
+                return  # exit so _connection_loop reconnects
             except (json.JSONDecodeError, ValueError):
                 continue
             except Exception as e:
