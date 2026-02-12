@@ -178,6 +178,54 @@ async def test_cancel_paper(paper_manager, intent):
     assert len(paper_manager.get_pending_orders()) == 0
 
 
+# --- multi-outcome positions ---
+
+@pytest.mark.asyncio
+async def test_two_outcomes_same_condition(paper_manager):
+    """Two orders on same condition_id but different outcomes don't collide."""
+    up_intent = TradeIntent(
+        condition_id="cid_1", token_id="tok_up", outcome="Up",
+        side="BUY", price=0.60, size_usd=6.0, reason="test", title="BTC-test",
+    )
+    down_intent = TradeIntent(
+        condition_id="cid_1", token_id="tok_down", outcome="Down",
+        side="BUY", price=0.40, size_usd=4.0, reason="test", title="BTC-test",
+    )
+    await paper_manager.place(up_intent)
+    await paper_manager.place(down_intent)
+
+    def mock_levels(cid, outcome):
+        if outcome == "Up":
+            return (0.59, 100, 0.60, 100)  # fills
+        return (0.39, 100, 0.40, 100)  # fills
+
+    fills = paper_manager.check_paper_fills(mock_levels)
+    assert len(fills) == 2
+
+    # Settle each independently
+    pnl_up = await paper_manager.settle("cid_1", "Up", 1.0, won=True)
+    pnl_down = await paper_manager.settle("cid_1", "Down", 0.0, won=False)
+    assert pnl_up > 0  # 10 * (1.0 - 0.60) = 4.0
+    assert pnl_down < 0  # 10 * (0.0 - 0.40) = -4.0
+
+
+# --- settle() partial loss ---
+
+@pytest.mark.asyncio
+async def test_settle_partial_loss(paper_manager, intent):
+    """settle() with partial loss uses actual settlement price, not full loss."""
+    await paper_manager.place(intent)  # BUY Up @ 0.80, size 10
+
+    def mock_levels(cid, outcome):
+        return (0.79, 100, 0.80, 100)
+
+    paper_manager.check_paper_fills(mock_levels)
+    # Settles at 0.50 — partial loss
+    pnl = await paper_manager.settle("cid_1", "Up", 0.50, won=False)
+    expected = 12.5 * (0.50 - 0.80)  # -3.75, not -10.0
+    assert abs(pnl - expected) < 0.01
+
+
 # --- get_stats() ---
 
 @pytest.mark.asyncio

@@ -231,7 +231,7 @@ async def _check_exits(
                                 try:
                                     won = realized_pnl >= 0
                                     # Record settlement in unified DB
-                                    if manager._recorder is not None:
+                                    if manager.recorder is not None:
                                         settle_intent = ExecTradeIntent(
                                             condition_id=cid,
                                             token_id=pos.token_id or "",
@@ -249,7 +249,7 @@ async def _check_exits(
                                             avg_price=exit_price,
                                             pnl_delta=realized_pnl,
                                         )
-                                        manager._recorder.record_settle(
+                                        manager.recorder.record_settle(
                                             intent=settle_intent,
                                             fill=settle_fill,
                                             fair_prices={pos.side: exit_price},
@@ -408,14 +408,14 @@ async def main(args: argparse.Namespace) -> None:
                             title=signal_result.title,
                             edge_pct=signal_result.edge_pct,
                         )
-                        if manager._recorder is not None:
+                        if manager.recorder is not None:
                             shares = signal_result.size_usd / signal_result.price if signal_result.price > 0 else 0.0
                             exec_fill = ExecFillResult(
                                 filled=True,
                                 shares=shares,
                                 avg_price=signal_result.price,
                             )
-                            manager._recorder.record_fill(
+                            manager.recorder.record_fill(
                                 intent=exec_intent,
                                 fill=exec_fill,
                                 fair_prices={signal_result.outcome: signal_result.price},
@@ -425,7 +425,7 @@ async def main(args: argparse.Namespace) -> None:
                                     "fear_score": signal_result.fear_score,
                                 },
                             )
-                        await manager._notify_bid(exec_intent)
+                        await manager.notify_bid(exec_intent)
                     except Exception as exc:
                         logger.warning("fear_manager_record_error", error=str(exc))
 

@@ -802,7 +802,7 @@ class WeatherOracleEngine:
 
     def _record_entry(self, trade: WeatherPaperTrade) -> None:
         """Persist entry via TradeManager recorder + Telegram + JSONL backup."""
-        if self.manager and self.manager._recorder:
+        if self.manager and self.manager.recorder:
             from src.execution.models import FillResult, TradeIntent
 
             intent = TradeIntent(
@@ -823,7 +823,7 @@ class WeatherOracleEngine:
                 avg_price=trade.entry_price,
             )
             try:
-                self.manager._recorder.record_fill(
+                self.manager.recorder.record_fill(
                     intent=intent,
                     fill=fill,
                     fair_prices={trade.outcome: trade.entry_price},
@@ -836,13 +836,13 @@ class WeatherOracleEngine:
             # Telegram notification (fire-and-forget)
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(self.manager._notify_bid(intent))
+                loop.create_task(self.manager.notify_bid(intent))
             except RuntimeError:
                 pass
 
     def _save_trade(self, trade: WeatherPaperTrade) -> None:
         """Persist resolved trade via TradeManager recorder + Telegram + JSONL backup."""
-        if self.manager and self.manager._recorder:
+        if self.manager and self.manager.recorder:
             from src.execution.models import FillResult, TradeIntent
 
             title = f"{trade.city} {trade.target_date} \u2192 {trade.side} {trade.outcome}"
@@ -867,7 +867,7 @@ class WeatherOracleEngine:
                 pnl_delta=pnl,
             )
             try:
-                self.manager._recorder.record_settle(
+                self.manager.recorder.record_settle(
                     intent=settle_intent,
                     fill=settle_fill,
                     fair_prices={trade.outcome: settlement_price},
@@ -892,7 +892,7 @@ class WeatherOracleEngine:
                 )
                 loop = asyncio.get_running_loop()
                 loop.create_task(
-                    self.manager._notify_settle(entry_intent, settlement_price, pnl, trade.won)
+                    self.manager.notify_settle(entry_intent, settlement_price, pnl, trade.won)
                 )
             except RuntimeError:
                 pass

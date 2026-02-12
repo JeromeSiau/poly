@@ -1296,12 +1296,12 @@ def settle_resolved_inventory(
                 timestamp=now_ts,
             )
 
-            if manager is not None and manager._recorder is not None:
+            if manager is not None and manager.recorder is not None:
                 extra = _build_extra_state(
                     intent=intent, fill=fill, snapshot=None,
                 )
                 try:
-                    manager._recorder.record_settle(
+                    manager.recorder.record_settle(
                         intent=_to_exec_intent(intent),
                         fill=_to_exec_fill(fill),
                         fair_prices={outcome: settlement_price},
@@ -1404,12 +1404,12 @@ def paper_merge_binary_pairs(
                 continue
             realized_total += fill.realized_pnl_delta
 
-            if manager is not None and manager._recorder is not None:
+            if manager is not None and manager.recorder is not None:
                 extra = _build_extra_state(
                     intent=intent, fill=fill, snapshot=snapshot,
                 )
                 try:
-                    manager._recorder.record_fill(
+                    manager.recorder.record_fill(
                         intent=_to_exec_intent(intent),
                         fill=_to_exec_fill(fill),
                         fair_prices=fair_prices,
@@ -1621,13 +1621,13 @@ async def run_cycle(
                     price=pending.intent.price,
                     age_seconds=round(age, 1),
                 )
-                if manager is not None and manager._recorder is not None and args.persist_paper:
+                if manager is not None and manager.recorder is not None and args.persist_paper:
                     fair_prices = engine.compute_fair_prices(snapshot)
                     extra = _build_extra_state(
                         intent=pending.intent, fill=fill, snapshot=snapshot,
                     )
                     try:
-                        manager._recorder.record_fill(
+                        manager.recorder.record_fill(
                             intent=_to_exec_intent(pending.intent),
                             fill=_to_exec_fill(fill),
                             fair_prices=fair_prices,
@@ -1772,13 +1772,13 @@ async def run_cycle(
                     price=intent.price,
                     status=status,
                 )
-                if manager is not None and manager._recorder is not None:
+                if manager is not None and manager.recorder is not None:
                     snapshot = snapshots_by_condition.get(intent.condition_id)
                     extra = _build_extra_state(
                         intent=intent, fill=fill, snapshot=snapshot,
                     )
                     try:
-                        manager._recorder.record_fill(
+                        manager.recorder.record_fill(
                             intent=_to_exec_intent(intent),
                             fill=_to_exec_fill(fill),
                             fair_prices=fair_cache.get(intent.condition_id, {}),
@@ -1818,13 +1818,13 @@ async def run_cycle(
             else:
                 fill = engine.apply_fill(intent)
                 executed += 1
-                if manager is not None and manager._recorder is not None:
+                if manager is not None and manager.recorder is not None:
                     snapshot = snapshots_by_condition.get(intent.condition_id)
                     extra = _build_extra_state(
                         intent=intent, fill=fill, snapshot=snapshot,
                     )
                     try:
-                        manager._recorder.record_fill(
+                        manager.recorder.record_fill(
                             intent=_to_exec_intent(intent),
                             fill=_to_exec_fill(fill),
                             fair_prices=fair_cache.get(intent.condition_id, {}),

@@ -59,22 +59,22 @@ class TradeManager:
 
         # Internal state
         self._pending: dict[str, PendingOrder] = {}
-        self._positions: dict[str, PendingOrder] = {}  # cid -> filled order
+        self._positions: dict[tuple[str, str], PendingOrder] = {}  # (cid, outcome) -> filled order
         self._paper_counter: int = 0
         self._wins: int = 0
         self._losses: int = 0
         self._total_pnl: float = 0.0
 
-        # Recorder
-        self._recorder: Optional[TradeRecorder] = None
+        # Recorder (public — strategies may need direct access for extra_state)
+        self.recorder: Optional[TradeRecorder] = None
         if db_url or event_type:
-            self._recorder = TradeRecorder(
+            self.recorder = TradeRecorder(
                 db_url=db_url or settings.DATABASE_URL,
                 strategy_tag=strategy,
                 event_type=event_type,
                 run_id=run_id,
             )
-            self._recorder.bootstrap()
+            self.recorder.bootstrap()
 
         # Telegram
         self._alerter = TelegramAlerter()
@@ -103,21 +103,9 @@ class TradeManager:
         pending = PendingOrder(order_id=order_id, intent=intent, placed_at=now)
         self._pending[order_id] = pending
 
-        # Persist entry
-        if self._recorder:
-            try:
-                fill = FillResult(filled=True, shares=intent.shares, avg_price=intent.price)
-                self._recorder.record_fill(
-                    intent=intent, fill=fill,
-                    fair_prices={intent.outcome: intent.price},
-                    execution_mode="paper" if self.paper else "live",
-                )
-            except Exception as exc:
-                logger.warning("record_fill_failed", error=str(exc))
-
         # Telegram
         if self.notify_bids:
-            await self._notify_bid(intent)
+            await self.notify_bid(intent)
 
         logger.info(
             "order_placed",
@@ -163,12 +151,12 @@ class TradeManager:
                 )
                 fills.append(fill)
                 filled_ids.append(oid)
-                self._positions[intent.condition_id] = pending
+                self._positions[(intent.condition_id, intent.outcome)] = pending
 
                 # Persist
-                if self._recorder:
+                if self.recorder:
                     try:
-                        self._recorder.record_fill(
+                        self.recorder.record_fill(
                             intent=intent, fill=fill,
                             fair_prices={intent.outcome: intent.price},
                             execution_mode="paper_fill",
@@ -180,7 +168,7 @@ class TradeManager:
                 if self.notify_fills:
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(self._notify_fill(intent, fill))
+                        loop.create_task(self.notify_fill(intent, fill))
                     except RuntimeError:
                         pass
 
@@ -205,23 +193,23 @@ class TradeManager:
         outcome: str,
         settlement_price: float,
         won: bool,
+        extra_state: dict[str, Any] | None = None,
     ) -> float:
         """Settle a position. Returns PnL."""
-        pos = self._positions.pop(condition_id, None)
+        pos = self._positions.pop((condition_id, outcome), None)
         if pos is None:
             return 0.0
 
         intent = pos.intent
+        pnl = intent.shares * (settlement_price - intent.price)
         if won:
-            pnl = intent.shares * (settlement_price - intent.price)
             self._wins += 1
         else:
-            pnl = -intent.size_usd
             self._losses += 1
         self._total_pnl += pnl
 
         # Persist settlement
-        if self._recorder:
+        if self.recorder:
             settle_intent = TradeIntent(
                 condition_id=condition_id,
                 token_id=intent.token_id,
@@ -241,16 +229,17 @@ class TradeManager:
                 pnl_delta=pnl,
             )
             try:
-                self._recorder.record_settle(
+                self.recorder.record_settle(
                     intent=settle_intent, fill=settle_fill,
                     fair_prices={outcome: settlement_price},
+                    extra_state=extra_state,
                 )
             except Exception as exc:
                 logger.warning("record_settle_failed", error=str(exc))
 
         # Telegram
         if self.notify_closes:
-            await self._notify_settle(intent, settlement_price, pnl, won)
+            await self.notify_settle(intent, settlement_price, pnl, won)
 
         logger.info(
             "position_settled",
@@ -295,6 +284,52 @@ class TradeManager:
     async def close(self) -> None:
         await self._alerter.close()
 
+    # --- public notifications (strategies can call directly) ---
+
+    async def notify_bid(self, intent: TradeIntent) -> None:
+        """Send Telegram BID notification."""
+        mode = self._mode_emoji()
+        msg = (
+            f"{mode}{_BID} {self.strategy}\n"
+            f"BID {intent.outcome} @ {intent.price:.2f} | ${intent.size_usd:.0f}\n"
+            f"{intent.title}"
+        )
+        try:
+            await self._alerter.send_custom_alert(msg)
+        except Exception:
+            pass
+
+    async def notify_fill(self, intent: TradeIntent, fill: FillResult) -> None:
+        """Send Telegram FILL notification."""
+        mode = self._mode_emoji()
+        msg = (
+            f"{mode}{_FILL} {self.strategy}\n"
+            f"FILL {intent.outcome} @ {fill.avg_price:.2f} | {fill.shares:.1f} shares\n"
+            f"{intent.title}"
+        )
+        try:
+            await self._alerter.send_custom_alert(msg)
+        except Exception:
+            pass
+
+    async def notify_settle(
+        self, intent: TradeIntent, exit_price: float, pnl: float, won: bool,
+    ) -> None:
+        """Send Telegram WIN/LOSS notification."""
+        mode = self._mode_emoji()
+        result_emoji = _WIN if won else _LOSS
+        result_text = "WIN" if won else "LOSS"
+        record = f"{self._wins}W-{self._losses}L"
+        msg = (
+            f"{mode}{result_emoji} {self.strategy}\n"
+            f"{result_text} {intent.outcome} {intent.price:.2f} \u2192 {exit_price:.2f} | ${pnl:+.2f}\n"
+            f"{record} | Total: ${self._total_pnl:+.2f}"
+        )
+        try:
+            await self._alerter.send_custom_alert(msg)
+        except Exception:
+            pass
+
     # --- internal ---
 
     def _next_paper_id(self) -> str:
@@ -310,44 +345,3 @@ class TradeManager:
 
     def _mode_emoji(self) -> str:
         return _PAPER if self.paper else _LIVE
-
-    async def _notify_bid(self, intent: TradeIntent) -> None:
-        mode = self._mode_emoji()
-        msg = (
-            f"{mode}{_BID} {self.strategy}\n"
-            f"BID {intent.outcome} @ {intent.price:.2f} | ${intent.size_usd:.0f}\n"
-            f"{intent.title}"
-        )
-        try:
-            await self._alerter.send_custom_alert(msg)
-        except Exception:
-            pass
-
-    async def _notify_fill(self, intent: TradeIntent, fill: FillResult) -> None:
-        mode = self._mode_emoji()
-        msg = (
-            f"{mode}{_FILL} {self.strategy}\n"
-            f"FILL {intent.outcome} @ {fill.avg_price:.2f} | {fill.shares:.1f} shares\n"
-            f"{intent.title}"
-        )
-        try:
-            await self._alerter.send_custom_alert(msg)
-        except Exception:
-            pass
-
-    async def _notify_settle(
-        self, intent: TradeIntent, exit_price: float, pnl: float, won: bool,
-    ) -> None:
-        mode = self._mode_emoji()
-        result_emoji = _WIN if won else _LOSS
-        result_text = "WIN" if won else "LOSS"
-        record = f"{self._wins}W-{self._losses}L"
-        msg = (
-            f"{mode}{result_emoji} {self.strategy}\n"
-            f"{result_text} {intent.outcome} {intent.price:.2f} \u2192 {exit_price:.2f} | ${pnl:+.2f}\n"
-            f"{record} | Total: ${self._total_pnl:+.2f}"
-        )
-        try:
-            await self._alerter.send_custom_alert(msg)
-        except Exception:
-            pass

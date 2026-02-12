@@ -542,7 +542,7 @@ class CryptoMinuteEngine:
 
     def _record_entry(self, trade: PaperTrade) -> None:
         """Persist entry via TradeManager recorder + Telegram."""
-        if self.manager and self.manager._recorder:
+        if self.manager and self.manager.recorder:
             from src.execution.models import FillResult, TradeIntent
 
             title = f"{trade.symbol} {trade.side} ({trade.strategy})"
@@ -564,7 +564,7 @@ class CryptoMinuteEngine:
                 avg_price=trade.entry_price,
             )
             try:
-                self.manager._recorder.record_fill(
+                self.manager.recorder.record_fill(
                     intent=intent,
                     fill=fill,
                     fair_prices={trade.side: trade.entry_price},
@@ -577,13 +577,13 @@ class CryptoMinuteEngine:
             # Telegram notification (fire-and-forget)
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(self.manager._notify_bid(intent))
+                loop.create_task(self.manager.notify_bid(intent))
             except RuntimeError:
                 pass
 
     def _save_trade(self, trade: PaperTrade) -> None:
         """Persist resolved trade via TradeManager recorder + Telegram + JSONL backup."""
-        if self.manager and self.manager._recorder:
+        if self.manager and self.manager.recorder:
             from src.execution.models import FillResult, TradeIntent
 
             title = f"{trade.symbol} {trade.side} ({trade.strategy})"
@@ -608,7 +608,7 @@ class CryptoMinuteEngine:
                 pnl_delta=pnl,
             )
             try:
-                self.manager._recorder.record_settle(
+                self.manager.recorder.record_settle(
                     intent=settle_intent,
                     fill=settle_fill,
                     fair_prices={trade.side: settlement_price},
@@ -633,7 +633,7 @@ class CryptoMinuteEngine:
                 )
                 loop = asyncio.get_running_loop()
                 loop.create_task(
-                    self.manager._notify_settle(entry_intent, settlement_price, pnl, trade.won)
+                    self.manager.notify_settle(entry_intent, settlement_price, pnl, trade.won)
                 )
             except RuntimeError:
                 pass

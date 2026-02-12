@@ -359,14 +359,14 @@ async def execution_loop(
                                 shares=fill.shares,
                                 avg_price=fill.fill_price,
                             )
-                            if manager._recorder is not None:
-                                manager._recorder.record_fill(
+                            if manager.recorder is not None:
+                                manager.recorder.record_fill(
                                     intent=exec_intent,
                                     fill=exec_fill,
                                     fair_prices={intent.outcome: intent.price},
                                     execution_mode="paper",
                                 )
-                            await manager._notify_bid(exec_intent)
+                            await manager.notify_bid(exec_intent)
                         except Exception as exc:
                             logger.warning("paper_db_persist_failed", error=repr(exc))
         except Exception as exc:
@@ -434,8 +434,8 @@ async def settlement_loop(
                                     pnl_delta=fill.realized_pnl_delta,
                                 )
                                 try:
-                                    if manager._recorder is not None:
-                                        manager._recorder.record_settle(
+                                    if manager.recorder is not None:
+                                        manager.recorder.record_settle(
                                             intent=exec_intent,
                                             fill=exec_fill,
                                             fair_prices={outcome: 0.0},

@@ -27,4 +27,10 @@ def test_adapt_polymarket_fallback_id():
 
 
 def test_protocol_is_runtime_checkable():
-    assert hasattr(ExecutorProtocol, '__protocol_attrs__') or True  # Protocol exists
+    class FakeExecutor:
+        async def place_order(self, token_id, side, size, price, outcome="", order_type="GTC"):
+            return OrderResult(order_id="fake")
+        async def cancel_order(self, order_id):
+            return True
+
+    assert isinstance(FakeExecutor(), ExecutorProtocol)

@@ -187,14 +187,19 @@ class TradeRecorder:
         condition_id: str,
         closed_at: Optional[datetime],
     ) -> None:
-        """Close all open BUY PaperTrade records for a given condition_id."""
-        from sqlalchemy import and_
+        """Close all open BUY PaperTrade records for a given condition_id + strategy."""
+        from sqlalchemy import and_, func
+
+        strategy_filter = func.json_extract(
+            LiveObservation.game_state, "$.strategy_tag"
+        ) == self._strategy_tag
 
         buy_obs_ids = (
             session.query(LiveObservation.id)
             .filter(
                 LiveObservation.match_id == condition_id,
                 LiveObservation.event_type == self._event_type,
+                strategy_filter,
             )
             .all()
         )
