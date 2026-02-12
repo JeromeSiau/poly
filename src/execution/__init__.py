@@ -5,6 +5,7 @@ from src.execution.models import (
     OrderResult,
 )
 from src.execution.executor import ExecutorProtocol, adapt_polymarket_response
+from src.execution.trade_recorder import TradeRecorder
 
 __all__ = [
     "TradeIntent",
@@ -13,4 +14,5 @@ __all__ = [
     "OrderResult",
     "ExecutorProtocol",
     "adapt_polymarket_response",
+    "TradeRecorder",
 ]
