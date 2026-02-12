@@ -58,6 +58,7 @@ class TradeRecorder:
         fill: FillResult,
         fair_prices: dict[str, float] | None = None,
         execution_mode: str = "paper",
+        extra_state: dict[str, Any] | None = None,
     ) -> int:
         """Persist a fill (entry). Returns observation_id, or 0 if skipped."""
         if fill.shares <= 0:
@@ -68,6 +69,7 @@ class TradeRecorder:
             fair_prices=fair_prices,
             execution_mode=execution_mode,
             is_settle=False,
+            extra_state=extra_state,
         )
 
     def record_settle(
@@ -76,6 +78,7 @@ class TradeRecorder:
         intent: TradeIntent,
         fill: FillResult,
         fair_prices: dict[str, float] | None = None,
+        extra_state: dict[str, Any] | None = None,
     ) -> int:
         """Persist a settlement (exit). Closes related BUY records."""
         if fill.shares <= 0:
@@ -86,6 +89,7 @@ class TradeRecorder:
             fair_prices=fair_prices,
             execution_mode="settlement",
             is_settle=True,
+            extra_state=extra_state,
         )
 
     def _persist(
@@ -96,6 +100,7 @@ class TradeRecorder:
         fair_prices: dict[str, float] | None,
         execution_mode: str,
         is_settle: bool,
+        extra_state: dict[str, Any] | None = None,
     ) -> int:
         fair = fair_prices or {}
         fair_price = fair.get(intent.outcome, intent.price)
@@ -118,6 +123,8 @@ class TradeRecorder:
             "shares": fill.shares,
             "size_usd": intent.size_usd,
         }
+        if extra_state:
+            game_state.update(extra_state)
 
         # PnL fields for sells
         edge_realized: Optional[float] = None

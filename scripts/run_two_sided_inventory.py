@@ -43,6 +43,9 @@ from src.arb.two_sided_inventory import (
 )
 from src.db.database import get_sync_session, init_db
 from src.db.models import LiveObservation, OddsApiCache, PaperTrade
+from src.execution import TradeManager, TradeRecorder
+from src.execution import TradeIntent as ExecTradeIntent
+from src.execution import FillResult as ExecFillResult
 from src.feeds.odds_api import OddsApiClient, OddsApiSnapshot, OddsApiUsage
 from src.matching.bookmaker_matcher import (
     BookmakerEvent,
@@ -635,8 +638,67 @@ class ExternalFairRuntime:
         return self._stats
 
 
+def _to_exec_intent(intent: TradeIntent) -> ExecTradeIntent:
+    """Convert two-sided TradeIntent to execution TradeIntent."""
+    return ExecTradeIntent(
+        condition_id=intent.condition_id,
+        token_id=intent.token_id,
+        outcome=intent.outcome,
+        side=intent.side,
+        price=intent.price,
+        size_usd=intent.size_usd,
+        reason=intent.reason,
+        title=intent.title,
+        edge_pct=intent.edge_pct,
+        timestamp=intent.timestamp,
+    )
+
+
+def _to_exec_fill(fill: FillResult) -> ExecFillResult:
+    """Convert two-sided FillResult to execution FillResult."""
+    return ExecFillResult(
+        filled=fill.shares > 0,
+        shares=fill.shares,
+        avg_price=fill.fill_price,
+        pnl_delta=fill.realized_pnl_delta,
+    )
+
+
+def _build_extra_state(
+    *,
+    intent: TradeIntent,
+    fill: FillResult,
+    snapshot: Optional[MarketSnapshot],
+    min_edge_pct: float = 0.0,
+    exit_edge_pct: float = 0.0,
+) -> dict[str, Any]:
+    """Build the two-sided-specific extra game_state fields."""
+    quote = snapshot.outcomes.get(intent.outcome) if snapshot else None
+    extra: dict[str, Any] = {
+        "min_edge_pct": min_edge_pct,
+        "exit_edge_pct": exit_edge_pct,
+        "slug": snapshot.slug if snapshot else "",
+        "inventory_avg_price": fill.avg_price,
+        "inventory_remaining_shares": fill.remaining_shares,
+        "liquidity": snapshot.liquidity if snapshot else None,
+        "volume_24h": snapshot.volume_24h if snapshot else None,
+        "market_bid": quote.bid if quote else None,
+        "market_ask": quote.ask if quote else None,
+    }
+    if intent.reason.startswith("settlement_"):
+        extra["is_settlement"] = True
+    if intent.reason == "pair_merge":
+        extra["is_pair_merge"] = True
+    return extra
+
+
 class TwoSidedPaperRecorder:
-    """Persist and replay two-sided paper fills using existing dashboard tables."""
+    """Persist and replay two-sided paper fills.
+
+    Persistence is now delegated to :class:`TradeRecorder`; this class
+    retains the two-sided-specific ``replay_into_engine`` logic and a
+    backward-compatible ``persist_fill`` wrapper used by ``run_sniper.py``.
+    """
 
     def __init__(
         self,
@@ -654,9 +716,15 @@ class TwoSidedPaperRecorder:
         self._min_edge_pct = min_edge_pct
         self._exit_edge_pct = exit_edge_pct
         self._event_type = event_type
+        self._recorder = TradeRecorder(
+            db_url=database_url,
+            strategy_tag=strategy_tag,
+            event_type=event_type,
+            run_id=run_id,
+        )
 
     def bootstrap(self) -> None:
-        init_db(self._database_url)
+        self._recorder.bootstrap()
 
     def replay_into_engine(self, engine: TwoSidedInventoryEngine) -> int:
         stmt = (
@@ -738,127 +806,35 @@ class TwoSidedPaperRecorder:
         fair_prices: dict[str, float],
         execution_mode: str,
     ) -> None:
+        """Backward-compatible wrapper: delegates to TradeRecorder."""
         if fill.shares <= 0:
             return
 
-        fair_price = _to_float(fair_prices.get(intent.outcome), default=intent.price)
-        quote = snapshot.outcomes.get(intent.outcome) if snapshot else None
-        observation_ts = datetime.fromtimestamp(intent.timestamp, tz=timezone.utc)
-
-        game_state = {
-            "strategy": self._event_type,
-            "strategy_tag": self._strategy_tag,
-            "run_id": self._run_id,
-            "min_edge_pct": self._min_edge_pct,
-            "exit_edge_pct": self._exit_edge_pct,
-            "condition_id": intent.condition_id,
-            "title": intent.title,
-            "slug": snapshot.slug if snapshot else "",
-            "outcome": intent.outcome,
-            "token_id": intent.token_id,
-            "side": intent.side,
-            "reason": intent.reason,
-            "mode": execution_mode,
-            "fair_price": fair_price,
-            "edge_theoretical": intent.edge_pct,
-            "fill_price": fill.fill_price,
-            "shares": fill.shares,
-            "size_usd": intent.size_usd,
-            "inventory_avg_price": fill.avg_price,
-            "inventory_remaining_shares": fill.remaining_shares,
-            "liquidity": snapshot.liquidity if snapshot else None,
-            "volume_24h": snapshot.volume_24h if snapshot else None,
-            "market_bid": quote.bid if quote else None,
-            "market_ask": quote.ask if quote else None,
-        }
-        if intent.reason.startswith("settlement_"):
-            game_state["is_settlement"] = True
-        if intent.reason == "pair_merge":
-            game_state["is_pair_merge"] = True
-
-        edge_realized: Optional[float] = None
-        pnl: Optional[float] = None
-        exit_price: Optional[float] = None
-        is_open = True
-        closed_at: Optional[datetime] = None
-        if intent.side == "SELL":
-            pnl = fill.realized_pnl_delta
-            if not intent.reason.startswith("settlement_") and intent.reason != "pair_merge":
-                edge_realized = pnl / intent.size_usd if intent.size_usd > 0 else 0.0
-            exit_price = fill.fill_price
-            is_open = False
-            closed_at = observation_ts
-
-        observation = LiveObservation(
-            timestamp=observation_ts,
-            match_id=intent.condition_id,
-            event_type=self._event_type,
-            game_state=game_state,
-            model_prediction=fair_price,
-            polymarket_price=fill.fill_price,
+        extra = _build_extra_state(
+            intent=intent,
+            fill=fill,
+            snapshot=snapshot,
+            min_edge_pct=self._min_edge_pct,
+            exit_edge_pct=self._exit_edge_pct,
         )
-
-        trade = PaperTrade(
-            observation_id=0,  # set after flush
-            side=intent.side,
-            entry_price=intent.price,
-            simulated_fill_price=fill.fill_price,
-            size=intent.size_usd,
-            edge_theoretical=intent.edge_pct,
-            edge_realized=edge_realized,
-            exit_price=exit_price,
-            pnl=pnl,
-            is_open=is_open,
-            created_at=observation_ts,
-            closed_at=closed_at,
-        )
-
-        session = get_sync_session(self._database_url)
-        try:
-            session.add(observation)
-            session.flush()
-            trade.observation_id = int(observation.id)
-            session.add(trade)
-            # When settling, mark related BUY records as closed
-            if intent.side == "SELL":
-                self._close_buy_records(session, intent.condition_id, closed_at)
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
-    def _close_buy_records(
-        self,
-        session: Any,
-        condition_id: str,
-        closed_at: Optional[datetime],
-    ) -> None:
-        """Mark open BUY PaperTrades for a settled condition as closed."""
-        from sqlalchemy import and_
-
-        buy_obs_ids = (
-            session.query(LiveObservation.id)
-            .filter(
-                LiveObservation.match_id == condition_id,
-                LiveObservation.event_type == self._event_type,
+        exec_intent = _to_exec_intent(intent)
+        exec_fill = _to_exec_fill(fill)
+        is_settle = intent.reason.startswith("settlement_") or intent.reason == "pair_merge"
+        if is_settle:
+            self._recorder.record_settle(
+                intent=exec_intent,
+                fill=exec_fill,
+                fair_prices=fair_prices,
+                extra_state=extra,
             )
-            .all()
-        )
-        if not buy_obs_ids:
-            return
-        obs_id_list = [row[0] for row in buy_obs_ids]
-        session.query(PaperTrade).filter(
-            and_(
-                PaperTrade.observation_id.in_(obs_id_list),
-                PaperTrade.side == "BUY",
-                PaperTrade.is_open.is_(True),
+        else:
+            self._recorder.record_fill(
+                intent=exec_intent,
+                fill=exec_fill,
+                fair_prices=fair_prices,
+                execution_mode=execution_mode,
+                extra_state=extra,
             )
-        ).update(
-            {"is_open": False, "closed_at": closed_at},
-            synchronize_session="fetch",
-        )
 
 
 async def fetch_markets(
@@ -1263,7 +1239,8 @@ def settle_resolved_inventory(
     engine: TwoSidedInventoryEngine,
     resolved_conditions: dict[str, ResolvedCondition],
     *,
-    paper_recorder: Optional[TwoSidedPaperRecorder],
+    manager: Optional[TradeManager] = None,
+    paper_recorder: Optional[TwoSidedPaperRecorder] = None,
     now_ts: float,
 ) -> int:
     if not resolved_conditions:
@@ -1306,9 +1283,6 @@ def settle_resolved_inventory(
                 realized_pnl=fill.realized_pnl_delta,
             )
 
-            if paper_recorder is None:
-                continue
-
             intent = TradeIntent(
                 condition_id=condition_id,
                 title=resolved.title,
@@ -1321,23 +1295,45 @@ def settle_resolved_inventory(
                 reason="settlement_closed_market",
                 timestamp=now_ts,
             )
-            try:
-                paper_recorder.persist_fill(
-                    intent=intent,
-                    fill=fill,
-                    snapshot=None,
-                    fair_prices={outcome: settlement_price},
-                    execution_mode="paper_settlement",
+
+            if manager is not None and manager._recorder is not None:
+                extra = _build_extra_state(
+                    intent=intent, fill=fill, snapshot=None,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "paper_db_persist_failed",
-                    condition_id=condition_id,
-                    outcome=outcome,
-                    side="SELL",
-                    reason="settlement_closed_market",
-                    error=repr(exc),
-                )
+                try:
+                    manager._recorder.record_settle(
+                        intent=_to_exec_intent(intent),
+                        fill=_to_exec_fill(fill),
+                        fair_prices={outcome: settlement_price},
+                        extra_state=extra,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "paper_db_persist_failed",
+                        condition_id=condition_id,
+                        outcome=outcome,
+                        side="SELL",
+                        reason="settlement_closed_market",
+                        error=repr(exc),
+                    )
+            elif paper_recorder is not None:
+                try:
+                    paper_recorder.persist_fill(
+                        intent=intent,
+                        fill=fill,
+                        snapshot=None,
+                        fair_prices={outcome: settlement_price},
+                        execution_mode="paper_settlement",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "paper_db_persist_failed",
+                        condition_id=condition_id,
+                        outcome=outcome,
+                        side="SELL",
+                        reason="settlement_closed_market",
+                        error=repr(exc),
+                    )
 
     return settled
 
@@ -1346,7 +1342,8 @@ def paper_merge_binary_pairs(
     engine: TwoSidedInventoryEngine,
     snapshots_by_condition: dict[str, MarketSnapshot],
     *,
-    paper_recorder: Optional[TwoSidedPaperRecorder],
+    manager: Optional[TradeManager] = None,
+    paper_recorder: Optional[TwoSidedPaperRecorder] = None,
     now_ts: float,
     min_edge_pct: float,
     max_pair_notional_usd: float,
@@ -1387,6 +1384,7 @@ def paper_merge_binary_pairs(
 
         leg_size_usd = merge_shares * DEFAULT_PAIR_MERGE_PRICE
         realized_total = 0.0
+        fair_prices = {out_a: DEFAULT_PAIR_MERGE_PRICE, out_b: DEFAULT_PAIR_MERGE_PRICE}
         for outcome in (out_a, out_b):
             quote = snapshot.outcomes.get(outcome)
             intent = TradeIntent(
@@ -1406,28 +1404,45 @@ def paper_merge_binary_pairs(
                 continue
             realized_total += fill.realized_pnl_delta
 
-            if paper_recorder is None:
-                continue
-            try:
-                paper_recorder.persist_fill(
-                    intent=intent,
-                    fill=fill,
-                    snapshot=snapshot,
-                    fair_prices={
-                        out_a: DEFAULT_PAIR_MERGE_PRICE,
-                        out_b: DEFAULT_PAIR_MERGE_PRICE,
-                    },
-                    execution_mode="paper_merge",
+            if manager is not None and manager._recorder is not None:
+                extra = _build_extra_state(
+                    intent=intent, fill=fill, snapshot=snapshot,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "paper_db_persist_failed",
-                    condition_id=condition_id,
-                    outcome=outcome,
-                    side="SELL",
-                    reason="pair_merge",
-                    error=repr(exc),
-                )
+                try:
+                    manager._recorder.record_fill(
+                        intent=_to_exec_intent(intent),
+                        fill=_to_exec_fill(fill),
+                        fair_prices=fair_prices,
+                        execution_mode="paper_merge",
+                        extra_state=extra,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "paper_db_persist_failed",
+                        condition_id=condition_id,
+                        outcome=outcome,
+                        side="SELL",
+                        reason="pair_merge",
+                        error=repr(exc),
+                    )
+            elif paper_recorder is not None:
+                try:
+                    paper_recorder.persist_fill(
+                        intent=intent,
+                        fill=fill,
+                        snapshot=snapshot,
+                        fair_prices=fair_prices,
+                        execution_mode="paper_merge",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "paper_db_persist_failed",
+                        condition_id=condition_id,
+                        outcome=outcome,
+                        side="SELL",
+                        reason="pair_merge",
+                        error=repr(exc),
+                    )
 
         merged_pairs += 1
         logger.info(
@@ -1531,7 +1546,7 @@ async def run_cycle(
     engine: TwoSidedInventoryEngine,
     executor: Optional[PolymarketExecutor],
     fair_runtime: Optional[ExternalFairRuntime],
-    paper_recorder: Optional[TwoSidedPaperRecorder],
+    manager: Optional[TradeManager],
     args: argparse.Namespace,
     signal_memory: dict[tuple[str, str, str, int], float],
     pending_maker_orders: Optional[list[PendingMakerOrder]] = None,
@@ -1606,15 +1621,18 @@ async def run_cycle(
                     price=pending.intent.price,
                     age_seconds=round(age, 1),
                 )
-                if paper_recorder is not None and args.persist_paper:
+                if manager is not None and manager._recorder is not None and args.persist_paper:
                     fair_prices = engine.compute_fair_prices(snapshot)
+                    extra = _build_extra_state(
+                        intent=pending.intent, fill=fill, snapshot=snapshot,
+                    )
                     try:
-                        paper_recorder.persist_fill(
-                            intent=pending.intent,
-                            fill=fill,
-                            snapshot=snapshot,
+                        manager._recorder.record_fill(
+                            intent=_to_exec_intent(pending.intent),
+                            fill=_to_exec_fill(fill),
                             fair_prices=fair_prices,
                             execution_mode="maker_paper",
+                            extra_state=extra,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1646,14 +1664,14 @@ async def run_cycle(
             settled = settle_resolved_inventory(
                 engine=engine,
                 resolved_conditions=resolved_conditions,
-                paper_recorder=paper_recorder if args.persist_paper else None,
+                manager=manager if args.persist_paper else None,
                 now_ts=now,
             )
     if args.paper_fill and args.pair_merge:
         merged = paper_merge_binary_pairs(
             engine=engine,
             snapshots_by_condition=snapshots_by_condition,
-            paper_recorder=paper_recorder if args.persist_paper else None,
+            manager=manager if args.persist_paper else None,
             now_ts=now,
             min_edge_pct=args.pair_merge_min_edge,
             max_pair_notional_usd=args.max_order,
@@ -1754,14 +1772,18 @@ async def run_cycle(
                     price=intent.price,
                     status=status,
                 )
-                if paper_recorder is not None:
+                if manager is not None and manager._recorder is not None:
+                    snapshot = snapshots_by_condition.get(intent.condition_id)
+                    extra = _build_extra_state(
+                        intent=intent, fill=fill, snapshot=snapshot,
+                    )
                     try:
-                        paper_recorder.persist_fill(
-                            intent=intent,
-                            fill=fill,
-                            snapshot=snapshots_by_condition.get(intent.condition_id),
+                        manager._recorder.record_fill(
+                            intent=_to_exec_intent(intent),
+                            fill=_to_exec_fill(fill),
                             fair_prices=fair_cache.get(intent.condition_id, {}),
                             execution_mode="autopilot",
+                            extra_state=extra,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1796,14 +1818,18 @@ async def run_cycle(
             else:
                 fill = engine.apply_fill(intent)
                 executed += 1
-                if paper_recorder is not None:
+                if manager is not None and manager._recorder is not None:
+                    snapshot = snapshots_by_condition.get(intent.condition_id)
+                    extra = _build_extra_state(
+                        intent=intent, fill=fill, snapshot=snapshot,
+                    )
                     try:
-                        paper_recorder.persist_fill(
-                            intent=intent,
-                            fill=fill,
-                            snapshot=snapshots_by_condition.get(intent.condition_id),
+                        manager._recorder.record_fill(
+                            intent=_to_exec_intent(intent),
+                            fill=_to_exec_fill(fill),
                             fair_prices=fair_cache.get(intent.condition_id, {}),
                             execution_mode="paper",
+                            extra_state=extra,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -2197,18 +2223,29 @@ async def main() -> None:
         )
     signal_memory: dict[tuple[str, str, str, int], float] = {}
     pending_maker_orders: list[PendingMakerOrder] = [] if args.maker_mode else []
-    paper_recorder: Optional[TwoSidedPaperRecorder] = None
+
+    # TradeManager replaces TwoSidedPaperRecorder for DB + Telegram.
+    # TwoSidedPaperRecorder is still used only for replay_into_engine().
+    manager: Optional[TradeManager] = None
     if args.persist_paper:
-        paper_recorder = TwoSidedPaperRecorder(
-            args.db_url,
-            strategy_tag=strategy_tag,
+        manager = TradeManager(
+            strategy=strategy_tag,
+            paper=not args.autopilot,
+            db_url=args.db_url,
+            event_type=TWO_SIDED_EVENT_TYPE,
             run_id=run_id,
-            min_edge_pct=args.min_edge,
-            exit_edge_pct=args.exit_edge,
         )
-        paper_recorder.bootstrap()
+        # Replay uses TwoSidedPaperRecorder (reads DB, feeds engine state)
         if args.resume_paper:
-            restored = paper_recorder.replay_into_engine(engine)
+            replay_recorder = TwoSidedPaperRecorder(
+                args.db_url,
+                strategy_tag=strategy_tag,
+                run_id=run_id,
+                min_edge_pct=args.min_edge,
+                exit_edge_pct=args.exit_edge,
+            )
+            replay_recorder.bootstrap()
+            restored = replay_recorder.replay_into_engine(engine)
             logger.info(
                 "paper_inventory_restored",
                 strategy_tag=strategy_tag,
@@ -2227,17 +2264,21 @@ async def main() -> None:
     )
 
     timeout = httpx.Timeout(20.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if args.mode == "scan":
-            await run_cycle(client, engine, executor, fair_runtime, paper_recorder, args, signal_memory, pending_maker_orders)
-            return
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            if args.mode == "scan":
+                await run_cycle(client, engine, executor, fair_runtime, manager, args, signal_memory, pending_maker_orders)
+                return
 
-        while True:
-            try:
-                await run_cycle(client, engine, executor, fair_runtime, paper_recorder, args, signal_memory, pending_maker_orders)
-            except Exception as exc:
-                logger.error("watch_cycle_error", error=str(exc))
-            await asyncio.sleep(args.interval)
+            while True:
+                try:
+                    await run_cycle(client, engine, executor, fair_runtime, manager, args, signal_memory, pending_maker_orders)
+                except Exception as exc:
+                    logger.error("watch_cycle_error", error=str(exc))
+                await asyncio.sleep(args.interval)
+    finally:
+        if manager is not None:
+            await manager.close()
 
 
 if __name__ == "__main__":
