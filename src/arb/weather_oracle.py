@@ -18,14 +18,14 @@ from dataclasses import asdict, dataclass, field
 from datetime import date as date_type
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
 
 from config.settings import settings
-from src.db.database import get_sync_session, init_db
-from src.db.models import LiveObservation
-from src.db.models import PaperTrade as PaperTradeDB
+
+if TYPE_CHECKING:
+    from src.execution.trade_manager import TradeManager
 
 logger = structlog.get_logger()
 
@@ -389,10 +389,12 @@ class WeatherOracleEngine:
         fetcher=None,
         scanner=None,
         database_url: str = "sqlite:///data/arb.db",
+        manager: Optional["TradeManager"] = None,
     ):
         self.fetcher = fetcher or OpenMeteoFetcher()
         self.scanner = scanner or WeatherMarketScanner()
         self._database_url = database_url
+        self.manager = manager
 
         # Days-to-resolution filter
         self.min_days_to_resolution = settings.WEATHER_ORACLE_MIN_DAYS_TO_RESOLUTION
@@ -702,6 +704,9 @@ class WeatherOracleEngine:
         self._entered_markets.add(entry_key)
         self._daily_spend += size
 
+        # Persist entry via TradeManager
+        self._record_entry(trade)
+
         logger.info(
             "weather_paper_trade_entered",
             city=trade.city,
@@ -783,68 +788,116 @@ class WeatherOracleEngine:
         self._open_trades = still_open
         return resolved
 
-    def _save_trade(self, trade: WeatherPaperTrade) -> None:
-        """Persist trade to DB (LiveObservation + PaperTrade) and JSONL backup."""
-        now = datetime.now(timezone.utc)
-        strategy_tag = "weather_oracle"
-
-        game_state = {
-            "strategy": "weather_oracle",
-            "strategy_tag": strategy_tag,
+    def _extra_state(self, trade: WeatherPaperTrade) -> dict[str, Any]:
+        """Build strategy-specific extra_state for TradeRecorder."""
+        return {
             "city": trade.city,
             "target_date": trade.target_date,
-            "condition_id": trade.condition_id,
-            "outcome": trade.outcome,
-            "side": trade.side,
-            "trade_type": trade.trade_type,
             "slug": trade.market_slug,
+            "trade_type": trade.trade_type,
             "forecast_temp_max": trade.forecast_temp_max,
             "forecast_temp_min": trade.forecast_temp_min,
             "confidence": trade.confidence,
-            "reason": trade.reason,
-            "title": f"{trade.city} {trade.target_date} → {trade.side} {trade.outcome}",
         }
 
-        edge = trade.pnl_usd / trade.size_usd if trade.size_usd > 0 else 0.0
+    def _record_entry(self, trade: WeatherPaperTrade) -> None:
+        """Persist entry via TradeManager recorder + Telegram + JSONL backup."""
+        if self.manager and self.manager._recorder:
+            from src.execution.models import FillResult, TradeIntent
 
-        observation = LiveObservation(
-            timestamp=now,
-            match_id=trade.condition_id,
-            event_type=WEATHER_ORACLE_EVENT_TYPE,
-            game_state=game_state,
-            model_prediction=trade.confidence,
-            polymarket_price=trade.entry_price,
-        )
-
-        db_trade = PaperTradeDB(
-            observation_id=0,
-            side=trade.side,
-            entry_price=trade.entry_price,
-            simulated_fill_price=trade.entry_price,
-            size=trade.size_usd,
-            edge_theoretical=edge,
-            edge_realized=edge,
-            exit_price=1.0 if trade.won else 0.0,
-            pnl=trade.pnl_usd,
-            created_at=now,
-        )
-
-        try:
-            session = get_sync_session(self._database_url)
+            intent = TradeIntent(
+                condition_id=trade.condition_id,
+                token_id="",
+                outcome=trade.outcome,
+                side=trade.side,
+                price=trade.entry_price,
+                size_usd=trade.size_usd,
+                reason=trade.reason,
+                title=f"{trade.city} {trade.target_date} \u2192 {trade.side} {trade.outcome}",
+                edge_pct=trade.confidence,
+                timestamp=time.time(),
+            )
+            fill = FillResult(
+                filled=True,
+                shares=trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0.0,
+                avg_price=trade.entry_price,
+            )
             try:
-                session.add(observation)
-                session.flush()
-                db_trade.observation_id = int(observation.id)
-                session.add(db_trade)
-                session.commit()
-            except Exception:
-                session.rollback()
-                logger.warning("db_save_error", trade_id=trade.id)
-            finally:
-                session.close()
-        except Exception as e:
-            logger.warning("db_connect_error", error=str(e))
+                self.manager._recorder.record_fill(
+                    intent=intent,
+                    fill=fill,
+                    fair_prices={trade.outcome: trade.entry_price},
+                    execution_mode="paper",
+                    extra_state=self._extra_state(trade),
+                )
+            except Exception as exc:
+                logger.warning("record_entry_failed", trade_id=trade.id, error=str(exc))
 
+            # Telegram notification (fire-and-forget)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.manager._notify_bid(intent))
+            except RuntimeError:
+                pass
+
+    def _save_trade(self, trade: WeatherPaperTrade) -> None:
+        """Persist resolved trade via TradeManager recorder + Telegram + JSONL backup."""
+        if self.manager and self.manager._recorder:
+            from src.execution.models import FillResult, TradeIntent
+
+            title = f"{trade.city} {trade.target_date} \u2192 {trade.side} {trade.outcome}"
+            settlement_price = 1.0 if trade.won else 0.0
+            settle_intent = TradeIntent(
+                condition_id=trade.condition_id,
+                token_id="",
+                outcome=trade.outcome,
+                side="SELL",
+                price=settlement_price,
+                size_usd=trade.size_usd,
+                reason="settlement",
+                title=title,
+                edge_pct=0.0,
+                timestamp=time.time(),
+            )
+            pnl = trade.pnl_usd
+            settle_fill = FillResult(
+                filled=True,
+                shares=trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0.0,
+                avg_price=settlement_price,
+                pnl_delta=pnl,
+            )
+            try:
+                self.manager._recorder.record_settle(
+                    intent=settle_intent,
+                    fill=settle_fill,
+                    fair_prices={trade.outcome: settlement_price},
+                    extra_state=self._extra_state(trade),
+                )
+            except Exception as exc:
+                logger.warning("record_settle_failed", trade_id=trade.id, error=str(exc))
+
+            # Telegram notification (fire-and-forget)
+            try:
+                entry_intent = TradeIntent(
+                    condition_id=trade.condition_id,
+                    token_id="",
+                    outcome=trade.outcome,
+                    side=trade.side,
+                    price=trade.entry_price,
+                    size_usd=trade.size_usd,
+                    reason=trade.reason,
+                    title=title,
+                    edge_pct=trade.confidence,
+                    timestamp=time.time(),
+                )
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self.manager._notify_settle(entry_intent, settlement_price, pnl, trade.won)
+                )
+            except RuntimeError:
+                pass
+
+        # JSONL backup
         try:
             self.paper_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.paper_file, "a") as f:

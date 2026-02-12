@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import structlog
 
 from config.settings import settings
-from src.arb.weather_oracle import WeatherOracleEngine
-from src.db.database import init_db
+from src.arb.weather_oracle import WeatherOracleEngine, WEATHER_ORACLE_EVENT_TYPE
+from src.execution import TradeManager
 
 logger = structlog.get_logger()
 
@@ -100,18 +100,34 @@ async def run_scan_once(engine: WeatherOracleEngine) -> None:
 async def main():
     args = build_parser().parse_args()
 
-    init_db(args.db_url)
+    from datetime import datetime, timezone
 
-    engine = WeatherOracleEngine(database_url=args.db_url)
+    run_id = f"weather_oracle-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+    manager = TradeManager(
+        strategy="WeatherOracle",
+        paper=True,
+        db_url=args.db_url,
+        event_type=WEATHER_ORACLE_EVENT_TYPE,
+        run_id=run_id,
+        notify_bids=True,
+        notify_fills=False,
+        notify_closes=True,
+    )
+
+    engine = WeatherOracleEngine(database_url=args.db_url, manager=manager)
     engine.max_entry_price = args.max_entry_price
     engine.min_confidence = args.min_confidence
     engine.paper_size = args.paper_size
     engine.max_daily_spend = args.max_daily_spend
 
-    if args.mode == "scan":
-        await run_scan_once(engine)
-    else:
-        await engine.run()
+    try:
+        if args.mode == "scan":
+            await run_scan_once(engine)
+        else:
+            await engine.run()
+    finally:
+        await manager.close()
 
 
 if __name__ == "__main__":
