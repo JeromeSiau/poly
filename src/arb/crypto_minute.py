@@ -21,14 +21,14 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
 
 from config.settings import settings
-from src.db.database import get_sync_session, init_db
-from src.db.models import LiveObservation
-from src.db.models import PaperTrade as PaperTradeDB
+
+if TYPE_CHECKING:
+    from src.execution.trade_manager import TradeManager
 
 logger = structlog.get_logger()
 
@@ -317,11 +317,13 @@ class CryptoMinuteEngine:
         poller: Optional[BinanceSpotPoller] = None,
         scanner: Optional[MarketScanner] = None,
         database_url: str = "sqlite:///data/arb.db",
+        manager: Optional["TradeManager"] = None,
     ):
         symbols = settings.CRYPTO_MINUTE_SYMBOLS.split(",")
         self.poller = poller or BinanceSpotPoller(symbols)
         self.scanner = scanner or MarketScanner(symbols)
         self._database_url = database_url
+        self.manager = manager
 
         # Strategy thresholds
         self.td_threshold = settings.CRYPTO_MINUTE_TD_THRESHOLD
@@ -446,6 +448,9 @@ class CryptoMinuteEngine:
             self._entered_markets[opp.market.slug] = set()
         self._entered_markets[opp.market.slug].add(opp.strategy)
 
+        # Persist entry via TradeManager
+        self._record_entry(trade)
+
         logger.info(
             "paper_trade_entered",
             strategy=trade.strategy,
@@ -521,20 +526,11 @@ class CryptoMinuteEngine:
         self._open_trades = still_open
         return resolved
 
-    def _save_trade(self, trade: PaperTrade) -> None:
-        """Persist trade to DB (LiveObservation + PaperTrade) and JSONL backup."""
-        now = datetime.now(timezone.utc)
-        strategy_tag = f"crypto_minute_{trade.strategy}"
-
-        game_state = {
-            "strategy": "crypto_minute",
-            "strategy_tag": strategy_tag,
+    def _extra_state(self, trade: PaperTrade) -> dict[str, Any]:
+        """Build strategy-specific extra_state for TradeRecorder."""
+        return {
             "sub_strategy": trade.strategy,
             "symbol": trade.symbol,
-            "condition_id": trade.market_slug,
-            "title": f"{trade.symbol} {trade.side} ({trade.strategy})",
-            "outcome": trade.side,
-            "side": "BUY",
             "slug": trade.market_slug,
             "spot_at_entry": trade.spot_at_entry,
             "spot_at_resolution": trade.spot_at_resolution,
@@ -542,55 +538,113 @@ class CryptoMinuteEngine:
             "gap_bucket": trade.gap_bucket,
             "time_remaining_s": trade.time_remaining_s,
             "time_bucket": trade.time_bucket,
-            "fair_price": 1.0 - trade.entry_price if trade.won else trade.entry_price,
-            "market_bid": trade.entry_price,
-            "market_ask": trade.entry_price,
         }
 
-        edge_theoretical = trade.pnl_usd / trade.size_usd if trade.size_usd > 0 else 0.0
+    def _record_entry(self, trade: PaperTrade) -> None:
+        """Persist entry via TradeManager recorder + Telegram."""
+        if self.manager and self.manager._recorder:
+            from src.execution.models import FillResult, TradeIntent
 
-        observation = LiveObservation(
-            timestamp=now,
-            match_id=trade.market_slug,
-            event_type=CRYPTO_MINUTE_EVENT_TYPE,
-            game_state=game_state,
-            model_prediction=game_state["fair_price"],
-            polymarket_price=trade.entry_price,
-        )
-
-        db_trade = PaperTradeDB(
-            observation_id=0,
-            side="BUY",
-            entry_price=trade.entry_price,
-            simulated_fill_price=trade.entry_price,
-            size=trade.size_usd,
-            edge_theoretical=edge_theoretical,
-            edge_realized=edge_theoretical,
-            exit_price=1.0 if trade.won else 0.0,
-            pnl=trade.pnl_usd,
-            created_at=now,
-        )
-
-        try:
-            session = get_sync_session(self._database_url)
+            title = f"{trade.symbol} {trade.side} ({trade.strategy})"
+            intent = TradeIntent(
+                condition_id=trade.market_slug,
+                token_id="",
+                outcome=trade.side,
+                side="BUY",
+                price=trade.entry_price,
+                size_usd=trade.size_usd,
+                reason=trade.strategy,
+                title=title,
+                edge_pct=0.0,
+                timestamp=time.time(),
+            )
+            fill = FillResult(
+                filled=True,
+                shares=trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0.0,
+                avg_price=trade.entry_price,
+            )
             try:
-                session.add(observation)
-                session.flush()
-                db_trade.observation_id = int(observation.id)
-                session.add(db_trade)
-                session.commit()
-            except Exception:
-                session.rollback()
-                logger.warning("db_save_error", trade_id=trade.id)
-            finally:
-                session.close()
-        except Exception as e:
-            logger.warning("db_connect_error", error=str(e))
+                self.manager._recorder.record_fill(
+                    intent=intent,
+                    fill=fill,
+                    fair_prices={trade.side: trade.entry_price},
+                    execution_mode="paper",
+                    extra_state=self._extra_state(trade),
+                )
+            except Exception as exc:
+                logger.warning("record_entry_failed", trade_id=trade.id, error=str(exc))
+
+            # Telegram notification (fire-and-forget)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.manager._notify_bid(intent))
+            except RuntimeError:
+                pass
+
+    def _save_trade(self, trade: PaperTrade) -> None:
+        """Persist resolved trade via TradeManager recorder + Telegram + JSONL backup."""
+        if self.manager and self.manager._recorder:
+            from src.execution.models import FillResult, TradeIntent
+
+            title = f"{trade.symbol} {trade.side} ({trade.strategy})"
+            settlement_price = 1.0 if trade.won else 0.0
+            settle_intent = TradeIntent(
+                condition_id=trade.market_slug,
+                token_id="",
+                outcome=trade.side,
+                side="SELL",
+                price=settlement_price,
+                size_usd=trade.size_usd,
+                reason="settlement",
+                title=title,
+                edge_pct=0.0,
+                timestamp=time.time(),
+            )
+            pnl = trade.pnl_usd
+            settle_fill = FillResult(
+                filled=True,
+                shares=trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0.0,
+                avg_price=settlement_price,
+                pnl_delta=pnl,
+            )
+            try:
+                self.manager._recorder.record_settle(
+                    intent=settle_intent,
+                    fill=settle_fill,
+                    fair_prices={trade.side: settlement_price},
+                    extra_state=self._extra_state(trade),
+                )
+            except Exception as exc:
+                logger.warning("record_settle_failed", trade_id=trade.id, error=str(exc))
+
+            # Telegram notification (fire-and-forget)
+            try:
+                entry_intent = TradeIntent(
+                    condition_id=trade.market_slug,
+                    token_id="",
+                    outcome=trade.side,
+                    side="BUY",
+                    price=trade.entry_price,
+                    size_usd=trade.size_usd,
+                    reason=trade.strategy,
+                    title=title,
+                    edge_pct=0.0,
+                    timestamp=time.time(),
+                )
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self.manager._notify_settle(entry_intent, settlement_price, pnl, trade.won)
+                )
+            except RuntimeError:
+                pass
 
         # JSONL backup
-        self.paper_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.paper_file, "a") as f:
-            f.write(json.dumps(asdict(trade)) + "\n")
+        try:
+            self.paper_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.paper_file, "a") as f:
+                f.write(json.dumps(asdict(trade)) + "\n")
+        except Exception as e:
+            logger.warning("jsonl_save_error", trade_id=trade.id, error=str(e))
 
     def get_stats(self) -> dict[str, Any]:
         """Return current paper trading stats."""

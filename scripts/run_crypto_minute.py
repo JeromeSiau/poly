@@ -16,8 +16,8 @@ import asyncio
 import structlog
 
 from config.settings import settings
-from src.arb.crypto_minute import CryptoMinuteEngine
-from src.db.database import init_db
+from src.arb.crypto_minute import CryptoMinuteEngine, CRYPTO_MINUTE_EVENT_TYPE
+from src.execution import TradeManager
 
 logger = structlog.get_logger()
 
@@ -25,9 +25,26 @@ DB_URL = "sqlite:///data/arb.db"
 
 
 async def main() -> None:
-    init_db(DB_URL)
-    engine = CryptoMinuteEngine(database_url=DB_URL)
-    await engine.run()
+    from datetime import datetime, timezone
+
+    run_id = f"crypto_minute-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+    manager = TradeManager(
+        strategy="CryptoMinute",
+        paper=True,
+        db_url=DB_URL,
+        event_type=CRYPTO_MINUTE_EVENT_TYPE,
+        run_id=run_id,
+        notify_bids=True,
+        notify_fills=False,
+        notify_closes=True,
+    )
+
+    engine = CryptoMinuteEngine(database_url=DB_URL, manager=manager)
+    try:
+        await engine.run()
+    finally:
+        await manager.close()
 
 
 if __name__ == "__main__":
