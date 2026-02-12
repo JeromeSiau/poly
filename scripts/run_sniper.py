@@ -34,6 +34,9 @@ from config.settings import Settings
 from src.analysis.event_condition_mapper import EventConditionMapper
 from src.arb.sniper_router import SniperRouter, SniperAction
 from src.arb.two_sided_inventory import TradeIntent, FillResult, TwoSidedInventoryEngine
+from src.execution import TradeManager
+from src.execution import TradeIntent as ExecTradeIntent
+from src.execution import FillResult as ExecFillResult
 from src.feeds.odds_api import OddsApiClient, ScoreTracker
 from src.feeds.spike_detector import SpikeDetector
 from scripts.run_two_sided_inventory import (
@@ -41,9 +44,6 @@ from scripts.run_two_sided_inventory import (
     settle_resolved_inventory,
     ResolvedCondition,
 )
-
-# Lazy import to avoid circular deps at module level
-TwoSidedPaperRecorder: Any = None
 
 logger = structlog.get_logger()
 
@@ -272,7 +272,7 @@ async def execution_loop(
     engine: TwoSidedInventoryEngine,
     max_order_usd: float,
     strategy_tag: str,
-    paper_recorder: Any = None,
+    manager: Optional[TradeManager] = None,
     dry_run: bool = False,
 ) -> None:
     """Consume actions from queue, fetch live ask, and paper-fill."""
@@ -340,15 +340,33 @@ async def execution_loop(
                         event_slug=action.source_event_slug,
                         tag=strategy_tag,
                     )
-                    if paper_recorder is not None:
+                    if manager is not None:
                         try:
-                            paper_recorder.persist_fill(
-                                intent=intent,
-                                fill=fill,
-                                snapshot=None,
-                                fair_prices={intent.outcome: intent.price},
-                                execution_mode="paper",
+                            exec_intent = ExecTradeIntent(
+                                condition_id=intent.condition_id,
+                                token_id=intent.token_id,
+                                outcome=intent.outcome,
+                                side=intent.side,
+                                price=intent.price,
+                                size_usd=intent.size_usd,
+                                reason=intent.reason,
+                                title=intent.title,
+                                edge_pct=intent.edge_pct,
+                                timestamp=intent.timestamp,
                             )
+                            exec_fill = ExecFillResult(
+                                filled=True,
+                                shares=fill.shares,
+                                avg_price=fill.fill_price,
+                            )
+                            if manager._recorder is not None:
+                                manager._recorder.record_fill(
+                                    intent=exec_intent,
+                                    fill=exec_fill,
+                                    fair_prices={intent.outcome: intent.price},
+                                    execution_mode="paper",
+                                )
+                            await manager._notify_bid(exec_intent)
                         except Exception as exc:
                             logger.warning("paper_db_persist_failed", error=repr(exc))
         except Exception as exc:
@@ -366,7 +384,7 @@ SETTLEMENT_MAX_HOLD_SECONDS = 24 * 3600  # 24h force-settle
 async def settlement_loop(
     client: httpx.AsyncClient,
     engine: TwoSidedInventoryEngine,
-    paper_recorder: Any,
+    manager: Optional[TradeManager] = None,
     interval: float = 120.0,
 ) -> None:
     """Periodically check open positions for market resolution and settle them."""
@@ -396,27 +414,34 @@ async def settlement_loop(
                                 hold_hours=round(hold_age / 3600, 1),
                                 pnl=round(fill.realized_pnl_delta, 4),
                             )
-                            if paper_recorder is not None:
-                                intent = TradeIntent(
+                            if manager is not None:
+                                exec_intent = ExecTradeIntent(
                                     condition_id=cid,
-                                    title="",
-                                    outcome=outcome,
                                     token_id="",
+                                    outcome=outcome,
                                     side="SELL",
                                     price=0.0,
                                     size_usd=0.0,
-                                    edge_pct=0.0,
                                     reason="settlement_timeout",
+                                    title="",
+                                    edge_pct=0.0,
                                     timestamp=now_ts,
                                 )
+                                exec_fill = ExecFillResult(
+                                    filled=True,
+                                    shares=fill.shares,
+                                    avg_price=fill.fill_price,
+                                    pnl_delta=fill.realized_pnl_delta,
+                                )
                                 try:
-                                    paper_recorder.persist_fill(
-                                        intent=intent,
-                                        fill=fill,
-                                        snapshot=None,
-                                        fair_prices={outcome: 0.0},
-                                        execution_mode="paper_settlement",
-                                    )
+                                    if manager._recorder is not None:
+                                        manager._recorder.record_settle(
+                                            intent=exec_intent,
+                                            fill=exec_fill,
+                                            fair_prices={outcome: 0.0},
+                                        )
+                                    won = fill.realized_pnl_delta >= 0
+                                    await manager.settle(cid, outcome, 0.0, won)
                                 except Exception as exc:
                                     logger.warning("settle_persist_failed", error=repr(exc))
 
@@ -442,7 +467,7 @@ async def settlement_loop(
                 settled = settle_resolved_inventory(
                     engine,
                     resolved,
-                    paper_recorder=paper_recorder,
+                    manager=manager,
                     now_ts=now_ts,
                 )
                 if settled:
@@ -505,21 +530,18 @@ async def main() -> None:
         max_market_net_usd=args.max_market_net,
     )
 
-    # Paper recorder for DB persistence (same as run_two_sided_inventory.py)
-    paper_recorder = None
+    # TradeManager for DB persistence + Telegram notifications
+    manager: Optional[TradeManager] = None
     if not args.dry_run:
-        from scripts.run_two_sided_inventory import TwoSidedPaperRecorder
         run_id = f"sniper_{uuid.uuid4().hex[:8]}"
-        paper_recorder = TwoSidedPaperRecorder(
-            args.db_url,
-            strategy_tag=args.strategy_tag,
-            run_id=run_id,
-            min_edge_pct=0.0,
-            exit_edge_pct=0.0,
+        manager = TradeManager(
+            strategy=args.strategy_tag,
+            paper=True,
+            db_url=args.db_url,
             event_type="sniper_sports",
+            run_id=run_id,
         )
-        paper_recorder.bootstrap()
-        logger.info("paper_recorder_ready", strategy_tag=args.strategy_tag, run_id=run_id)
+        logger.info("trade_manager_ready", strategy_tag=args.strategy_tag, run_id=run_id)
 
     prefixes = [p.strip() for p in args.event_prefixes.split(",") if p.strip()] or None
     scores_sports = [s.strip() for s in args.scores_sports.split(",") if s.strip()]
@@ -553,11 +575,11 @@ async def main() -> None:
                 client, action_queue, mapper, engine,
                 max_order_usd=args.max_order,
                 strategy_tag=args.strategy_tag,
-                paper_recorder=paper_recorder,
+                manager=manager,
                 dry_run=args.dry_run,
             )),
             asyncio.create_task(settlement_loop(
-                client, engine, paper_recorder,
+                client, engine, manager=manager,
                 interval=args.settlement_interval,
             )),
         ]
