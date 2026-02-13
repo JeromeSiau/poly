@@ -54,6 +54,7 @@ from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEv
 from src.utils.crypto_markets import CRYPTO_SYMBOL_TO_SLUG, fetch_crypto_markets
 from src.utils.parsing import parse_json_list, _to_float, _first_event_slug
 from src.execution import TradeManager, TradeIntent, FillResult
+from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -116,6 +117,7 @@ class CryptoTDMaker:
         discovery_interval: float = 60.0,
         maker_loop_interval: float = 0.5,
         strategy_tag: str = "crypto_td_maker",
+        guard: Optional[RiskGuard] = None,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -130,6 +132,8 @@ class CryptoTDMaker:
         self.discovery_interval = discovery_interval
         self.maker_loop_interval = maker_loop_interval
         self.strategy_tag = strategy_tag
+        self.guard = guard
+        self._last_book_update: float = time.time()
 
         # State
         self.known_markets: dict[str, dict[str, Any]] = {}  # cid -> raw market
@@ -242,6 +246,15 @@ class CryptoTDMaker:
         now = time.time()
         self._cycle_count += 1
 
+        # Circuit breaker gate
+        if self.guard:
+            await self.guard.heartbeat()
+            if not await self.guard.is_trading_allowed(last_book_update=self._last_book_update):
+                # Still check paper fills and settle — just don't place new orders
+                if self.paper_mode:
+                    self._check_fills_paper(now)
+                return
+
         # Check for paper fills every tick.
         if self.paper_mode:
             self._check_fills_paper(now)
@@ -271,6 +284,7 @@ class CryptoTDMaker:
                 bid, bid_sz, ask, ask_sz = self.polymarket.get_best_levels(cid, outcome)
                 if bid is not None:
                     self._last_bids[(cid, outcome)] = bid
+                    self._last_book_update = now
                 existing_key = (cid, outcome)
                 existing_oid = self._orders_by_cid_outcome.get(existing_key)
                 existing_order = self.active_orders.get(existing_oid) if existing_oid else None
@@ -348,6 +362,7 @@ class CryptoTDMaker:
 
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
+                f"cb={'ON' if (self.guard and self.guard.circuit_broken) else 'off'} "
                 f"mkts={len(self.known_markets)} "
                 f"orders={len(self.active_orders)} "
                 f"pos={len(self.positions)} "
@@ -605,6 +620,13 @@ class CryptoTDMaker:
             self.total_losses += 1
         self.realized_pnl += pnl
 
+        if self.guard:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.guard.record_result(pnl=pnl, won=won))
+            except RuntimeError:
+                pass
+
         logger.info(
             "td_position_settled",
             condition_id=pos.condition_id[:16],
@@ -702,6 +724,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--maker-interval", type=float, default=0.5, help="Maker loop tick interval")
     p.add_argument("--strategy-tag", type=str, default="crypto_td_maker")
     p.add_argument("--db-url", type=str, default=settings.DATABASE_URL)
+    p.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    p.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    p.add_argument("--cb-stale-seconds", type=float, default=30.0, help="Circuit breaker: book staleness threshold")
+    p.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return p
 
 
@@ -729,6 +755,17 @@ async def main() -> None:
         notify_fills=not paper_mode,
         notify_closes=not paper_mode,
     )
+
+    guard = RiskGuard(
+        strategy_tag=strategy_tag,
+        db_path=args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", ""),
+        max_consecutive_losses=args.cb_max_losses,
+        max_drawdown_usd=args.cb_max_drawdown,
+        stale_seconds=args.cb_stale_seconds,
+        daily_loss_limit_usd=args.cb_daily_limit,
+        telegram_alerter=manager._alerter,
+    )
+    await guard.initialize()
 
     polymarket = PolymarketFeed()
 
@@ -758,6 +795,7 @@ async def main() -> None:
         discovery_interval=args.discovery_interval,
         maker_loop_interval=args.maker_interval,
         strategy_tag=strategy_tag,
+        guard=guard,
     )
 
     print(f"=== Crypto TD Maker {'(PAPER)' if paper_mode else '(LIVE)'} ===")
