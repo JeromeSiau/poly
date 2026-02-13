@@ -26,11 +26,18 @@ CRYPTO_MAKER_EVENT_TYPE = "crypto_maker"
 TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
+_LIVE_MODES = {"live", "live_fill", "live_settlement", "autopilot"}
+
+
 def _obs_is_paper(observation: LiveObservation) -> bool:
-    """Return True if the observation was recorded in paper mode."""
+    """Return True if the observation was recorded in paper mode.
+
+    Only explicitly-live modes are classified as live; everything else
+    (including legacy or unknown modes) is treated as paper.
+    """
     gs = observation.game_state if isinstance(observation.game_state, dict) else {}
     mode = str(gs.get("mode", "paper")).lower()
-    return mode.startswith("paper") or mode.startswith("maker_paper")
+    return mode not in _LIVE_MODES
 
 
 def filter_by_execution_mode(
