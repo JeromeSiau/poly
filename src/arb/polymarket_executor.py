@@ -13,10 +13,18 @@ logger = structlog.get_logger()
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    from py_clob_client.clob_types import (
+        ApiCreds,
+        AssetType,
+        BalanceAllowanceParams,
+        OrderArgs,
+        OrderType,
+    )
 except ImportError:  # pragma: no cover - optional dependency in runtime
     ClobClient = None
     ApiCreds = None
+    AssetType = None
+    BalanceAllowanceParams = None
     OrderArgs = None
     OrderType = None
 
@@ -223,3 +231,19 @@ class PolymarketExecutor:
     async def get_open_orders(self, market: str = "") -> list[dict[str, Any]]:
         """Get open/live orders, optionally filtered by market (condition_id)."""
         return await asyncio.to_thread(self._get_open_orders_sync, market)
+
+    def _get_balance_sync(self) -> float:
+        self._ensure_creds()
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = self._client.get_balance_allowance(params)
+            # Response contains 'balance' as a string in USDC (6 decimals)
+            raw = resp.get("balance", "0") if isinstance(resp, dict) else "0"
+            return float(raw) / 1e6
+        except Exception as exc:
+            logger.warning("polymarket_get_balance_failed", error=str(exc))
+            return 0.0
+
+    async def get_balance(self) -> float:
+        """Return available USDC collateral balance."""
+        return await asyncio.to_thread(self._get_balance_sync)

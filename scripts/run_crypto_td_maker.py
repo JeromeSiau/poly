@@ -812,8 +812,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-bid", type=float, default=0.85,
         help="Max bid price to enter (default: 0.85)",
     )
-    p.add_argument("--order-size", type=float, default=10.0, help="USD per order")
-    p.add_argument("--max-exposure", type=float, default=200.0, help="Max total USD exposure")
+    p.add_argument("--wallet", type=float, default=0.0,
+                    help="Wallet USD (0 = auto-detect from Polymarket balance)")
+    p.add_argument("--order-size", type=float, default=0.0,
+                    help="USD per order (0 = derive from wallet * 0.025)")
+    p.add_argument("--max-exposure", type=float, default=0.0,
+                    help="Max total USD exposure (0 = derive from wallet * 0.50)")
     p.add_argument("--discovery-interval", type=float, default=60.0)
     p.add_argument("--maker-interval", type=float, default=0.5, help="Maker loop tick interval")
     p.add_argument("--strategy-tag", type=str, default="crypto_td_maker")
@@ -875,6 +879,18 @@ async def main() -> None:
                 api_passphrase=api_passphrase,
             )
 
+    # Resolve wallet → sizing
+    wallet = args.wallet
+    if wallet <= 0 and not paper_mode:
+        wallet = await manager.get_wallet_balance()
+        if wallet <= 0:
+            logger.error("auto_wallet_failed", hint="pass --wallet explicitly")
+            return
+        logger.info("auto_wallet_detected", wallet_usd=round(wallet, 2))
+
+    order_size = args.order_size if args.order_size > 0 else max(wallet * 0.025, 1.0)
+    max_exposure = args.max_exposure if args.max_exposure > 0 else max(wallet * 0.50, 50.0)
+
     maker = CryptoTDMaker(
         executor=executor,
         polymarket=polymarket,
@@ -883,8 +899,8 @@ async def main() -> None:
         symbols=symbols,
         target_bid=args.target_bid,
         max_bid=args.max_bid,
-        order_size_usd=args.order_size,
-        max_total_exposure_usd=args.max_exposure,
+        order_size_usd=order_size,
+        max_total_exposure_usd=max_exposure,
         paper_mode=paper_mode,
         discovery_interval=args.discovery_interval,
         maker_loop_interval=args.maker_interval,
@@ -893,11 +909,13 @@ async def main() -> None:
         db_url=args.db_url,
     )
 
+    wallet_src = "auto" if args.wallet <= 0 else "manual"
     print(f"=== Crypto TD Maker {'(PAPER)' if paper_mode else '(LIVE)'} ===")
     print(f"  Symbols:     {', '.join(symbols)}")
+    print(f"  Wallet:      ${wallet:.0f} ({wallet_src})")
     print(f"  Bid range:   [{args.target_bid}, {args.max_bid}]")
-    print(f"  Order size:  ${args.order_size}")
-    print(f"  Max exposure: ${args.max_exposure}")
+    print(f"  Order size:  ${order_size:.2f}")
+    print(f"  Max exposure: ${max_exposure:.2f}")
     print(f"  Strategy:    Watch books, bid at current bid when in range")
     print(f"               Hold filled positions to market resolution")
     print()

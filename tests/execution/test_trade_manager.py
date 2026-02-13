@@ -235,3 +235,80 @@ async def test_get_stats_initial(paper_manager):
     assert stats["losses"] == 0
     assert stats["total_pnl"] == 0.0
     assert stats["pending_orders"] == 0
+
+
+# --- get_wallet_balance() ---
+
+@pytest.mark.asyncio
+async def test_get_wallet_balance_paper_returns_zero(paper_manager):
+    """Paper mode has no executor, should return 0."""
+    balance = await paper_manager.get_wallet_balance()
+    assert balance == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_wallet_balance_live_no_pending(tmp_path):
+    from src.db.database import reset_engines
+    reset_engines()
+
+    executor = AsyncMock()
+    executor.get_balance = AsyncMock(return_value=300.0)
+    db_url = f"sqlite:///{tmp_path}/test_bal.db"
+    mgr = TradeManager(
+        executor=executor, strategy="TestStrat", paper=False,
+        db_url=db_url, event_type="test",
+    )
+    mgr._alerter = MagicMock()
+    mgr._alerter.send_custom_alert = AsyncMock(return_value=True)
+
+    balance = await mgr.get_wallet_balance()
+    assert balance == 300.0
+    executor.get_balance.assert_called_once()
+
+    reset_engines()
+
+
+@pytest.mark.asyncio
+async def test_get_wallet_balance_includes_pending(tmp_path, intent):
+    """Pending orders' locked value should be added back to available balance."""
+    from src.db.database import reset_engines
+    reset_engines()
+
+    executor = AsyncMock()
+    executor.get_balance = AsyncMock(return_value=290.0)  # 300 - 10 locked
+    executor.place_order = AsyncMock(return_value={"orderID": "o1", "status": "PLACED"})
+    db_url = f"sqlite:///{tmp_path}/test_bal2.db"
+    mgr = TradeManager(
+        executor=executor, strategy="TestStrat", paper=False,
+        db_url=db_url, event_type="test",
+    )
+    mgr._alerter = MagicMock()
+    mgr._alerter.send_custom_alert = AsyncMock(return_value=True)
+
+    await mgr.place(intent)  # places $10 order
+    balance = await mgr.get_wallet_balance()
+    assert balance == pytest.approx(300.0, abs=0.01)  # 290 + 10
+
+    reset_engines()
+
+
+@pytest.mark.asyncio
+async def test_get_wallet_balance_executor_error(tmp_path):
+    """If executor.get_balance() throws, return 0."""
+    from src.db.database import reset_engines
+    reset_engines()
+
+    executor = AsyncMock()
+    executor.get_balance = AsyncMock(side_effect=RuntimeError("network"))
+    db_url = f"sqlite:///{tmp_path}/test_bal3.db"
+    mgr = TradeManager(
+        executor=executor, strategy="TestStrat", paper=False,
+        db_url=db_url, event_type="test",
+    )
+    mgr._alerter = MagicMock()
+    mgr._alerter.send_custom_alert = AsyncMock(return_value=True)
+
+    balance = await mgr.get_wallet_balance()
+    assert balance == 0.0
+
+    reset_engines()

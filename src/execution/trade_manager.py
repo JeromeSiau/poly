@@ -377,6 +377,23 @@ class TradeManager:
             "open_positions": len(self._positions),
         }
 
+    async def get_wallet_balance(self) -> float:
+        """Fetch available USDC + own pending orders value.
+
+        Returns the effective wallet: what would be available if all
+        our pending orders were cancelled.  Returns 0.0 in paper mode
+        or if the executor does not support balance queries.
+        """
+        if self.paper or self.executor is None:
+            return 0.0
+        try:
+            available = await self.executor.get_balance()
+        except Exception as exc:
+            logger.warning("get_wallet_balance_failed", error=str(exc))
+            return 0.0
+        pending_locked = sum(p.intent.size_usd for p in self._pending.values())
+        return available + pending_locked
+
     async def close(self) -> None:
         await self._alerter.close()
 

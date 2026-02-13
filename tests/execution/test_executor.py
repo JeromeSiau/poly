@@ -32,5 +32,7 @@ def test_protocol_is_runtime_checkable():
             return OrderResult(order_id="fake")
         async def cancel_order(self, order_id):
             return True
+        async def get_balance(self):
+            return 100.0
 
     assert isinstance(FakeExecutor(), ExecutorProtocol)

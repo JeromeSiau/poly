@@ -23,6 +23,10 @@ class ExecutorProtocol(Protocol):
 
     async def cancel_order(self, order_id: str) -> dict[str, Any] | bool: ...
 
+    async def get_balance(self) -> float:
+        """Return available collateral (USDC) balance."""
+        ...
+
 
 def adapt_polymarket_response(raw: dict[str, Any]) -> OrderResult:
     """Convert PolymarketExecutor dict response to OrderResult."""

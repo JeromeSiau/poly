@@ -2,35 +2,28 @@
 """Backtest crypto TD maker strategy on historical Polymarket data.
 
 STRATEGY (from run_crypto_td_maker.py):
-    On Polymarket 15-min crypto binary markets (BTC/ETH up/down), place
-    passive maker bids when the best bid enters [target_bid, max_bid]
-    (default [0.75, 0.85]). Hold filled position to market resolution.
-    Maker orders pay 0 fees -- the edge is the gap between actual win
-    rate and the implied probability at entry price.
+    On Polymarket 15-min crypto binary markets (BTC/ETH up/down):
+    - BUY side: passive maker bids in [0.75, 0.85] — bet token resolves to 1.
+    - SELL side: passive maker asks in [0.15, 0.35] — bet token resolves to 0.
+    Maker orders pay 0 fees -- the edge is the gap between actual win rate
+    and the implied probability at entry price.
+
+    SELL at price P is economically identical to BUY the other side at (1-P).
+    The difference is order-book dynamics (spread/volume on each side).
 
 BACKTEST METHODOLOGY:
     Without orderbook history, we approximate maker fills using trade-level
-    VWAP in the bid range as the entry price proxy. For each resolved market,
-    if either outcome (Up or Down) has sufficient trade volume in [target_bid,
-    max_bid], we simulate a fill at the VWAP. If both qualify, we pick the
-    outcome with more volume (higher fill probability).
-
-    This is CONSERVATIVE for a maker because:
-    - Maker fills at their exact limit price (best case = target_bid)
-    - VWAP includes trades above the limit price
-    - Real edge may be higher than reported
+    VWAP in the bid/ask range as the entry price proxy. For each resolved
+    market, if either outcome has sufficient trade volume in the target zone,
+    we simulate a fill at the VWAP.
 
 DATASET: 41K resolved BTC/ETH 15-min updown markets (Oct 2025 - Feb 2026)
 
-FINDINGS:
-    (to be filled after first run)
-
 Usage:
     python scripts/backtest_crypto_td_maker.py
-    python scripts/backtest_crypto_td_maker.py --symbol BTC
-    python scripts/backtest_crypto_td_maker.py --target-bid 0.78 --max-bid 0.88
+    python scripts/backtest_crypto_td_maker.py --mode sell --sell-lo 0.15 --sell-hi 0.35
     python scripts/backtest_crypto_td_maker.py --sweep
-    python scripts/backtest_crypto_td_maker.py --no-chart
+    python scripts/backtest_crypto_td_maker.py --symbol BTC
 """
 
 from __future__ import annotations
@@ -276,8 +269,13 @@ def simulate(
     target_bid: float,
     max_bid: float,
     min_volume: float,
+    mode: str = "buy",
 ) -> StrategyStats:
-    """Simulate TD maker strategy across all markets chronologically."""
+    """Simulate TD maker strategy across all markets chronologically.
+
+    mode="buy":  BUY token at VWAP in zone, win if token resolves to 1.
+    mode="sell": SELL token at VWAP in zone, win if token resolves to 0.
+    """
     sorted_markets = sorted(markets, key=lambda m: m.end_date)
 
     stats = StrategyStats(
@@ -301,28 +299,37 @@ def simulate(
         # Entry rule: pick one outcome per market
         entry_price = 0.0
         side = ""
-        won = False
+        token_resolved_1 = False
 
         if up_ok and dn_ok:
-            # Both outcomes tradeable -- pick the one with more volume
             if m.up_vol_usd >= m.down_vol_usd:
-                entry_price, side, won = m.up_vwap, "Up", m.up_won
+                entry_price, side = m.up_vwap, "Up"
+                token_resolved_1 = m.up_won
             else:
-                entry_price, side, won = m.down_vwap, "Down", not m.up_won
+                entry_price, side = m.down_vwap, "Down"
+                token_resolved_1 = not m.up_won
         elif up_ok:
-            entry_price, side, won = m.up_vwap, "Up", m.up_won
+            entry_price, side = m.up_vwap, "Up"
+            token_resolved_1 = m.up_won
         elif dn_ok:
-            entry_price, side, won = m.down_vwap, "Down", not m.up_won
+            entry_price, side = m.down_vwap, "Down"
+            token_resolved_1 = not m.up_won
         else:
             continue
 
-        # PnL: buy tokens at entry_price, they resolve to 1 or 0
+        won = token_resolved_1 if mode == "buy" else not token_resolved_1
+
         actual_size = min(size_usd, current_capital)
+        if mode == "buy":
+            # BUY at P, win → (1/P - 1) * size, lose → -size
+            pnl = actual_size * (1.0 / entry_price - 1.0) if won else -actual_size
+        else:
+            # SELL at P, win (→0) → P/(1-P) * size, lose (→1) → -size
+            pnl = actual_size * entry_price / (1.0 - entry_price) if won else -actual_size
+
         if won:
-            pnl = actual_size * (1.0 / entry_price - 1.0)
             stats.win_count += 1
         else:
-            pnl = -actual_size
             stats.loss_count += 1
 
         current_capital += pnl
@@ -367,7 +374,7 @@ def compute_sharpe(trades: list[TradeResult]) -> float:
     return (mean_r / std_r) * math.sqrt(trades_per_year)
 
 
-def print_report(stats: StrategyStats, args: argparse.Namespace) -> None:
+def print_report(stats: StrategyStats, args: argparse.Namespace, mode: str = "buy") -> None:
     """Print results."""
     n = len(stats.trades)
     if n == 0:
@@ -378,10 +385,14 @@ def print_report(stats: StrategyStats, args: argparse.Namespace) -> None:
     ret_pct = stats.total_pnl / stats.initial_capital * 100
     avg_entry = sum(t.entry_price for t in stats.trades) / n
     avg_pnl = stats.total_pnl / n
-    be_wr = avg_entry * 100  # break-even win rate = entry price
+    # BUY break-even = entry price; SELL break-even = 1 - entry price
+    be_wr = avg_entry * 100 if mode == "buy" else (1.0 - avg_entry) * 100
     edge = win_rate - be_wr
 
-    print(f"\n  TD MAKER [{args.target_bid}-{args.max_bid}]")
+    zone_lo = args.target_bid if mode == "buy" else args.sell_lo
+    zone_hi = args.max_bid if mode == "buy" else args.sell_hi
+    label = "BUY" if mode == "buy" else "SELL"
+    print(f"\n  TD MAKER {label} [{zone_lo}-{zone_hi}]")
     print(f"  {'—' * 50}")
     print(f"  Trades:          {n:,}")
     print(f"  Wins / Losses:   {stats.win_count:,} / {stats.loss_count:,}")
@@ -407,13 +418,16 @@ def print_report(stats: StrategyStats, args: argparse.Namespace) -> None:
         s_wr = s_wins / len(st) * 100
         s_pnl = sum(t.pnl_usd for t in st)
         s_avg = sum(t.entry_price for t in st) / len(st)
-        s_edge = s_wr - s_avg * 100
+        s_be = s_avg * 100 if mode == "buy" else (1.0 - s_avg) * 100
+        s_edge = s_wr - s_be
         print(f"  {sym:<6} | {len(st):>6} | {s_wr:>4.1f}% | ${s_pnl:>+9,.2f} | {s_avg:>9.4f} | {s_edge:>+5.1f}%")
 
     # Breakdown by 1c entry price zone
     zones = []
-    lo = args.target_bid
-    while lo < args.max_bid - 0.001:
+    z_start = args.target_bid if mode == "buy" else args.sell_lo
+    z_end = args.max_bid if mode == "buy" else args.sell_hi
+    lo = z_start
+    while lo < z_end - 0.001:
         hi = round(lo + 0.01, 2)
         label = f"{lo:.2f}-{hi:.2f}"
         zones.append((label, lo, hi))
@@ -428,7 +442,7 @@ def print_report(stats: StrategyStats, args: argparse.Namespace) -> None:
         z_wins = sum(1 for t in zt if t.won)
         z_wr = z_wins / len(zt) * 100
         z_avg_entry = sum(t.entry_price for t in zt) / len(zt)
-        z_be = z_avg_entry * 100
+        z_be = z_avg_entry * 100 if mode == "buy" else (1.0 - z_avg_entry) * 100
         z_edge = z_wr - z_be
         print(f"  {label:<10} | {len(zt):>6} | {z_wr:>4.1f}% | {z_be:>9.1f}% | {z_edge:>+5.1f}%")
 
@@ -544,7 +558,31 @@ def run_sweep(
             cells.append(f"  ${s.total_pnl:>+7,.0f}")
         print(f"  tb={tb:.2f}" + "".join(cells))
 
-    # 4. Position size sensitivity at default bid range
+    # 4. SELL side sweep — vary sell range upper bound
+    print(f"\n  SELL SIDE — maker asks (bet token resolves to 0)")
+    sell_header = f"  {'Range':>12} | {'Trades':>6} | {'Win%':>5} | {'PnL':>12} | {'Return':>8} | {'Edge':>6} | {'Sharpe':>6}"
+    sell_div = f"  {'-'*12}-+-{'-'*6}-+-{'-'*5}-+-{'-'*12}-+-{'-'*8}-+-{'-'*6}-+-{'-'*6}"
+    print(sell_header)
+    print(sell_div)
+    for sell_hi in [0.20, 0.25, 0.30, 0.35, 0.40]:
+        sell_lo = max(sell_hi - 0.20, 0.05)
+        assign_vwap_from_buckets(markets, buckets_df, sell_lo, sell_hi)
+        s = simulate(markets, capital, size_usd, sell_lo, sell_hi, min_volume, mode="sell")
+        n = len(s.trades)
+        if n == 0:
+            zone = f"[{sell_lo:.2f},{sell_hi:.2f}]"
+            print(f"  {zone:>12} |      0 |    -- |           -- |       -- |     -- |     --")
+            continue
+        wr = s.win_count / n * 100
+        avg_e = sum(t.entry_price for t in s.trades) / n
+        be = (1.0 - avg_e) * 100
+        edge = wr - be
+        ret = s.total_pnl / capital * 100
+        sh = compute_sharpe(s.trades)
+        zone = f"[{sell_lo:.2f},{sell_hi:.2f}]"
+        print(f"  {zone:>12} | {n:>6} | {wr:>4.1f}% | ${s.total_pnl:>+11,.2f} | {ret:>+7.1f}% | {edge:>+5.1f}% | {sh:>6.2f}")
+
+    # 5. Position size sensitivity at default bid range
     sizes = [5, 10, 20, 50]
     print(f"\n  POSITION SIZE (target=0.75, max=0.85)")
     print(f"  {'Size':>6} | {'Trades':>6} | {'PnL':>12} | {'Return':>8} | {'MaxDD':>6}")
@@ -584,6 +622,12 @@ def main():
                         help="Min USD volume in bid range for entry")
     parser.add_argument("--symbol", default=None, choices=["BTC", "ETH"],
                         help="Filter to BTC or ETH only")
+    parser.add_argument("--mode", default=None, choices=["buy", "sell"],
+                        help="Run only buy or sell (default: both)")
+    parser.add_argument("--sell-lo", type=float, default=0.15,
+                        help="Sell zone lower bound (default: 0.15)")
+    parser.add_argument("--sell-hi", type=float, default=0.35,
+                        help="Sell zone upper bound (default: 0.35)")
     parser.add_argument("--sweep", action="store_true",
                         help="Run parameter sensitivity sweep")
     parser.add_argument("--no-chart", action="store_true",
@@ -612,39 +656,45 @@ def main():
     # Step 2: Compute trade buckets (single scan -- expensive)
     buckets_df = compute_trade_buckets(con, trades_dir, markets)
 
-    # Step 3: Assign VWAP from buckets
-    assign_vwap_from_buckets(markets, buckets_df, args.target_bid, args.max_bid)
+    modes = [args.mode] if args.mode else ["buy", "sell"]
 
-    # Count tradeable markets
-    tradeable = sum(1 for m in markets
-                    if (m.up_vwap >= args.target_bid and m.up_vol_usd >= args.min_volume) or
-                       (m.down_vwap >= args.target_bid and m.down_vol_usd >= args.min_volume))
-    print(f"  Tradeable: {tradeable:,} markets with volume in [{args.target_bid}, {args.max_bid}]")
-
-    # Step 4: Simulate
     print()
     print("=" * 70)
     print("CRYPTO TD MAKER BACKTEST RESULTS")
     print("=" * 70)
     print(f"  Capital: ${args.capital:,.0f}  |  Size: ${args.size_usd:.0f}/trade  "
           f"|  Symbol: {args.symbol or 'ALL'}")
-    print(f"  Bid range: [{args.target_bid}, {args.max_bid}]  "
-          f"|  Min volume: ${args.min_volume:.0f}")
 
-    stats = simulate(markets, args.capital, args.size_usd,
-                     args.target_bid, args.max_bid, args.min_volume)
-    print_report(stats, args)
+    buy_stats = None
+    for mode in modes:
+        if mode == "buy":
+            lo, hi = args.target_bid, args.max_bid
+        else:
+            lo, hi = args.sell_lo, args.sell_hi
+
+        assign_vwap_from_buckets(markets, buckets_df, lo, hi)
+        tradeable = sum(1 for m in markets
+                        if (lo <= m.up_vwap <= hi and m.up_vol_usd >= args.min_volume) or
+                           (lo <= m.down_vwap <= hi and m.down_vol_usd >= args.min_volume))
+        print(f"\n  {mode.upper()} — Tradeable: {tradeable:,} markets with volume in [{lo}, {hi}]")
+
+        stats = simulate(markets, args.capital, args.size_usd, lo, hi,
+                         args.min_volume, mode=mode)
+        print_report(stats, args, mode=mode)
+        if mode == "buy":
+            buy_stats = stats
 
     print()
     print("=" * 70)
 
-    # Step 5: Sweep
+    # Sweep
     if args.sweep:
         run_sweep(markets, buckets_df, args.capital, args.size_usd, args.min_volume)
 
-    # Step 6: Capital curve
-    if not args.no_chart and stats.trades:
-        plot_capital_curve(stats, args)
+    # Capital curve (buy side only)
+    chart_stats = buy_stats or stats
+    if not args.no_chart and chart_stats.trades:
+        plot_capital_curve(chart_stats, args)
 
     con.close()
 
