@@ -152,7 +152,7 @@ class PolymarketFeed(BaseFeed):
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL)
+                self._ws = await websockets.connect(self.WS_URL, proxy=None)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("polymarket_ws_connected")
@@ -611,7 +611,7 @@ class PolymarketUserFeed:
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL)
+                self._ws = await websockets.connect(self.WS_URL, proxy=None)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("user_ws_connected")
