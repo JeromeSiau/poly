@@ -45,6 +45,7 @@ configure_logging()
 
 from config.settings import settings
 from src.execution import TradeManager, TradeIntent, FillResult
+from src.risk.guard import RiskGuard
 from src.feeds.kalshi_executor import (
     KalshiExecutor,
     KALSHI_API_BASE,
@@ -118,6 +119,7 @@ class KalshiTDMaker:
         paper_mode: bool = True,
         scan_interval: float = 120.0,
         symbols: list[str] | None = None,
+        guard: Optional[RiskGuard] = None,
     ) -> None:
         self.executor = executor
         self.manager = manager
@@ -129,6 +131,8 @@ class KalshiTDMaker:
         self.paper_mode = paper_mode
         self.scan_interval = scan_interval
         self.symbols = symbols or ["KXBTCD", "KXETHD"]
+        self.guard = guard
+        self._last_book_update: float = time.time()
 
         # State
         self.known_events: set[str] = set()
@@ -152,6 +156,12 @@ class KalshiTDMaker:
 
     async def _scan_and_bid(self) -> None:
         """Find new hourly crypto events and place passive bids on best strikes."""
+        # Circuit breaker gate
+        if self.guard:
+            await self.guard.heartbeat()
+            if not await self.guard.is_trading_allowed(last_book_update=self._last_book_update):
+                return
+
         for prefix in self.symbols:
             try:
                 data = await self.executor.api_get("/markets", params={
@@ -165,6 +175,7 @@ class KalshiTDMaker:
                 markets = data.get("markets", [])
                 if not markets:
                     continue
+                self._last_book_update = time.time()
 
                 # Group by event_ticker
                 events: dict[str, list[dict]] = {}
@@ -396,6 +407,15 @@ class KalshiTDMaker:
                     won = result == "yes"
                     settlement_price = 1.0 if won else 0.0
 
+                    entry_price_01 = pos.entry_price_cents / 100.0
+                    pnl = (settlement_price - entry_price_01) * pos.count if won else -pos.count * entry_price_01
+
+                    if self.guard:
+                        try:
+                            await self.guard.record_result(pnl=pnl, won=won)
+                        except Exception:
+                            pass
+
                     await self.manager.settle(
                         condition_id=pos.event_ticker,
                         outcome="yes",
@@ -428,6 +448,7 @@ class KalshiTDMaker:
             winrate = wins / total_fills * 100 if total_fills > 0 else 0
             print(
                 f"[{time.strftime('%H:%M:%S')}] "
+                f"cb={'ON' if (self.guard and self.guard.circuit_broken) else 'off'} "
                 f"events={len(self.known_events)} "
                 f"pending={stats['pending_orders']} "
                 f"positions={len(self.positions)} "
@@ -483,6 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--symbols", type=str, default="KXBTCD,KXETHD", help="Kalshi event prefixes")
     p.add_argument("--api-key-id", type=str, default="", help="Kalshi API key ID")
     p.add_argument("--private-key-path", type=str, default="", help="Path to RSA private key PEM")
+    p.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    p.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    p.add_argument("--cb-stale-seconds", type=float, default=300.0, help="Circuit breaker: book staleness threshold")
+    p.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return p
 
 
@@ -519,6 +544,18 @@ async def main() -> None:
         notify_closes=not paper_mode,
     )
 
+    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
+    guard = RiskGuard(
+        strategy_tag="kalshi_td_maker",
+        db_path=db_path,
+        max_consecutive_losses=args.cb_max_losses,
+        max_drawdown_usd=args.cb_max_drawdown,
+        stale_seconds=args.cb_stale_seconds,
+        daily_loss_limit_usd=args.cb_daily_limit,
+        telegram_alerter=manager._alerter,
+    )
+    await guard.initialize()
+
     maker = KalshiTDMaker(
         executor=executor,
         manager=manager,
@@ -530,6 +567,7 @@ async def main() -> None:
         paper_mode=paper_mode,
         scan_interval=args.scan_interval,
         symbols=symbols,
+        guard=guard,
     )
 
     print(f"=== Kalshi TD Maker {'(PAPER)' if paper_mode else '(LIVE)'} ===")

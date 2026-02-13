@@ -50,6 +50,7 @@ from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEv
 # Crypto market discovery and parsing utilities.
 from src.utils.crypto_markets import CRYPTO_SYMBOL_TO_SLUG, fetch_crypto_markets
 from src.utils.parsing import parse_json_list, _to_float, _first_event_slug
+from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -96,6 +97,7 @@ class CryptoMaker:
         max_outcome_inv_usd: float = 25.0,
         min_pair_profit: float = 0.01,
         strategy_tag: str = "crypto_maker",
+        guard: Optional[RiskGuard] = None,
     ) -> None:
         self.engine = engine
         self.executor = executor
@@ -113,6 +115,8 @@ class CryptoMaker:
         self.max_outcome_inv_usd = max_outcome_inv_usd
         self.min_pair_profit = min_pair_profit
         self.strategy_tag = strategy_tag
+        self.guard = guard
+        self._last_book_update: float = time.time()
 
         # State
         self.active_orders: dict[str, ActiveOrder] = {}
@@ -390,9 +394,17 @@ class CryptoMaker:
         now: float,
     ) -> None:
         """Persist a settlement via TradeManager."""
+        won = settlement_price >= 0.5
+        pnl = fill.realized_pnl_delta
+
+        if self.guard:
+            try:
+                await self.guard.record_result(pnl=pnl, won=won)
+            except Exception:
+                pass
+
         if self.manager is None:
             return
-        won = settlement_price >= 0.5
         try:
             await self.manager.settle(
                 condition_id=condition_id,
@@ -432,6 +444,16 @@ class CryptoMaker:
         now = time.time()
         self._cycle_count += 1
 
+        # Circuit breaker gate
+        if self.guard:
+            await self.guard.heartbeat()
+            if not await self.guard.is_trading_allowed(last_book_update=self._last_book_update):
+                # Still check fills and settle — just don't place new orders
+                if self.paper_mode or now - self._last_fill_check >= self.fill_check_interval:
+                    await self._check_fills(now)
+                    self._last_fill_check = now
+                return
+
         # Fill check: paper mode runs every tick (free, no I/O);
         # live mode throttled to fill_check_interval (HTTP polling).
         if self.paper_mode or now - self._last_fill_check >= self.fill_check_interval:
@@ -462,6 +484,7 @@ class CryptoMaker:
                 if levels[0] is not None:
                     book[outcome] = levels
                     self._last_bids[(cid, outcome)] = levels[0]
+                    self._last_book_update = now
 
             # GUARD 1: Require BOTH books present.  Without both sides we
             # cannot verify pair profitability and risk naked directional
@@ -600,7 +623,9 @@ class CryptoMaker:
         if self._cycle_count % 20 == 0:
             n_positions = sum(len(by_out) for by_out in inv.values())
             print(
-                f"[{time.strftime('%H:%M:%S')}] markets={len(self.known_markets)} "
+                f"[{time.strftime('%H:%M:%S')}] "
+                f"cb={'ON' if (self.guard and self.guard.circuit_broken) else 'off'} "
+                f"markets={len(self.known_markets)} "
                 f"active_orders={len(self.active_orders)} positions={n_positions} "
                 f"placed={orders_placed} cancelled={len(cancel_ids)} "
                 f"fills={len(paper_fill_ids)} "
@@ -917,6 +942,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-hold-seconds", type=float, default=900.0, help="Max hold before stale exit")
     p.add_argument("--strategy-tag", type=str, default="crypto_maker")
     p.add_argument("--db-url", type=str, default=settings.DATABASE_URL)
+    p.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    p.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    p.add_argument("--cb-stale-seconds", type=float, default=30.0, help="Circuit breaker: book staleness threshold")
+    p.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return p
 
 
@@ -957,6 +986,17 @@ async def main() -> None:
         notify_closes=not paper_mode,
     )
 
+    guard = RiskGuard(
+        strategy_tag=strategy_tag,
+        db_path=args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", ""),
+        max_consecutive_losses=args.cb_max_losses,
+        max_drawdown_usd=args.cb_max_drawdown,
+        stale_seconds=args.cb_stale_seconds,
+        daily_loss_limit_usd=args.cb_daily_limit,
+        telegram_alerter=manager._alerter,
+    )
+    await guard.initialize()
+
     binance = BinanceFeed(symbols=symbols)
     polymarket = PolymarketFeed()
 
@@ -990,6 +1030,7 @@ async def main() -> None:
         max_outcome_inv_usd=args.max_outcome_inv,
         min_pair_profit=args.min_pair_profit,
         strategy_tag=strategy_tag,
+        guard=guard,
     )
 
     await maker.run()
