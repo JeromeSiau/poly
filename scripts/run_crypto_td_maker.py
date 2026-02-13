@@ -20,9 +20,10 @@ STRATEGY (validated by backtest_crypto_minute.py):
     two-sided inventory pair-trade of run_crypto_maker.py.
 
 USAGE:
-    ./run run_crypto_td_maker.py --paper          # paper mode (default)
-    ./run run_crypto_td_maker.py --live            # real orders
-    ./run run_crypto_td_maker.py --target-bid 0.78 # adjust min entry level
+    ./run run_crypto_td_maker.py --paper             # BUY only (default)
+    ./run run_crypto_td_maker.py --sell               # BUY + SELL [0.15, 0.30]
+    ./run run_crypto_td_maker.py --sell --sell-hi 0.25 # custom sell range
+    ./run run_crypto_td_maker.py --live --sell         # real orders, both sides
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 
 @dataclass(slots=True)
 class PassiveOrder:
-    """A GTC maker bid waiting to be filled."""
+    """A GTC maker order (BUY or SELL) waiting to be filled."""
     order_id: str
     condition_id: str
     outcome: str  # "Up" or "Down"
@@ -75,18 +76,20 @@ class PassiveOrder:
     price: float
     size_usd: float
     placed_at: float
+    side: str = "BUY"  # "BUY" or "SELL"
 
 
 @dataclass(slots=True)
 class OpenPosition:
-    """A filled passive bid held until market resolution."""
+    """A filled passive order held until market resolution."""
     condition_id: str
     outcome: str
     token_id: str
     entry_price: float
     size_usd: float
-    shares: float  # size_usd / entry_price
+    shares: float  # BUY: size_usd / price, SELL: size_usd / (1-price)
     filled_at: float
+    side: str = "BUY"
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +114,8 @@ class CryptoTDMaker:
         symbols: list[str],
         target_bid: float = 0.75,
         max_bid: float = 0.85,
+        sell_lo: float = 0.0,
+        sell_hi: float = 0.0,
         order_size_usd: float = 10.0,
         max_total_exposure_usd: float = 200.0,
         paper_mode: bool = True,
@@ -127,6 +132,8 @@ class CryptoTDMaker:
         self.symbols = symbols
         self.target_bid = target_bid
         self.max_bid = max_bid
+        self.sell_lo = sell_lo
+        self.sell_hi = sell_hi
         self.order_size_usd = order_size_usd
         self.max_total_exposure_usd = max_total_exposure_usd
         self.paper_mode = paper_mode
@@ -172,12 +179,14 @@ class CryptoTDMaker:
             strategy_tag=self.strategy_tag,
         )
         for row in rows:
+            side = (row.extra or {}).get("side", "BUY")
             if row.status == "pending":
                 order = PassiveOrder(
                     order_id=row.order_id, condition_id=row.condition_id,
                     outcome=row.outcome, token_id=row.token_id,
                     price=row.price, size_usd=row.size_usd,
                     placed_at=row.placed_at or 0.0,
+                    side=side,
                 )
                 self.active_orders[row.order_id] = order
                 self._orders_by_cid_outcome[(row.condition_id, row.outcome)] = row.order_id
@@ -188,6 +197,7 @@ class CryptoTDMaker:
                     size_usd=row.size_usd,
                     shares=row.shares or row.size_usd / row.price,
                     filled_at=row.filled_at or 0.0,
+                    side=side,
                 )
                 self.positions[row.condition_id] = pos
         if self.active_orders or self.positions:
@@ -215,6 +225,7 @@ class CryptoTDMaker:
             outcome=order.outcome, price=order.price,
             size_usd=order.size_usd, status="pending",
             placed_at=order.placed_at,
+            extra={"side": order.side},
         )
 
     async def _db_mark_filled(self, order_id: str, shares: float, filled_at: float) -> None:
@@ -257,6 +268,7 @@ class CryptoTDMaker:
         )
 
         new_count = 0
+        new_user_markets: list[str] = []
         for mkt in raw_markets:
             cid = str(mkt.get("conditionId", ""))
             if not cid or cid in self.known_markets:
@@ -274,21 +286,31 @@ class CryptoTDMaker:
                 self.market_tokens[(cid, outcome)] = clob_ids[idx]
                 token_map[outcome] = clob_ids[idx]
 
-            # Subscribe to orderbook WS.
+            # Register tokens locally (don't send WS message yet).
             try:
-                await self.polymarket.subscribe_market(cid, token_map=token_map)
+                await self.polymarket.subscribe_market(
+                    cid, token_map=token_map, send=False,
+                )
             except Exception as exc:
                 logger.warning("ws_subscribe_failed", condition_id=cid, error=str(exc))
 
+            new_user_markets.append(cid)
+            new_count += 1
+
+        # Send ONE batched subscription for all new tokens at once,
+        # avoiding rapid-fire replace messages that cause dropped snapshots.
+        if new_count:
+            try:
+                await self.polymarket.flush_subscriptions()
+            except Exception as exc:
+                logger.warning("ws_flush_failed", error=str(exc))
+
             if self.user_feed and self.user_feed.is_connected:
                 try:
-                    await self.user_feed.subscribe_markets([cid])
+                    await self.user_feed.subscribe_markets(new_user_markets)
                 except Exception:
                     pass
 
-            new_count += 1
-
-        if new_count:
             logger.info(
                 "td_markets_discovered",
                 new=new_count,
@@ -345,8 +367,9 @@ class CryptoTDMaker:
         pending_exposure = sum(o.size_usd for o in self.active_orders.values())
         budget_left = self.max_total_exposure_usd - current_exposure - pending_exposure
 
+        sell_enabled = self.sell_lo > 0 and self.sell_hi > 0
         cancel_ids: list[str] = []
-        place_intents: list[tuple[str, str, str, float]] = []  # (cid, outcome, token_id, bid_price)
+        place_intents: list[tuple[str, str, str, float, str]] = []  # (cid, outcome, token_id, price, side)
 
         for cid in list(self.known_markets):
             # Skip if already have a position on this market.
@@ -370,34 +393,57 @@ class CryptoTDMaker:
                 existing_oid = self._orders_by_cid_outcome.get(existing_key)
                 existing_order = self.active_orders.get(existing_oid) if existing_oid else None
 
-                # Is the bid in our target range?
+                # BUY signal: bid in [target_bid, max_bid]
                 bid_in_range = (
                     bid is not None
                     and self.target_bid <= bid <= self.max_bid
                 )
+                # SELL signal: ask in [sell_lo, sell_hi]
+                ask_in_range = (
+                    sell_enabled
+                    and ask is not None
+                    and self.sell_lo <= ask <= self.sell_hi
+                )
 
                 if existing_order:
-                    if not bid_in_range:
-                        # Price left our range → cancel.
-                        cancel_ids.append(existing_order.order_id)
-                    elif existing_order.price != bid:
-                        # Bid moved within range → cancel and re-place at new bid.
-                        # Paper fill check: if bid dropped past our price, it's a fill.
-                        if self.paper_mode and bid < existing_order.price:
-                            self._process_fill(existing_order, now)
-                            oid = existing_order.order_id
-                            self.active_orders.pop(oid, None)
-                            if self._orders_by_cid_outcome.get(existing_key) == oid:
-                                del self._orders_by_cid_outcome[existing_key]
-                            self._cancel_other_side(cid, outcome)
-                        else:
+                    if existing_order.side == "BUY":
+                        if not bid_in_range:
                             cancel_ids.append(existing_order.order_id)
-                            if budget_left >= self.order_size_usd:
-                                place_intents.append((cid, outcome, token_id, bid))
+                        elif existing_order.price != bid:
+                            if self.paper_mode and bid < existing_order.price:
+                                self._process_fill(existing_order, now)
+                                oid = existing_order.order_id
+                                self.active_orders.pop(oid, None)
+                                if self._orders_by_cid_outcome.get(existing_key) == oid:
+                                    del self._orders_by_cid_outcome[existing_key]
+                                self._cancel_other_side(cid, outcome)
+                            else:
+                                cancel_ids.append(existing_order.order_id)
+                                if budget_left >= self.order_size_usd:
+                                    place_intents.append((cid, outcome, token_id, bid, "BUY"))
+                    else:  # SELL
+                        if not ask_in_range:
+                            cancel_ids.append(existing_order.order_id)
+                        elif existing_order.price != ask:
+                            # Ask rose past our price → our level was consumed → fill
+                            if self.paper_mode and ask > existing_order.price:
+                                self._process_fill(existing_order, now)
+                                oid = existing_order.order_id
+                                self.active_orders.pop(oid, None)
+                                if self._orders_by_cid_outcome.get(existing_key) == oid:
+                                    del self._orders_by_cid_outcome[existing_key]
+                                self._cancel_other_side(cid, outcome)
+                            else:
+                                cancel_ids.append(existing_order.order_id)
+                                if budget_left >= self.order_size_usd:
+                                    place_intents.append((cid, outcome, token_id, ask, "SELL"))
                     # else: order still at correct price, do nothing.
-                elif bid_in_range and budget_left >= self.order_size_usd:
-                    # No existing order, price is in range → place new bid.
-                    place_intents.append((cid, outcome, token_id, bid))
+                else:
+                    # No existing order — place if in range
+                    if bid_in_range and budget_left >= self.order_size_usd:
+                        place_intents.append((cid, outcome, token_id, bid, "BUY"))
+                    elif ask_in_range and budget_left >= self.order_size_usd:
+                        place_intents.append((cid, outcome, token_id, ask, "SELL"))
 
         # Execute cancels.
         for oid in cancel_ids:
@@ -413,18 +459,25 @@ class CryptoTDMaker:
                     except Exception:
                         pass
 
-        # Execute placements.
+        # Execute placements (at most one order per market).
         placed = 0
-        for cid, outcome, token_id, bid_price in place_intents:
+        placed_cids: set[str] = set()
+        for cid, outcome, token_id, price, side in place_intents:
             # Re-check we don't already have position (could have filled above).
             if cid in self.positions:
                 continue
             if (cid, outcome) in self._orders_by_cid_outcome:
                 continue
+            # Avoid duplicate orders on same market (e.g. BUY Up + SELL Down).
+            if cid in placed_cids:
+                continue
+            if any(o.condition_id == cid for o in self.active_orders.values()):
+                continue
 
-            order_id = await self._place_order(cid, outcome, token_id, bid_price, now)
+            order_id = await self._place_order(cid, outcome, token_id, price, now, side=side)
             if order_id:
                 placed += 1
+                placed_cids.add(cid)
                 budget_left -= self.order_size_usd
 
         # Periodic status (every 30s wall-clock).
@@ -460,15 +513,16 @@ class CryptoTDMaker:
     # ------------------------------------------------------------------
 
     async def _place_order(
-        self, cid: str, outcome: str, token_id: str, price: float, now: float
+        self, cid: str, outcome: str, token_id: str, price: float, now: float,
+        *, side: str = "BUY",
     ) -> Optional[str]:
-        """Place a GTC buy at the given price via TradeManager."""
+        """Place a GTC maker order (BUY or SELL) at the given price."""
         if not self.manager:
             return None
         slug = _first_event_slug(self.known_markets.get(cid, {}))
         intent = TradeIntent(
             condition_id=cid, token_id=token_id, outcome=outcome,
-            side="BUY", price=price, size_usd=self.order_size_usd,
+            side=side, price=price, size_usd=self.order_size_usd,
             reason="td_maker_passive", title=slug, timestamp=now,
         )
         pending = await self.manager.place(intent)
@@ -477,7 +531,7 @@ class CryptoTDMaker:
         order = PassiveOrder(
             order_id=pending.order_id, condition_id=cid, outcome=outcome,
             token_id=token_id, price=price, size_usd=self.order_size_usd,
-            placed_at=now,
+            placed_at=now, side=side,
         )
         self.active_orders[pending.order_id] = order
         self._orders_by_cid_outcome[(cid, outcome)] = pending.order_id
@@ -496,34 +550,59 @@ class CryptoTDMaker:
     def _check_fills_paper(self, now: float) -> None:
         """Paper mode: simulate maker fills via three conditions.
 
-        1. Ask crossed: ask <= our bid price (original).
-        2. Bid-through: bid dropped below our price — our level was consumed.
-        3. Time-at-bid: order at best bid with tight spread for PAPER_FILL_TIMEOUT
-           seconds — simulates queue priority on an active book.
+        BUY orders:
+            1. Ask crossed: ask <= our bid price.
+            2. Bid-through: bid dropped below our price — our level was consumed.
+            3. Time-at-bid: order at best bid with tight spread for PAPER_FILL_TIMEOUT.
+        SELL orders:
+            1. Bid crossed: bid >= our ask price.
+            2. Ask-through: ask rose above our price — our level was consumed.
+            3. Time-at-ask: order at best ask with tight spread for PAPER_FILL_TIMEOUT.
         """
         filled_ids: list[str] = []
         for order_id, order in self.active_orders.items():
             bid, _, ask, _ = self.polymarket.get_best_levels(
                 order.condition_id, order.outcome
             )
-            # 1. Ask crossed down to our bid.
-            if ask is not None and ask <= order.price:
-                self._process_fill(order, now)
-                filled_ids.append(order_id)
-            # 2. Bid dropped below our price — our level got consumed.
-            elif bid is not None and bid < order.price:
-                self._process_fill(order, now)
-                filled_ids.append(order_id)
-            # 3. Sitting at best bid with tight spread long enough.
-            elif (
-                bid is not None
-                and ask is not None
-                and bid == order.price
-                and (ask - bid) <= self.PAPER_FILL_MAX_SPREAD
-                and (now - order.placed_at) >= self.PAPER_FILL_TIMEOUT
-            ):
-                self._process_fill(order, now)
-                filled_ids.append(order_id)
+
+            if order.side == "BUY":
+                # 1. Ask crossed down to our bid.
+                if ask is not None and ask <= order.price:
+                    self._process_fill(order, now)
+                    filled_ids.append(order_id)
+                # 2. Bid dropped below our price — our level got consumed.
+                elif bid is not None and bid < order.price:
+                    self._process_fill(order, now)
+                    filled_ids.append(order_id)
+                # 3. Sitting at best bid with tight spread long enough.
+                elif (
+                    bid is not None
+                    and ask is not None
+                    and bid == order.price
+                    and (ask - bid) <= self.PAPER_FILL_MAX_SPREAD
+                    and (now - order.placed_at) >= self.PAPER_FILL_TIMEOUT
+                ):
+                    self._process_fill(order, now)
+                    filled_ids.append(order_id)
+            else:  # SELL
+                # 1. Bid crossed up to our ask.
+                if bid is not None and bid >= order.price:
+                    self._process_fill(order, now)
+                    filled_ids.append(order_id)
+                # 2. Ask rose above our price — our level got consumed.
+                elif ask is not None and ask > order.price:
+                    self._process_fill(order, now)
+                    filled_ids.append(order_id)
+                # 3. Sitting at best ask with tight spread long enough.
+                elif (
+                    bid is not None
+                    and ask is not None
+                    and ask == order.price
+                    and (ask - bid) <= self.PAPER_FILL_MAX_SPREAD
+                    and (now - order.placed_at) >= self.PAPER_FILL_TIMEOUT
+                ):
+                    self._process_fill(order, now)
+                    filled_ids.append(order_id)
 
         for oid in filled_ids:
             order = self.active_orders.pop(oid, None)
@@ -535,7 +614,10 @@ class CryptoTDMaker:
 
     def _process_fill(self, order: PassiveOrder, now: float) -> None:
         """Record a filled order as an open position."""
-        shares = order.size_usd / order.price
+        if order.side == "BUY":
+            shares = order.size_usd / order.price
+        else:  # SELL: collateral per share = (1 - price)
+            shares = order.size_usd / (1.0 - order.price)
         pos = OpenPosition(
             condition_id=order.condition_id,
             outcome=order.outcome,
@@ -544,6 +626,7 @@ class CryptoTDMaker:
             size_usd=order.size_usd,
             shares=shares,
             filled_at=now,
+            side=order.side,
         )
         self.positions[order.condition_id] = pos
         self._position_order_ids[order.condition_id] = order.order_id
@@ -568,7 +651,7 @@ class CryptoTDMaker:
                 condition_id=order.condition_id,
                 token_id=order.token_id,
                 outcome=order.outcome,
-                side="BUY",
+                side=order.side,
                 price=order.price,
                 size_usd=order.size_usd,
                 reason="td_maker_passive",
@@ -691,16 +774,23 @@ class CryptoTDMaker:
             logger.info("td_markets_pruned", count=len(to_remove), remaining=len(self.known_markets))
 
     def _settle_position(self, pos: OpenPosition, now: float) -> None:
-        """Determine win/loss from last book state and record PnL."""
+        """Determine win/loss from last book state and record PnL.
+
+        BUY: won if token resolves to 1 (bid >= 0.5), pnl = shares * (1 - entry)
+        SELL: won if token resolves to 0 (bid < 0.5), pnl = shares * entry
+        """
         bid, _, _, _ = self.polymarket.get_best_levels(pos.condition_id, pos.outcome)
         if bid is None:
             bid = self._last_bids.get((pos.condition_id, pos.outcome))
-        if bid is not None and bid >= 0.5:
-            won = True
-            pnl = pos.shares * (1.0 - pos.entry_price)
-        else:
-            won = False
-            pnl = -pos.size_usd
+
+        token_resolved_1 = bid is not None and bid >= 0.5
+
+        if pos.side == "BUY":
+            won = token_resolved_1
+            pnl = pos.shares * (1.0 - pos.entry_price) if won else -pos.size_usd
+        else:  # SELL
+            won = not token_resolved_1
+            pnl = pos.shares * pos.entry_price if won else -pos.size_usd
 
         if won:
             self.total_wins += 1
@@ -724,6 +814,7 @@ class CryptoTDMaker:
             "td_position_settled",
             condition_id=pos.condition_id[:16],
             outcome=pos.outcome,
+            side=pos.side,
             entry_price=pos.entry_price,
             won=won,
             pnl=round(pnl, 4),
@@ -731,12 +822,31 @@ class CryptoTDMaker:
             record=f"{self.total_wins}W-{self.total_losses}L",
         )
 
-        # Manager handles DB persistence + Telegram notification
+        # Manager handles DB persistence + Telegram notification.
+        # Use record_settle_direct with explicit pnl to handle both BUY/SELL correctly.
         if self.manager:
+            slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
+            settle_intent = TradeIntent(
+                condition_id=pos.condition_id,
+                token_id=pos.token_id,
+                outcome=pos.outcome,
+                side="SELL" if pos.side == "BUY" else "BUY",
+                price=1.0 if token_resolved_1 else 0.0,
+                size_usd=pos.size_usd,
+                reason="settlement",
+                title=slug,
+                timestamp=now,
+            )
+            settle_fill = FillResult(
+                filled=True,
+                shares=pos.shares,
+                avg_price=1.0 if token_resolved_1 else 0.0,
+                pnl_delta=pnl,
+            )
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(self.manager.settle(
-                    pos.condition_id, pos.outcome, 1.0 if won else 0.0, won,
+                loop.create_task(self.manager.record_settle_direct(
+                    settle_intent, settle_fill,
                 ))
             except RuntimeError:
                 pass
@@ -767,8 +877,8 @@ class CryptoTDMaker:
                 "crypto_td_maker_started",
                 symbols=self.symbols,
                 paper=self.paper_mode,
-                target_bid=self.target_bid,
-                max_bid=self.max_bid,
+                buy_range=f"[{self.target_bid}, {self.max_bid}]",
+                sell_range=f"[{self.sell_lo}, {self.sell_hi}]" if self.sell_lo > 0 else "off",
                 order_size=self.order_size_usd,
                 max_exposure=self.max_total_exposure_usd,
                 markets=len(self.known_markets),
@@ -812,6 +922,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-bid", type=float, default=0.85,
         help="Max bid price to enter (default: 0.85)",
     )
+    p.add_argument(
+        "--sell", action="store_true", default=False,
+        help="Enable SELL side with default range [0.15, 0.30]",
+    )
+    p.add_argument(
+        "--sell-lo", type=float, default=0.15,
+        help="Sell zone lower bound (default: 0.15)",
+    )
+    p.add_argument(
+        "--sell-hi", type=float, default=0.30,
+        help="Sell zone upper bound (default: 0.30)",
+    )
     p.add_argument("--wallet", type=float, default=0.0,
                     help="Wallet USD (0 = auto-detect from Polymarket balance)")
     p.add_argument("--order-size", type=float, default=0.0,
@@ -836,6 +958,10 @@ async def main() -> None:
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     paper_mode = not args.live
     strategy_tag = args.strategy_tag.strip() or "crypto_td_maker"
+
+    # Sell range: only active when --sell flag is passed
+    sell_lo = args.sell_lo if args.sell else 0.0
+    sell_hi = args.sell_hi if args.sell else 0.0
     run_id = f"{strategy_tag}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
     executor: Optional[PolymarketExecutor] = None
@@ -899,6 +1025,8 @@ async def main() -> None:
         symbols=symbols,
         target_bid=args.target_bid,
         max_bid=args.max_bid,
+        sell_lo=sell_lo,
+        sell_hi=sell_hi,
         order_size_usd=order_size,
         max_total_exposure_usd=max_exposure,
         paper_mode=paper_mode,
@@ -909,15 +1037,18 @@ async def main() -> None:
         db_url=args.db_url,
     )
 
+    sell_enabled = sell_lo > 0 and sell_hi > 0
     wallet_src = "auto" if args.wallet <= 0 else "manual"
     print(f"=== Crypto TD Maker {'(PAPER)' if paper_mode else '(LIVE)'} ===")
     print(f"  Symbols:     {', '.join(symbols)}")
     print(f"  Wallet:      ${wallet:.0f} ({wallet_src})")
-    print(f"  Bid range:   [{args.target_bid}, {args.max_bid}]")
+    print(f"  BUY range:   [{args.target_bid}, {args.max_bid}]")
+    if sell_enabled:
+        print(f"  SELL range:  [{sell_lo}, {sell_hi}]")
     print(f"  Order size:  ${order_size:.2f}")
     print(f"  Max exposure: ${max_exposure:.2f}")
-    print(f"  Strategy:    Watch books, bid at current bid when in range")
-    print(f"               Hold filled positions to market resolution")
+    print(f"  Strategy:    Passive maker on 15-min crypto markets")
+    print(f"               BUY favourites + {'SELL longshots' if sell_enabled else 'no sell side'}")
     print()
 
     await maker.run()

@@ -129,8 +129,13 @@ class PolymarketExecutor:
         if price <= 0:
             return {"status": "ERROR", "message": "Invalid price"}
 
-        # Convert USD size into shares
-        shares = size / price
+        # Convert USD size into shares.
+        # BUY: cost per share = price → shares = size / price
+        # SELL: collateral per share = (1 - price) → shares = size / (1 - price)
+        if side == "BUY":
+            shares = size / price
+        else:
+            shares = size / (1.0 - price)
         if shares <= 0:
             return {"status": "ERROR", "message": "Invalid size"}
 
