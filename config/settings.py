@@ -4,6 +4,10 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # === Proxy (residential IP for geo-restricted APIs) ===
+    HTTPS_PROXY: str = ""
+    HTTP_PROXY: str = ""
+
     # === Polymarket ===
     POLYMARKET_API_KEY: str = ""
     POLYMARKET_API_SECRET: str = ""
