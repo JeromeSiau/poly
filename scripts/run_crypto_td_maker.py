@@ -840,6 +840,14 @@ class CryptoTDMaker:
         if to_remove:
             logger.info("td_markets_pruned", count=len(to_remove), remaining=len(self.known_markets))
 
+        # Settle orphaned positions whose markets are no longer known
+        # (e.g. loaded from DB after restart, but the 15-min slot expired).
+        orphan_cids = [cid for cid in self.positions if cid not in self.known_markets]
+        for cid in orphan_cids:
+            pos = self.positions.pop(cid)
+            logger.warning("td_orphan_position_settled", condition_id=cid[:16], outcome=pos.outcome)
+            self._settle_position(pos, now)
+
     def _settle_position(self, pos: OpenPosition, now: float) -> None:
         """Determine win/loss from last book state and record PnL.
 
