@@ -27,9 +27,9 @@ logger = structlog.get_logger()
 
 # Emoji prefixes
 _PAPER = "\U0001f4dd"  # 📝
-_LIVE = "\U0001f525"   # 🔥
+_LIVE = "\U0001f4b0"   # 💰
 _BID = "\U0001f4ca"    # 📊
-_FILL = "\u2705"       # ✅
+_FILL = "\U0001f4e6"   # 📦
 _WIN = "\U0001f7e2"    # 🟢
 _LOSS = "\U0001f534"   # 🔴
 
