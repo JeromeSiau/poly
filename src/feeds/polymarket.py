@@ -231,8 +231,11 @@ class PolymarketFeed(BaseFeed):
                 self._local_orderbook.setdefault(token_id, {"bids": [], "asks": []})
 
         if new_tokens and self._ws and self._connected:
+            # Send ALL subscribed tokens — "type": "MARKET" replaces the
+            # entire subscription set on the server side.
+            all_tokens = list(self._subscribed_tokens)
             msg = json.dumps({
-                "assets_ids": new_tokens,
+                "assets_ids": all_tokens,
                 "type": "MARKET",
             })
             await self._ws.send(msg)
@@ -240,6 +243,7 @@ class PolymarketFeed(BaseFeed):
                 "clob_ws_subscribed",
                 market_id=market_id,
                 tokens=len(new_tokens),
+                total=len(all_tokens),
             )
         elif new_tokens:
             logger.debug(
