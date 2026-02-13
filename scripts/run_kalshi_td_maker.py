@@ -44,7 +44,7 @@ from src.utils.logging import configure_logging
 configure_logging()
 
 from config.settings import settings
-from src.execution import TradeManager, TradeIntent
+from src.execution import TradeManager, TradeIntent, FillResult
 from src.feeds.kalshi_executor import (
     KalshiExecutor,
     KALSHI_API_BASE,
@@ -262,6 +262,8 @@ class KalshiTDMaker:
                 )
                 self.positions[ticker] = pos
                 self.total_fills += 1
+                self.manager._pending.pop(pending.order_id, None)
+                self._persist_fill(pos)
                 logger.info(
                     "kalshi_paper_fill",
                     ticker=ticker,
@@ -277,6 +279,39 @@ class KalshiTDMaker:
             count=self.order_size_contracts,
             paper=self.paper_mode,
         )
+
+    # ------------------------------------------------------------------
+    # Fill persistence
+    # ------------------------------------------------------------------
+
+    def _persist_fill(self, pos: OpenPosition) -> None:
+        """Persist a fill to DB + Telegram via TradeManager."""
+        price_01 = pos.entry_price_cents / 100.0
+        size_usd = pos.count * price_01
+        intent = TradeIntent(
+            condition_id=pos.event_ticker,
+            token_id=pos.ticker,
+            outcome="yes",
+            side="BUY",
+            price=price_01,
+            size_usd=size_usd,
+            reason="kalshi_td_maker",
+            title=f"{pos.event_ticker} YES @{pos.entry_price_cents}c x{pos.count}",
+            timestamp=pos.filled_at,
+        )
+        fill_result = FillResult(
+            filled=True,
+            shares=float(pos.count),
+            avg_price=price_01,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.manager.record_fill_direct(
+                intent, fill_result,
+                execution_mode="paper_fill" if self.paper_mode else "live_fill",
+            ))
+        except RuntimeError:
+            pass
 
     # ------------------------------------------------------------------
     # Fill & settlement checking
@@ -335,6 +370,7 @@ class KalshiTDMaker:
 
             # Remove from manager's pending
             await self.manager.cancel(oid)
+            self._persist_fill(pos)
 
             logger.info(
                 "kalshi_fill_detected",

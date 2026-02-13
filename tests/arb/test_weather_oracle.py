@@ -2,6 +2,8 @@
 
 import json
 import pytest
+import time
+from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from src.arb.weather_oracle import (
@@ -11,6 +13,16 @@ from src.arb.weather_oracle import (
     WeatherMarketScanner,
     WeatherMarket,
 )
+
+
+def _future_end_date(days: int = 3) -> str:
+    """Return an end_date string N days in the future (passes days-to-resolution filter)."""
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _future_target_date(days: int = 3) -> str:
+    """Return a target_date string N days in the future."""
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 @pytest.mark.asyncio
@@ -286,10 +298,10 @@ def test_engine_detects_cheap_certain_outcome():
         slug="highest-temp-dallas-feb-12",
         title="Highest temperature in Dallas on February 12?",
         city="Dallas",
-        target_date="2026-02-12",
+        target_date=_future_target_date(),
         outcomes={"58°F or higher": "tok1", "56-57°F": "tok2", "54-55°F": "tok3", "52-53°F": "tok4"},
         outcome_prices={"58°F or higher": 0.03, "56-57°F": 0.12, "54-55°F": 0.35, "52-53°F": 0.50},
-        end_date="2026-02-13T00:00:00Z",
+        end_date=_future_end_date(),
         resolution_source="Weather Underground",
     )
 
@@ -341,15 +353,15 @@ def test_engine_handles_range_outcomes():
         slug="highest-temp-nyc-feb-12",
         title="Highest temperature in New York on February 12?",
         city="New York",
-        target_date="2026-02-12",
+        target_date=_future_target_date(),
         outcomes={"40°F or higher": "tok1", "38-39°F": "tok2", "36-37°F": "tok3"},
         outcome_prices={"40°F or higher": 0.60, "38-39°F": 0.02, "36-37°F": 0.03},
-        end_date="2026-02-13T00:00:00Z",
+        end_date=_future_end_date(),
         resolution_source="Weather Underground",
     )
 
     forecast = ForecastData(
-        city="New York", date="2026-02-12",
+        city="New York", date=_future_target_date(),
         temp_max=38.5, temp_min=28.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
@@ -501,14 +513,14 @@ def test_engine_yield_yes_signal():
         slug="highest-temp-dallas-feb-12",
         title="Highest temperature in Dallas on February 12?",
         city="Dallas",
-        target_date="2026-02-12",
+        target_date=_future_target_date(),
         outcomes={"58°F or higher": "tok1", "56-57°F": "tok2"},
         outcome_prices={"58°F or higher": 0.92, "56-57°F": 0.05},
-        end_date="2026-02-13T00:00:00Z",
+        end_date=_future_end_date(),
         resolution_source="Weather Underground",
     )
     forecast = ForecastData(
-        city="Dallas", date="2026-02-12",
+        city="Dallas", date=_future_target_date(),
         temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
@@ -529,15 +541,15 @@ def test_engine_yield_no_signal():
         slug="highest-temp-dallas-feb-12",
         title="Highest temperature in Dallas on February 12?",
         city="Dallas",
-        target_date="2026-02-12",
+        target_date=_future_target_date(),
         outcomes={"45°F or below": "tok1", "58°F or higher": "tok2"},
         # 45°F or below is very unlikely if forecast says 66°F
         outcome_prices={"45°F or below": 0.01, "58°F or higher": 0.92},
-        end_date="2026-02-13T00:00:00Z",
+        end_date=_future_end_date(),
         resolution_source="Weather Underground",
     )
     forecast = ForecastData(
-        city="Dallas", date="2026-02-12",
+        city="Dallas", date=_future_target_date(),
         temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
@@ -558,13 +570,13 @@ async def test_engine_yield_sizing():
 
     market = WeatherMarket(
         condition_id="0xabc", slug="test", title="test",
-        city="Dallas", target_date="2026-02-12",
+        city="Dallas", target_date=_future_target_date(),
         outcomes={"58°F or higher": "tok1"},
         outcome_prices={"58°F or higher": 0.92},
-        end_date="2026-02-13T00:00:00Z", resolution_source="",
+        end_date=_future_end_date(), resolution_source="",
     )
     forecast = ForecastData(
-        city="Dallas", date="2026-02-12",
+        city="Dallas", date=_future_target_date(),
         temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
     )
 

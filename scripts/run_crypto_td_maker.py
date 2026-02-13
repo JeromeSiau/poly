@@ -53,7 +53,7 @@ from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEv
 # Crypto market discovery and parsing utilities.
 from src.utils.crypto_markets import CRYPTO_SYMBOL_TO_SLUG, fetch_crypto_markets
 from src.utils.parsing import parse_json_list, _to_float, _first_event_slug
-from src.execution import TradeManager, TradeIntent
+from src.execution import TradeManager, TradeIntent, FillResult
 
 logger = structlog.get_logger()
 
@@ -141,6 +141,8 @@ class CryptoTDMaker:
         self._http_client: Optional[httpx.AsyncClient] = None
         self._cycle_count: int = 0
         self._last_status_time: float = 0.0
+        # Last known bid per (cid, outcome) — fallback for settlement when book empties.
+        self._last_bids: dict[tuple[str, str], float] = {}
 
         # Stats
         self.total_fills: int = 0
@@ -267,6 +269,8 @@ class CryptoTDMaker:
                     continue
 
                 bid, bid_sz, ask, ask_sz = self.polymarket.get_best_levels(cid, outcome)
+                if bid is not None:
+                    self._last_bids[(cid, outcome)] = bid
                 existing_key = (cid, outcome)
                 existing_oid = self._orders_by_cid_outcome.get(existing_key)
                 existing_order = self.active_orders.get(existing_oid) if existing_oid else None
@@ -456,6 +460,39 @@ class CryptoTDMaker:
             paper=self.paper_mode,
         )
 
+        # Persist fill to DB + Telegram via TradeManager.
+        if self.manager:
+            self.manager._pending.pop(order.order_id, None)
+            slug = _first_event_slug(self.known_markets.get(order.condition_id, {}))
+            intent = TradeIntent(
+                condition_id=order.condition_id,
+                token_id=order.token_id,
+                outcome=order.outcome,
+                side="BUY",
+                price=order.price,
+                size_usd=order.size_usd,
+                reason="td_maker_passive",
+                title=slug,
+                timestamp=now,
+            )
+            fill_result = FillResult(
+                filled=True,
+                shares=shares,
+                avg_price=order.price,
+            )
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.manager.record_fill_direct(
+                    intent, fill_result,
+                    execution_mode="paper_fill" if self.paper_mode else "live_fill",
+                    extra_state={
+                        "strategy_tag": self.strategy_tag,
+                        "condition_id": order.condition_id,
+                    },
+                ))
+            except RuntimeError:
+                pass
+
     def _cancel_other_side(self, cid: str, filled_outcome: str) -> None:
         """Cancel the unfilled side's order after one side fills."""
         outcomes = self.market_outcomes.get(cid, [])
@@ -547,7 +584,8 @@ class CryptoTDMaker:
                 pass
 
             self.known_markets.pop(cid, None)
-            self.market_outcomes.pop(cid, None)
+            for outcome in self.market_outcomes.pop(cid, []):
+                self._last_bids.pop((cid, outcome), None)
 
         if to_remove:
             logger.info("td_markets_pruned", count=len(to_remove), remaining=len(self.known_markets))
@@ -555,6 +593,8 @@ class CryptoTDMaker:
     def _settle_position(self, pos: OpenPosition, now: float) -> None:
         """Determine win/loss from last book state and record PnL."""
         bid, _, _, _ = self.polymarket.get_best_levels(pos.condition_id, pos.outcome)
+        if bid is None:
+            bid = self._last_bids.get((pos.condition_id, pos.outcome))
         if bid is not None and bid >= 0.5:
             won = True
             pnl = pos.shares * (1.0 - pos.entry_price)

@@ -43,7 +43,7 @@ from src.arb.two_sided_inventory import (
     TradeIntent,
     TwoSidedInventoryEngine,
 )
-from src.execution import TradeManager, TradeIntent as ExecTradeIntent
+from src.execution import TradeManager, TradeIntent as ExecTradeIntent, FillResult as ExecFillResult
 from src.feeds.binance import BinanceFeed
 from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEvent
 
@@ -125,6 +125,8 @@ class CryptoMaker:
         self._http_client: Optional[httpx.AsyncClient] = None
         self._paper_order_counter: int = 0
         self._cycle_count: int = 0
+        # Last known bid per (cid, outcome) — fallback for settlement when book empties.
+        self._last_bids: dict[tuple[str, str], float] = {}
 
     # ------------------------------------------------------------------
     # Market discovery
@@ -237,7 +239,8 @@ class CryptoMaker:
                     pass
             self.known_markets.pop(cid, None)
             self.market_symbol.pop(cid, None)
-            self.market_outcomes.pop(cid, None)
+            for outcome in self.market_outcomes.pop(cid, []):
+                self._last_bids.pop((cid, outcome), None)
 
         if to_remove:
             logger.info(
@@ -246,6 +249,46 @@ class CryptoMaker:
                 settled=settled_count,
                 remaining=len(self.known_markets),
             )
+
+    # ------------------------------------------------------------------
+    # Fill persistence
+    # ------------------------------------------------------------------
+
+    def _persist_fill(self, order: ActiveOrder, now: float) -> None:
+        """Persist a fill to DB + Telegram via TradeManager."""
+        if not self.manager:
+            return
+        self.manager._pending.pop(order.order_id, None)
+        intent = order.intent
+        exec_intent = ExecTradeIntent(
+            condition_id=intent.condition_id,
+            token_id=intent.token_id,
+            outcome=intent.outcome,
+            side=intent.side,
+            price=intent.price,
+            size_usd=intent.size_usd,
+            reason=intent.reason,
+            title=intent.title,
+            edge_pct=intent.edge_pct,
+            timestamp=now,
+        )
+        fill_result = ExecFillResult(
+            filled=True,
+            shares=intent.size_usd / intent.price if intent.price > 0 else 0.0,
+            avg_price=intent.price,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.manager.record_fill_direct(
+                exec_intent, fill_result,
+                execution_mode="paper_fill" if self.paper_mode else "live_fill",
+                extra_state={
+                    "strategy_tag": self.strategy_tag,
+                    "condition_id": intent.condition_id,
+                },
+            ))
+        except RuntimeError:
+            pass
 
     # ------------------------------------------------------------------
     # Settlement
@@ -311,6 +354,8 @@ class CryptoMaker:
 
             # Determine settlement from last book: bid near 1.0 = winner.
             bid, _, _, _ = self.polymarket.get_best_levels(condition_id, outcome)
+            if bid is None:
+                bid = self._last_bids.get((condition_id, outcome))
             if bid is not None and bid >= 0.5:
                 settlement_price = 1.0
             else:
@@ -419,6 +464,7 @@ class CryptoMaker:
                 levels = self.polymarket.get_best_levels(cid, outcome)
                 if levels[0] is not None:
                     book[outcome] = levels
+                    self._last_bids[(cid, outcome)] = levels[0]
 
             # GUARD 1: Require BOTH books present.  Without both sides we
             # cannot verify pair profitability and risk naked directional
@@ -524,6 +570,7 @@ class CryptoMaker:
             if self._orders_by_key.get(key) == oid:
                 del self._orders_by_key[key]
             fill = self.engine.apply_fill(order.intent)
+            self._persist_fill(order, now)
             logger.info(
                 "maker_order_filled",
                 order_id=oid,
@@ -660,6 +707,7 @@ class CryptoMaker:
 
             if filled:
                 fill = self.engine.apply_fill(order.intent)
+                self._persist_fill(order, now)
                 filled_ids.append(order_id)
                 logger.info(
                     "maker_order_filled",
@@ -708,6 +756,7 @@ class CryptoMaker:
         for order_id, order in list(self.active_orders.items()):
             if order_id not in live_order_ids:
                 fill = self.engine.apply_fill(order.intent)
+                self._persist_fill(order, now)
                 logger.info(
                     "maker_order_filled",
                     order_id=order_id,
@@ -746,6 +795,7 @@ class CryptoMaker:
                 continue
 
             fill = self.engine.apply_fill(matched_order.intent)
+            self._persist_fill(matched_order, time.time())
             logger.info(
                 "maker_ws_fill_detected",
                 order_id=matched_id,
