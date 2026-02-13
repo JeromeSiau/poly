@@ -13,18 +13,10 @@ logger = structlog.get_logger()
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import (
-        ApiCreds,
-        AssetType,
-        BalanceAllowanceParams,
-        OrderArgs,
-        OrderType,
-    )
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 except ImportError:  # pragma: no cover - optional dependency in runtime
     ClobClient = None
     ApiCreds = None
-    AssetType = None
-    BalanceAllowanceParams = None
     OrderArgs = None
     OrderType = None
 
@@ -232,18 +224,37 @@ class PolymarketExecutor:
         """Get open/live orders, optionally filtered by market (condition_id)."""
         return await asyncio.to_thread(self._get_open_orders_sync, market)
 
+    # USDC.e on Polygon (PoS-bridged, 6 decimals) — used by Polymarket
+    _USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    _BALANCE_OF_SELECTOR = "0x70a08231"
+    _DEFAULT_RPC = "https://polygon-rpc.com"
+
     def _get_balance_sync(self) -> float:
-        self._ensure_creds()
+        """Query on-chain USDC.e balance on Polygon for the funder wallet."""
+        import httpx
+
+        rpc_url = settings.POLYGON_RPC_URL or self._DEFAULT_RPC
+        wallet = settings.POLYMARKET_WALLET_ADDRESS
+        padded = wallet.lower().replace("0x", "").zfill(64)
+        data = self._BALANCE_OF_SELECTOR + padded
+
         try:
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            resp = self._client.get_balance_allowance(params)
-            # Response contains 'balance' as a string in USDC (6 decimals)
-            raw = resp.get("balance", "0") if isinstance(resp, dict) else "0"
-            return float(raw) / 1e6
+            resp = httpx.post(
+                rpc_url,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [{"to": self._USDC_E_ADDRESS, "data": data}, "latest"],
+                    "id": 1,
+                },
+                timeout=10,
+            )
+            result = resp.json().get("result", "0x0")
+            return int(result, 16) / 1e6
         except Exception as exc:
             logger.warning("polymarket_get_balance_failed", error=str(exc))
             return 0.0
 
     async def get_balance(self) -> float:
-        """Return available USDC collateral balance."""
+        """Return on-chain USDC.e balance for the wallet on Polygon."""
         return await asyncio.to_thread(self._get_balance_sync)
