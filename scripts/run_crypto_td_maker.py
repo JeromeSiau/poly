@@ -203,6 +203,7 @@ class CryptoTDMaker:
                     side=side,
                 )
                 self.positions[row.condition_id] = pos
+                self._position_order_ids[row.condition_id] = row.order_id
         if self.active_orders or self.positions:
             logger.info(
                 "td_db_state_loaded",
@@ -552,15 +553,59 @@ class CryptoTDMaker:
         """Place a GTC maker order (BUY or SELL) at the given price."""
         if not self.manager:
             return None
+
+        # Pre-register a placeholder BEFORE the await so the fill listener
+        # can match fills that arrive while we're waiting for the API response.
+        temp_id = f"_placing_{cid}_{outcome}"
+        placeholder = PassiveOrder(
+            order_id=temp_id, condition_id=cid, outcome=outcome,
+            token_id=token_id, price=price, size_usd=self.order_size_usd,
+            placed_at=now, side=side,
+        )
+        self.active_orders[temp_id] = placeholder
+        self._orders_by_cid_outcome[(cid, outcome)] = temp_id
+
         slug = _first_event_slug(self.known_markets.get(cid, {}))
         intent = TradeIntent(
             condition_id=cid, token_id=token_id, outcome=outcome,
             side=side, price=price, size_usd=self.order_size_usd,
             reason="td_maker_passive", title=slug, timestamp=now,
         )
-        pending = await self.manager.place(intent)
-        if not pending.order_id:
+        try:
+            pending = await self.manager.place(intent)
+        except Exception as exc:
+            # Placement failed — clean up placeholder.
+            self.active_orders.pop(temp_id, None)
+            if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
+                del self._orders_by_cid_outcome[(cid, outcome)]
+            logger.warning("order_place_exception", error=str(exc)[:80])
             return None
+
+        if not pending.order_id:
+            self.active_orders.pop(temp_id, None)
+            if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
+                del self._orders_by_cid_outcome[(cid, outcome)]
+            return None
+
+        # Fill listener may have already processed a fill for the placeholder.
+        if cid in self.positions:
+            self.active_orders.pop(temp_id, None)
+            if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
+                del self._orders_by_cid_outcome[(cid, outcome)]
+            # Update DB with real order_id.
+            self._position_order_ids[cid] = pending.order_id
+            order = PassiveOrder(
+                order_id=pending.order_id, condition_id=cid, outcome=outcome,
+                token_id=token_id, price=price, size_usd=self.order_size_usd,
+                placed_at=now, side=side,
+            )
+            self._db_fire(self._db_save_order(order))
+            self._db_fire(self._db_mark_filled(pending.order_id, self.positions[cid].shares, now))
+            logger.info("td_fill_caught_during_placement", order_id=pending.order_id[:16])
+            return pending.order_id
+
+        # No fill yet — replace placeholder with real order.
+        self.active_orders.pop(temp_id, None)
         order = PassiveOrder(
             order_id=pending.order_id, condition_id=cid, outcome=outcome,
             token_id=token_id, price=price, size_usd=self.order_size_usd,
