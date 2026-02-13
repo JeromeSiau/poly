@@ -95,7 +95,7 @@ PandaScore Feed    Polymarket Feed    Azuro + Overtime Feeds
 
 The trades API runs on the production server and provides access to live trading stats. Source: `src/api/trades_api.py`.
 
-**Base URL:** `http://localhost:8788` (on the production server)
+**Base URL:** `http://localhost:8788` (on local server, it works with ssh tunnel)
 
 ### Endpoints
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -800,7 +801,7 @@ class CryptoTDMaker:
             )
             fill_result = FillResult(
                 filled=True,
-                shares=shares,
+                shares=new_shares,
                 avg_price=order.price,
             )
             try:
@@ -954,7 +955,7 @@ class CryptoTDMaker:
             # Settle position if held.
             pos = self.positions.pop(cid, None)
             if pos:
-                self._settle_position(pos, now)
+                await self._settle_position(pos, now)
 
             # Clean up fill count.
             self._cid_fill_count.pop(cid, None)
@@ -978,19 +979,76 @@ class CryptoTDMaker:
         for cid in orphan_cids:
             pos = self.positions.pop(cid)
             logger.warning("td_orphan_position_settled", condition_id=cid[:16], outcome=pos.outcome)
-            self._settle_position(pos, now)
+            await self._settle_position(pos, now)
 
-    def _settle_position(self, pos: OpenPosition, now: float) -> None:
-        """Determine win/loss from last book state and record PnL.
+    async def _query_resolution(self, pos: OpenPosition) -> Optional[bool]:
+        """Query Gamma API for actual market resolution.
 
-        BUY: won if token resolves to 1 (bid >= 0.5), pnl = shares * (1 - entry)
-        SELL: won if token resolves to 0 (bid < 0.5), pnl = shares * entry
+        Returns True if the token resolved to 1, False if 0, None if unknown.
         """
-        bid, _, _, _ = self.polymarket.get_best_levels(pos.condition_id, pos.outcome)
-        if bid is None:
-            bid = self._last_bids.get((pos.condition_id, pos.outcome))
+        GAMMA_URL = "https://gamma-api.polymarket.com"
+        slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
 
-        token_resolved_1 = bid is not None and bid >= 0.5
+        if not self._http_client or not slug:
+            return None
+
+        try:
+            resp = await self._http_client.get(
+                f"{GAMMA_URL}/events",
+                params={"slug": slug},
+                timeout=10.0,
+            )
+            if resp.status_code != 200:
+                return None
+            events = resp.json()
+            if not events:
+                return None
+
+            mkt = events[0].get("markets", [{}])[0]
+            outcome_prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
+            outcomes_raw = json.loads(mkt.get("outcomes", "[]"))
+
+            for i, outcome in enumerate(outcomes_raw):
+                if outcome == pos.outcome and i < len(outcome_prices_raw):
+                    price = float(outcome_prices_raw[i])
+                    # Resolved prices are ~0 or ~1; only trust if clearly resolved
+                    if price >= 0.9:
+                        return True
+                    if price <= 0.1:
+                        return False
+        except Exception as exc:
+            logger.warning(
+                "gamma_resolution_failed",
+                condition_id=pos.condition_id[:16],
+                slug=slug,
+                error=str(exc)[:60],
+            )
+        return None
+
+    async def _settle_position(self, pos: OpenPosition, now: float) -> None:
+        """Determine win/loss from Gamma API resolution (bid fallback).
+
+        BUY: won if token resolves to 1, pnl = shares * (1 - entry)
+        SELL: won if token resolves to 0, pnl = shares * entry
+        """
+        # Primary: query Gamma API for actual resolved outcome prices
+        resolution = await self._query_resolution(pos)
+
+        if resolution is not None:
+            token_resolved_1 = resolution
+        else:
+            # Fallback: last book state (unreliable — logged as warning)
+            bid, _, _, _ = self.polymarket.get_best_levels(pos.condition_id, pos.outcome)
+            if bid is None:
+                bid = self._last_bids.get((pos.condition_id, pos.outcome))
+            token_resolved_1 = bid is not None and bid >= 0.5
+            logger.warning(
+                "td_settle_fallback_bid",
+                condition_id=pos.condition_id[:16],
+                outcome=pos.outcome,
+                bid=bid,
+                resolved_1=token_resolved_1,
+            )
 
         if pos.side == "BUY":
             won = token_resolved_1
