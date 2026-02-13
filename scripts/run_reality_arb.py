@@ -36,7 +36,7 @@ from src.arb.reality_arb import RealityArbEngine
 from src.arb.polymarket_executor import PolymarketExecutor
 from src.db.database import init_db_async
 from src.bot.reality_handlers import RealityArbHandler
-from src.risk.manager import UnifiedRiskManager
+from src.risk.guard import RiskGuard
 
 
 class RealityArbBot:
@@ -52,23 +52,22 @@ class RealityArbBot:
         self.game = game
         self.autopilot = autopilot
 
+        # Allocated capital for this strategy
+        self.allocated_capital = (
+            settings.GLOBAL_CAPITAL * (settings.CAPITAL_ALLOCATION_REALITY_PCT / 100.0)
+        )
+
         # Components
         self.pandascore = PandaScoreFeed(api_key=settings.PANDASCORE_API_KEY)
         self.polymarket = PolymarketFeed()
         self.detector = EventDetector()
         self.mapper = MarketMapper()
-        self.risk_manager = UnifiedRiskManager(
-            global_capital=settings.GLOBAL_CAPITAL,
-            reality_allocation_pct=settings.CAPITAL_ALLOCATION_REALITY_PCT,
-            crossmarket_allocation_pct=settings.CAPITAL_ALLOCATION_CROSSMARKET_PCT,
-            max_position_pct=settings.MAX_POSITION_PCT,
-            daily_loss_limit_pct=settings.DAILY_LOSS_LIMIT_PCT,
-        )
+        self.guard: RiskGuard | None = None
         self.engine = RealityArbEngine(
             polymarket_feed=self.polymarket,
             event_detector=self.detector,
             market_mapper=self.mapper,
-            risk_manager=self.risk_manager,
+            allocated_capital=self.allocated_capital,
             autopilot=self.autopilot,
         )
 
@@ -87,6 +86,17 @@ class RealityArbBot:
 
         # Initialize database
         await init_db_async()
+
+        # Initialize RiskGuard
+        self.guard = RiskGuard(
+            strategy_tag="reality_arb",
+            db_path="data/arb.db",
+            daily_loss_limit_usd=-(
+                settings.GLOBAL_CAPITAL * settings.DAILY_LOSS_LIMIT_PCT
+            ),
+        )
+        await self.guard.initialize()
+        self.engine.guard = self.guard
 
         # Connect to feeds
         await self.pandascore.connect()

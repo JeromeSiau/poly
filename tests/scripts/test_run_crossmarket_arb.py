@@ -57,8 +57,8 @@ def test_crossmarketarbbot_has_required_components():
     # Check matcher is initialized
     assert bot.matcher is not None
 
-    # Check risk manager is initialized
-    assert bot.risk_manager is not None
+    # Check guard is None before start() (initialized asynchronously)
+    assert bot.guard is None
 
     # Check engine is initialized
     assert bot.engine is not None

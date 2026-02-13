@@ -66,13 +66,15 @@ class CryptoArbEngine:
         binance_feed: Optional[Any] = None,
         polymarket_feed: Optional[Any] = None,
         crypto_mapper: Optional[Any] = None,
-        risk_manager: Optional[Any] = None,
+        guard: Optional[Any] = None,
+        allocated_capital: float = 0.0,
         position_manager: Optional[Any] = None,
     ):
         self.binance_feed = binance_feed
         self.polymarket_feed = polymarket_feed
         self.crypto_mapper = crypto_mapper
-        self.risk_manager = risk_manager
+        self.guard = guard
+        self.allocated_capital = allocated_capital
         self.position_manager = position_manager
 
         self.min_edge_pct = settings.MIN_EDGE_PCT

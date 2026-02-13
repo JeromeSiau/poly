@@ -4,23 +4,12 @@ import pytest
 
 from src.arb.fear_engine import FearSellingEngine, FearTradeSignal
 from src.arb.fear_scanner import FearMarketCandidate
-from src.risk.manager import UnifiedRiskManager
 
 
 @pytest.fixture
 def engine():
-    """Create a FearSellingEngine with a risk manager allocating 100% to fear."""
-    rm = UnifiedRiskManager(
-        global_capital=100_000,
-        reality_allocation_pct=0.0,
-        crossmarket_allocation_pct=0.0,
-        max_position_pct=0.10,
-        daily_loss_limit_pct=0.05,
-        crypto_allocation_pct=0.0,
-        nobet_allocation_pct=0.0,
-        fear_allocation_pct=100.0,
-    )
-    return FearSellingEngine(risk_manager=rm)
+    """Create a FearSellingEngine with 100k allocated capital."""
+    return FearSellingEngine(allocated_capital=100_000.0)
 
 
 class TestKellySizing:

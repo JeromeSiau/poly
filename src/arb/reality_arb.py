@@ -10,6 +10,7 @@ This is the main trading logic that:
 6. Executes trade if in autopilot mode, or alerts for manual approval
 """
 
+import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
@@ -21,7 +22,8 @@ import structlog
 from src.realtime.event_detector import EventDetector, SignificantEvent
 from src.realtime.market_mapper import MarketMapper, MarketMapping
 from src.arb.position_manager import PositionManager, PositionAction, PositionDecision
-from src.risk.manager import UnifiedRiskManager
+from src.risk.guard import RiskGuard
+from src.risk.sizing import kelly_position_size
 from config.settings import settings
 
 logger = structlog.get_logger()
@@ -101,7 +103,8 @@ class RealityArbEngine:
         event_detector: Optional[EventDetector] = None,
         market_mapper: Optional[MarketMapper] = None,
         position_manager: Optional[PositionManager] = None,
-        risk_manager: Optional[UnifiedRiskManager] = None,
+        guard: Optional[RiskGuard] = None,
+        allocated_capital: float = 0.0,
         autopilot: Optional[bool] = None,
     ):
         """Initialize the Reality Arbitrage Engine.
@@ -111,6 +114,8 @@ class RealityArbEngine:
             event_detector: Detector for significant game events
             market_mapper: Mapper for linking events to markets
             position_manager: Manager for tracking open positions
+            guard: Optional RiskGuard for circuit-breaker gating
+            allocated_capital: Capital allocated to this strategy (USD)
         """
         self.polymarket_feed = polymarket_feed
 
@@ -128,11 +133,11 @@ class RealityArbEngine:
 
         self.market_mapper = market_mapper or MarketMapper()
 
-        # Risk parameters (from settings)
-        self.risk_manager = risk_manager
+        # Risk gating
+        self.guard = guard
         self.capital: float = (
-            self.risk_manager.get_available_capital("reality")
-            if self.risk_manager
+            allocated_capital
+            if allocated_capital > 0
             else settings.GLOBAL_CAPITAL * (settings.CAPITAL_ALLOCATION_REALITY_PCT / 100.0)
         )
         self.max_position_pct: float = settings.MAX_POSITION_PCT
@@ -292,12 +297,7 @@ class RealityArbEngine:
     def calculate_position_size(self, opportunity: ArbOpportunity) -> float:
         """Calculate position size using Kelly criterion.
 
-        The Kelly criterion optimizes long-term growth by betting a fraction
-        of capital proportional to edge and probability.
-
-        Kelly fraction = edge / odds
-
-        For simplicity, we use a fractional Kelly (1/4) to reduce variance.
+        Uses the standalone ``kelly_position_size`` utility (1/4 Kelly).
 
         Args:
             opportunity: The arbitrage opportunity
@@ -305,51 +305,13 @@ class RealityArbEngine:
         Returns:
             Position size in dollars (capped by max_position_pct)
         """
-        # Use UnifiedRiskManager if available
-        if self.risk_manager:
-            available_liquidity = opportunity.available_liquidity or self.capital
-            return self.risk_manager.calculate_position_size(
-                strategy="reality",
-                available_liquidity=available_liquidity,
-                edge_pct=opportunity.edge_pct,
-            )
-
-        # Max position based on capital and risk limit
-        max_position = self.capital * self.max_position_pct
-
-        # Kelly criterion: f* = edge / odds
-        # For binary markets, odds = 1 / (1 - p) where p is probability
-        # Simplified: f* = edge / variance
-        prob = opportunity.estimated_fair_price
-        variance = prob * (1 - prob)
-
-        if variance <= 0:
-            return 0.0
-
-        # Full Kelly
-        kelly_fraction = opportunity.edge_pct / variance
-
-        # Use fractional Kelly (1/4) for safety
-        fractional_kelly = kelly_fraction * 0.25
-
-        # Calculate position size
-        position = self.capital * fractional_kelly
-
-        # Cap at maximum allowed position
-        position = min(position, max_position)
-
-        # Ensure positive
-        position = max(0.0, position)
-
-        logger.debug(
-            "position_size_calculated",
-            kelly_fraction=kelly_fraction,
-            fractional_kelly=fractional_kelly,
-            position=position,
-            max_position=max_position,
+        available_liquidity = opportunity.available_liquidity or self.capital
+        return kelly_position_size(
+            capital=self.capital,
+            edge=opportunity.edge_pct,
+            max_pct=self.max_position_pct,
+            liquidity=available_liquidity,
         )
-
-        return position
 
     def _event_age_seconds(self, event: SignificantEvent) -> Optional[float]:
         """Compute event age in seconds if possible."""
@@ -481,7 +443,7 @@ class RealityArbEngine:
             Trade result if executed, opportunity dict if pending, None if no opportunity
         """
         # Risk halt check
-        if self.risk_manager and self.risk_manager.is_halted:
+        if self.guard and self.guard.circuit_broken:
             logger.warning("risk_halt_active")
             return {"status": "RISK_HALTED"}
 
@@ -743,10 +705,10 @@ class RealityArbEngine:
                 realized_pnl=closed.get("realized_pnl") if closed else None,
             )
 
-            if closed and self.risk_manager:
-                self.risk_manager.record_pnl(
-                    closed.get("realized_pnl", 0.0),
-                    strategy="reality",
+            if closed and self.guard:
+                pnl = closed.get("realized_pnl", 0.0)
+                asyncio.ensure_future(
+                    self.guard.record_result(pnl=pnl, won=pnl > 0)
                 )
 
             return {
@@ -818,11 +780,9 @@ class RealityArbEngine:
             realized_pnl=closed.get("realized_pnl") if closed else None,
         )
 
-        if closed and self.risk_manager:
-            self.risk_manager.record_pnl(
-                closed.get("realized_pnl", 0.0),
-                strategy="reality",
-            )
+        if closed and self.guard:
+            pnl = closed.get("realized_pnl", 0.0)
+            await self.guard.record_result(pnl=pnl, won=pnl > 0)
 
         return closed
 

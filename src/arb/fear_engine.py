@@ -55,8 +55,8 @@ class FearSellingEngine:
 
     def __init__(
         self,
-        risk_manager=None,
         executor=None,
+        allocated_capital: float = 100_000.0,
         max_cluster_pct: float = 0.30,
         max_position_pct: float = 0.10,
         kelly_fraction: float = 0.25,
@@ -65,7 +65,7 @@ class FearSellingEngine:
         min_fear_score: float = 0.5,
         classifier: FearClassifier | None = None,
     ) -> None:
-        self._risk_manager = risk_manager
+        self._allocated_capital = allocated_capital
         self._executor = executor
         self._max_cluster_pct = max_cluster_pct
         self._max_position_pct = max_position_pct
@@ -100,10 +100,8 @@ class FearSellingEngine:
 
     @property
     def _available_capital(self) -> float:
-        """Get available capital from risk manager, or default to 100k."""
-        if self._risk_manager is not None:
-            return self._risk_manager.get_available_capital("fear")
-        return 100_000.0
+        """Get available capital for this strategy."""
+        return self._allocated_capital
 
     # ------------------------------------------------------------------
     # Kelly sizing

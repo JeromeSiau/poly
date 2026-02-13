@@ -19,7 +19,7 @@ from src.feeds.polymarket import PolymarketFeed
 from src.realtime.crypto_mapper import CryptoMarketMapper
 from src.arb.crypto_arb import CryptoArbEngine
 from src.arb.position_manager import PositionManager
-from src.risk.manager import UnifiedRiskManager
+from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -35,22 +35,26 @@ async def main(symbols: list[str], autopilot: bool) -> None:
     polymarket = PolymarketFeed()
     mapper = CryptoMarketMapper()
 
-    # Init risk manager
-    risk_mgr = UnifiedRiskManager(
-        global_capital=settings.GLOBAL_CAPITAL,
-        reality_allocation_pct=settings.CAPITAL_ALLOCATION_REALITY_PCT,
-        crossmarket_allocation_pct=settings.CAPITAL_ALLOCATION_CROSSMARKET_PCT,
-        crypto_allocation_pct=settings.CAPITAL_ALLOCATION_CRYPTO_PCT,
-        max_position_pct=settings.MAX_POSITION_PCT,
-        daily_loss_limit_pct=settings.DAILY_LOSS_LIMIT_PCT,
+    # Init RiskGuard
+    allocated_capital = (
+        settings.GLOBAL_CAPITAL * (settings.CAPITAL_ALLOCATION_CRYPTO_PCT / 100.0)
     )
+    guard = RiskGuard(
+        strategy_tag="crypto_arb",
+        db_path="data/arb.db",
+        daily_loss_limit_usd=-(
+            settings.GLOBAL_CAPITAL * settings.DAILY_LOSS_LIMIT_PCT
+        ),
+    )
+    await guard.initialize()
 
     # Init engine
     engine = CryptoArbEngine(
         binance_feed=binance,
         polymarket_feed=polymarket,
         crypto_mapper=mapper,
-        risk_manager=risk_mgr,
+        guard=guard,
+        allocated_capital=allocated_capital,
     )
 
     # Connect feeds

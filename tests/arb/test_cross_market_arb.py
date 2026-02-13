@@ -70,18 +70,11 @@ def test_opportunity_is_valid():
 
 
 @pytest.fixture
-def mock_risk_manager():
-    rm = MagicMock()
-    rm.check_daily_loss_limit.return_value = True
-    rm.check_position_limit.return_value = True
-    rm.calculate_position_size.return_value = 500.0
-    rm.get_available_capital.return_value = 5000.0
-    return rm
-
-
-@pytest.fixture
-def arb_engine(mock_risk_manager):
-    engine = CrossMarketArbEngine(risk_manager=mock_risk_manager)
+def arb_engine():
+    engine = CrossMarketArbEngine(
+        allocated_capital=5000.0,
+        max_position_pct=0.10,
+    )
     return engine
 
 

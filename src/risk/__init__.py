@@ -1,5 +1,5 @@
 """Risk management module for arbitrage strategies."""
 
-from src.risk.manager import UnifiedRiskManager
+from src.risk.guard import RiskGuard
 
-__all__ = ["UnifiedRiskManager"]
+__all__ = ["RiskGuard"]

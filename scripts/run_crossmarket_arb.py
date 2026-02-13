@@ -31,7 +31,7 @@ from src.feeds.overtime import OvertimeFeed
 from src.feeds.polymarket import PolymarketFeed
 from src.matching.event_matcher import CrossMarketMatcher, MatchedEvent
 from src.arb.cross_market_arb import CrossMarketArbEngine, EvaluationResult
-from src.risk.manager import UnifiedRiskManager
+from src.risk.guard import RiskGuard
 from src.bot.crossmarket_handlers import CrossMarketArbHandler
 from src.db.database import init_db_async
 
@@ -64,18 +64,18 @@ class CrossMarketArbBot:
         # Initialize matcher
         self.matcher = CrossMarketMatcher()
 
-        # Initialize risk manager
-        self.risk_manager = UnifiedRiskManager(
-            global_capital=settings.GLOBAL_CAPITAL,
-            reality_allocation_pct=settings.CAPITAL_ALLOCATION_REALITY_PCT,
-            crossmarket_allocation_pct=settings.CAPITAL_ALLOCATION_CROSSMARKET_PCT,
-            max_position_pct=settings.MAX_POSITION_PCT,
-            daily_loss_limit_pct=settings.DAILY_LOSS_LIMIT_PCT,
+        # Allocated capital for this strategy
+        self.allocated_capital = (
+            settings.GLOBAL_CAPITAL * (settings.CAPITAL_ALLOCATION_CROSSMARKET_PCT / 100.0)
         )
 
-        # Initialize arb engine
+        # RiskGuard — initialized asynchronously in start()
+        self.guard: RiskGuard | None = None
+
+        # Initialize arb engine (guard injected in start())
         self.engine = CrossMarketArbEngine(
-            risk_manager=self.risk_manager,
+            allocated_capital=self.allocated_capital,
+            max_position_pct=settings.MAX_POSITION_PCT,
             min_edge_pct=settings.CROSSMARKET_MIN_EDGE_PCT,
         )
 
@@ -97,6 +97,17 @@ class CrossMarketArbBot:
 
         # Initialize database
         await init_db_async()
+
+        # Initialize RiskGuard
+        self.guard = RiskGuard(
+            strategy_tag="crossmarket_arb",
+            db_path="data/arb.db",
+            daily_loss_limit_usd=-(
+                settings.GLOBAL_CAPITAL * settings.DAILY_LOSS_LIMIT_PCT
+            ),
+        )
+        await self.guard.initialize()
+        self.engine.guard = self.guard
 
         # Connect to feeds
         await self._connect_feeds()

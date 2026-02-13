@@ -10,7 +10,6 @@ import respx
 
 from src.arb.fear_engine import FearSellingEngine
 from src.arb.fear_scanner import FearMarketScanner
-from src.risk.manager import UnifiedRiskManager
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
@@ -85,16 +84,8 @@ async def test_full_pipeline():
     respx.get(f"{GAMMA_API}/events").mock(
         return_value=httpx.Response(200, json=FEAR_EVENTS)
     )
-    risk_manager = UnifiedRiskManager(
-        global_capital=100_000.0,
-        reality_allocation_pct=0.0,
-        crossmarket_allocation_pct=0.0,
-        max_position_pct=0.10,
-        daily_loss_limit_pct=0.05,
-        fear_allocation_pct=1.0,
-    )
     engine = FearSellingEngine(
-        risk_manager=risk_manager, executor=None, min_fear_score=0.5
+        allocated_capital=100_000.0, executor=None, min_fear_score=0.5
     )
 
     # Discover
@@ -125,16 +116,8 @@ async def test_cluster_limit_enforcement():
     respx.get(f"{GAMMA_API}/events").mock(
         return_value=httpx.Response(200, json=FEAR_EVENTS)
     )
-    risk_manager = UnifiedRiskManager(
-        global_capital=50_000.0,
-        reality_allocation_pct=0.0,
-        crossmarket_allocation_pct=0.0,
-        max_position_pct=0.10,
-        daily_loss_limit_pct=0.05,
-        fear_allocation_pct=1.0,
-    )
     engine = FearSellingEngine(
-        risk_manager=risk_manager,
+        allocated_capital=50_000.0,
         executor=None,
         max_cluster_pct=0.15,
         min_fear_score=0.5,

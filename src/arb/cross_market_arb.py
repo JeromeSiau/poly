@@ -18,6 +18,8 @@ from typing import Any, Optional
 import structlog
 
 from config.settings import settings
+from src.risk.guard import RiskGuard
+from src.risk.sizing import kelly_position_size
 
 logger = structlog.get_logger()
 
@@ -156,21 +158,33 @@ class CrossMarketArbEngine:
     """Cross-Market Arbitrage Engine.
 
     Detects and evaluates arbitrage opportunities across prediction market
-    platforms. Uses the UnifiedRiskManager for position sizing and limits.
+    platforms. Uses RiskGuard for circuit-breaker gating and
+    ``kelly_position_size`` for sizing.
     """
 
     def __init__(
         self,
-        risk_manager: Optional[Any] = None,
+        guard: Optional[RiskGuard] = None,
+        allocated_capital: float = 0.0,
+        max_position_pct: float = 0.0,
         min_edge_pct: Optional[float] = None,
     ):
         """Initialize the Cross-Market Arbitrage Engine.
 
         Args:
-            risk_manager: UnifiedRiskManager instance for risk checks
+            guard: Optional RiskGuard for circuit-breaker gating
+            allocated_capital: Capital allocated to this strategy (USD)
+            max_position_pct: Max position as fraction of capital (0-1)
             min_edge_pct: Minimum edge percentage to consider (default from settings)
         """
-        self.risk_manager = risk_manager
+        self.guard = guard
+        self.allocated_capital = (
+            allocated_capital
+            if allocated_capital > 0
+            else settings.GLOBAL_CAPITAL
+            * (settings.CAPITAL_ALLOCATION_CROSSMARKET_PCT / 100.0)
+        )
+        self.max_position_pct = max_position_pct or settings.MAX_POSITION_PCT
         self.min_edge_pct = min_edge_pct or settings.CROSSMARKET_MIN_EDGE_PCT
 
         # Tracking state
@@ -375,43 +389,38 @@ class CrossMarketArbEngine:
                 rejection_reason="Opportunity net edge below minimum threshold",
             )
 
-        # Risk manager checks
-        if self.risk_manager:
-            # Check daily loss limit
-            if not self.risk_manager.check_daily_loss_limit():
-                logger.warning("daily_loss_limit_exceeded_rejection")
-                return EvaluationResult(
-                    opportunity=opportunity,
-                    position_size=0.0,
-                    approved=False,
-                    rejection_reason="Daily loss limit exceeded",
-                )
-
-            # Calculate position size using risk manager
-            position_size = self.risk_manager.calculate_position_size(
-                strategy="crossmarket",
-                available_liquidity=opportunity.min_liquidity,
-                edge_pct=opportunity.net_edge_pct,
+        # Circuit-breaker check
+        if self.guard and self.guard.circuit_broken:
+            logger.warning("circuit_breaker_active")
+            return EvaluationResult(
+                opportunity=opportunity,
+                position_size=0.0,
+                approved=False,
+                rejection_reason="Circuit breaker active",
             )
 
-            # Check position limit
-            if not self.risk_manager.check_position_limit(
-                size=position_size,
-                strategy="crossmarket",
-            ):
-                logger.warning(
-                    "position_limit_exceeded",
-                    position_size=position_size,
-                )
-                return EvaluationResult(
-                    opportunity=opportunity,
-                    position_size=0.0,
-                    approved=False,
-                    rejection_reason="Position limit exceeded",
-                )
-        else:
-            # Fallback: simple position sizing without risk manager
-            position_size = opportunity.min_liquidity * 0.1  # 10% of liquidity
+        # Position sizing via Kelly
+        position_size = kelly_position_size(
+            capital=self.allocated_capital,
+            edge=opportunity.net_edge_pct,
+            max_pct=self.max_position_pct,
+            liquidity=opportunity.min_liquidity,
+        )
+
+        # Inline position limit check
+        max_position = self.allocated_capital * self.max_position_pct
+        if position_size > max_position:
+            logger.warning(
+                "position_limit_exceeded",
+                position_size=position_size,
+                max_position=max_position,
+            )
+            return EvaluationResult(
+                opportunity=opportunity,
+                position_size=0.0,
+                approved=False,
+                rejection_reason="Position limit exceeded",
+            )
 
         # Store pending opportunity
         event_key = self._make_opportunity_key(opportunity)
