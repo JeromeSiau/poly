@@ -76,7 +76,8 @@ class PassiveOrder:
     price: float
     size_usd: float
     placed_at: float
-    side: str = "BUY"  # "BUY" or "SELL"
+    side: str = "BUY"
+    cancelled_at: float = 0.0  # "BUY" or "SELL"
 
 
 @dataclass(slots=True)
@@ -151,6 +152,8 @@ class CryptoTDMaker:
         self.active_orders: dict[str, PassiveOrder] = {}  # order_id -> order
         self._orders_by_cid_outcome: dict[tuple[str, str], str] = {}
         self.positions: dict[str, OpenPosition] = {}  # cid -> position
+        # Orders being cancelled — kept for late fill detection.
+        self._pending_cancels: dict[str, PassiveOrder] = {}  # order_id -> order
         self._http_client: Optional[httpx.AsyncClient] = None
         self._cycle_count: int = 0
         self._last_status_time: float = 0.0
@@ -349,6 +352,16 @@ class CryptoTDMaker:
         now = time.time()
         self._cycle_count += 1
 
+        # Expire stale pending cancels (>30s since cancel was sent).
+        stale_cancel_ids = [
+            oid for oid, order in self._pending_cancels.items()
+            if order.cancelled_at > 0 and now - order.cancelled_at > 30.0
+        ]
+        for oid in stale_cancel_ids:
+            order = self._pending_cancels.pop(oid)
+            self._db_fire(self._db_delete_order(oid))
+            logger.debug("td_pending_cancel_expired", order_id=oid[:16])
+
         # Circuit breaker gate
         if self.guard:
             await self.guard.heartbeat()
@@ -417,15 +430,13 @@ class CryptoTDMaker:
                                 if self._orders_by_cid_outcome.get(existing_key) == oid:
                                     del self._orders_by_cid_outcome[existing_key]
                                 self._cancel_other_side(cid, outcome)
-                            else:
-                                cancel_ids.append(existing_order.order_id)
-                                if budget_left >= self.order_size_usd:
-                                    place_intents.append((cid, outcome, token_id, bid, "BUY"))
+                            # else: bid moved within range — keep existing order.
+                            # DO NOT cancel+replace: the CLOB fills faster than
+                            # cancels propagate, causing runaway duplicate fills.
                     else:  # SELL
                         if not ask_in_range:
                             cancel_ids.append(existing_order.order_id)
                         elif existing_order.price != ask:
-                            # Ask rose past our price → our level was consumed → fill
                             if self.paper_mode and ask > existing_order.price:
                                 self._process_fill(existing_order, now)
                                 oid = existing_order.order_id
@@ -433,10 +444,7 @@ class CryptoTDMaker:
                                 if self._orders_by_cid_outcome.get(existing_key) == oid:
                                     del self._orders_by_cid_outcome[existing_key]
                                 self._cancel_other_side(cid, outcome)
-                            else:
-                                cancel_ids.append(existing_order.order_id)
-                                if budget_left >= self.order_size_usd:
-                                    place_intents.append((cid, outcome, token_id, ask, "SELL"))
+                            # else: ask moved within range — keep existing order.
                     # else: order still at correct price, do nothing.
                 else:
                     # No existing order — place if in range
@@ -447,21 +455,43 @@ class CryptoTDMaker:
 
         # Execute cancels.
         for oid in cancel_ids:
-            order = self.active_orders.pop(oid, None)
-            if order:
-                key = (order.condition_id, order.outcome)
+            order = self.active_orders.get(oid)
+            if not order:
+                continue
+            key = (order.condition_id, order.outcome)
+            if not self.paper_mode and self.executor:
+                # Track cancel in-flight so late fills are caught.
+                order.cancelled_at = now
+                self._pending_cancels[oid] = order
+                try:
+                    await self.executor.cancel_order(oid)
+                    # Cancel confirmed — safe to clean up everywhere.
+                    self._pending_cancels.pop(oid, None)
+                    self.active_orders.pop(oid, None)
+                    if self._orders_by_cid_outcome.get(key) == oid:
+                        del self._orders_by_cid_outcome[key]
+                    self._db_fire(self._db_delete_order(oid))
+                except Exception as exc:
+                    # Cancel request failed — order likely still live.
+                    # Keep in both active_orders AND _pending_cancels.
+                    # _fill_listener will handle late fills.
+                    logger.warning(
+                        "td_cancel_request_failed",
+                        order_id=oid[:16],
+                        error=str(exc)[:80],
+                    )
+            else:
+                # Paper mode: instant cancel.
+                self.active_orders.pop(oid, None)
                 if self._orders_by_cid_outcome.get(key) == oid:
                     del self._orders_by_cid_outcome[key]
                 self._db_fire(self._db_delete_order(oid))
-                if not self.paper_mode and self.executor:
-                    try:
-                        await self.executor.cancel_order(oid)
-                    except Exception:
-                        pass
 
         # Execute placements (at most one order per market).
         placed = 0
         placed_cids: set[str] = set()
+        # Collect condition_ids with pending cancels — don't place new orders there.
+        pending_cancel_cids = {o.condition_id for o in self._pending_cancels.values()}
         for cid, outcome, token_id, price, side in place_intents:
             # Re-check we don't already have position (could have filled above).
             if cid in self.positions:
@@ -472,6 +502,9 @@ class CryptoTDMaker:
             if cid in placed_cids:
                 continue
             if any(o.condition_id == cid for o in self.active_orders.values()):
+                continue
+            # Don't place new orders while a cancel is in-flight for this market.
+            if cid in pending_cancel_cids:
                 continue
 
             order_id = await self._place_order(cid, outcome, token_id, price, now, side=side)
@@ -682,16 +715,23 @@ class CryptoTDMaker:
             key = (cid, outcome)
             oid = self._orders_by_cid_outcome.pop(key, None)
             if oid and oid in self.active_orders:
-                self.active_orders.pop(oid)
-                self._db_fire(self._db_delete_order(oid))
+                order = self.active_orders.pop(oid)
                 if not self.paper_mode and self.executor:
+                    order.cancelled_at = time.time()
+                    self._pending_cancels[oid] = order
                     asyncio.create_task(self._async_cancel(oid))
+                else:
+                    self._db_fire(self._db_delete_order(oid))
                 logger.debug("td_other_side_cancelled", outcome=outcome)
 
     async def _async_cancel(self, order_id: str) -> None:
         try:
             await self.executor.cancel_order(order_id)
+            # Cancel confirmed — clean up.
+            self._pending_cancels.pop(order_id, None)
+            self._db_fire(self._db_delete_order(order_id))
         except Exception:
+            # Keep in _pending_cancels; _fill_listener or expiry will handle it.
             pass
 
     async def _fill_listener(self) -> None:
@@ -706,18 +746,45 @@ class CryptoTDMaker:
 
             matched_order: Optional[PassiveOrder] = None
             matched_id: Optional[str] = None
+            source = "active"
+
+            # First check active orders.
             for oid, order in self.active_orders.items():
                 if order.token_id == evt.asset_id and order.condition_id == evt.market:
                     matched_order = order
                     matched_id = oid
                     break
 
+            # Then check pending cancels — late fill for an order we tried to cancel.
+            if not matched_order:
+                for oid, order in self._pending_cancels.items():
+                    if order.token_id == evt.asset_id and order.condition_id == evt.market:
+                        matched_order = order
+                        matched_id = oid
+                        source = "pending_cancel"
+                        logger.warning(
+                            "td_late_fill_from_cancelled_order",
+                            order_id=oid[:16],
+                            condition_id=order.condition_id[:16],
+                            outcome=order.outcome,
+                            price=order.price,
+                        )
+                        break
+
             if not matched_order or not matched_id:
+                continue
+
+            # Skip duplicate CONFIRMED events for already-processed fills,
+            # but only AFTER checking pending_cancels above.
+            if evt.market in self.positions:
                 continue
 
             now = time.time()
             self._process_fill(matched_order, now)
-            del self.active_orders[matched_id]
+            if source == "active":
+                del self.active_orders[matched_id]
+            else:
+                self._pending_cancels.pop(matched_id, None)
             key = (matched_order.condition_id, matched_order.outcome)
             if self._orders_by_cid_outcome.get(key) == matched_id:
                 del self._orders_by_cid_outcome[key]
