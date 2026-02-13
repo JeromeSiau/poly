@@ -120,6 +120,7 @@ class KalshiTDMaker:
         scan_interval: float = 120.0,
         symbols: list[str] | None = None,
         guard: Optional[RiskGuard] = None,
+        db_url: str = "",
     ) -> None:
         self.executor = executor
         self.manager = manager
@@ -132,14 +133,70 @@ class KalshiTDMaker:
         self.scan_interval = scan_interval
         self.symbols = symbols or ["KXBTCD", "KXETHD"]
         self.guard = guard
+        self._db_url = db_url
         self._last_book_update: float = time.time()
 
         # State
         self.known_events: set[str] = set()
         self.positions: dict[str, OpenPosition] = {}  # ticker -> position
+        self._position_order_ids: dict[str, str] = {}  # ticker -> order_id for DB
 
         # Stats (mirror from manager for status display)
         self.total_fills: int = 0
+
+    # ------------------------------------------------------------------
+    # DB persistence
+    # ------------------------------------------------------------------
+
+    async def _load_db_state(self) -> None:
+        """Restore positions from DB on startup."""
+        if not self._db_url:
+            return
+        from src.db.td_orders import load_orders
+        rows = await load_orders(
+            db_url=self._db_url, platform="kalshi",
+            strategy_tag="kalshi_td_maker",
+        )
+        for row in rows:
+            if row.status == "filled":
+                pos = OpenPosition(
+                    ticker=row.token_id,
+                    event_ticker=row.condition_id,
+                    entry_price_cents=round(row.price * 100),
+                    count=round(row.shares) if row.shares else self.order_size_contracts,
+                    filled_at=row.filled_at or 0.0,
+                )
+                self.positions[row.token_id] = pos
+                self._position_order_ids[row.token_id] = row.order_id
+        if self.positions:
+            logger.info("kalshi_db_state_loaded", positions=len(self.positions))
+
+    def _db_fire(self, coro) -> None:
+        if not self._db_url:
+            return
+        try:
+            asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            pass
+
+    async def _db_save_filled(self, pos: OpenPosition, order_id: str) -> None:
+        from src.db.td_orders import save_order
+        await save_order(
+            db_url=self._db_url, platform="kalshi",
+            strategy_tag="kalshi_td_maker", order_id=order_id,
+            condition_id=pos.event_ticker, token_id=pos.ticker,
+            outcome="yes", price=pos.entry_price_cents / 100.0,
+            size_usd=pos.count * pos.entry_price_cents / 100.0,
+            status="filled", shares=float(pos.count),
+            filled_at=pos.filled_at,
+        )
+
+    async def _db_mark_settled(self, order_id: str, pnl: float, settled_at: float) -> None:
+        from src.db.td_orders import mark_settled
+        await mark_settled(
+            db_url=self._db_url, order_id=order_id,
+            pnl=pnl, settled_at=settled_at,
+        )
 
     # ------------------------------------------------------------------
     # Market scanning
@@ -272,9 +329,11 @@ class KalshiTDMaker:
                     filled_at=time.time(),
                 )
                 self.positions[ticker] = pos
+                self._position_order_ids[ticker] = pending.order_id
                 self.total_fills += 1
                 self.manager._pending.pop(pending.order_id, None)
                 self._persist_fill(pos)
+                self._db_fire(self._db_save_filled(pos, pending.order_id))
                 logger.info(
                     "kalshi_paper_fill",
                     ticker=ticker,
@@ -377,11 +436,13 @@ class KalshiTDMaker:
                 filled_at=time.time(),
             )
             self.positions[ticker] = pos
+            self._position_order_ids[ticker] = oid
             self.total_fills += 1
 
             # Remove from manager's pending
             await self.manager.cancel(oid)
             self._persist_fill(pos)
+            self._db_fire(self._db_save_filled(pos, oid))
 
             logger.info(
                 "kalshi_fill_detected",
@@ -424,6 +485,11 @@ class KalshiTDMaker:
                     )
                     settled_tickers.append(ticker)
 
+                    # Mark settled in DB.
+                    oid = self._position_order_ids.pop(ticker, None)
+                    if oid:
+                        self._db_fire(self._db_mark_settled(oid, pnl, time.time()))
+
             except Exception as exc:
                 logger.debug("kalshi_settlement_check_error", ticker=ticker, error=str(exc))
 
@@ -464,6 +530,7 @@ class KalshiTDMaker:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        await self._load_db_state()
         try:
             logger.info(
                 "kalshi_td_maker_started",
@@ -568,6 +635,7 @@ async def main() -> None:
         scan_interval=args.scan_interval,
         symbols=symbols,
         guard=guard,
+        db_url=settings.DATABASE_URL,
     )
 
     print(f"=== Kalshi TD Maker {'(PAPER)' if paper_mode else '(LIVE)'} ===")

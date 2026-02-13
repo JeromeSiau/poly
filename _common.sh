@@ -10,6 +10,12 @@ export PYTHONPATH="$BASE"
 export PYTHONUNBUFFERED=1
 mkdir -p "$BASE/logs" "$BASE/data"
 
+# Export proxy vars from .env so httpx/websockets pick them up
+if [[ -f "$BASE/.env" ]]; then
+  _proxy=$(grep -m1 '^HTTPS_PROXY=' "$BASE/.env" | cut -d= -f2-)
+  [[ -n "$_proxy" ]] && export HTTPS_PROXY="$_proxy" HTTP_PROXY="$_proxy"
+fi
+
 PYTHON="$BASE/.venv/bin/python"
 DB_URL="sqlite+aiosqlite:///data/arb.db"
 

@@ -320,3 +320,30 @@ class FearPosition(Base):
     entry_trigger = Column(String, nullable=True)  # "scan" | "spike" | "manual"
     opened_at = Column(DateTime, server_default=func.now())
     closed_at = Column(DateTime, nullable=True)
+
+
+class TDMakerOrder(Base):
+    """Persisted TD maker orders — pending bids and open positions.
+
+    Used by CryptoTDMaker and KalshiTDMaker to survive daemon restarts.
+    """
+
+    __tablename__ = "td_maker_orders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    platform = Column(String(20), nullable=False, index=True)  # "polymarket" | "kalshi"
+    strategy_tag = Column(String(100), nullable=False, index=True)
+    order_id = Column(String(255), nullable=False, index=True)
+    condition_id = Column(String(255), nullable=False)
+    token_id = Column(String(255), nullable=False)
+    outcome = Column(String(50), nullable=False)
+    price = Column(Float, nullable=False)
+    size_usd = Column(Float, nullable=False)
+    shares = Column(Float, nullable=True)
+    status = Column(String(20), nullable=False, index=True)  # "pending" | "filled" | "settled" | "cancelled"
+    placed_at = Column(Float, nullable=True)
+    filled_at = Column(Float, nullable=True)
+    settled_at = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True)
+    extra = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

@@ -118,6 +118,7 @@ class CryptoTDMaker:
         maker_loop_interval: float = 0.5,
         strategy_tag: str = "crypto_td_maker",
         guard: Optional[RiskGuard] = None,
+        db_url: str = "",
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -133,6 +134,7 @@ class CryptoTDMaker:
         self.maker_loop_interval = maker_loop_interval
         self.strategy_tag = strategy_tag
         self.guard = guard
+        self._db_url = db_url
         self._last_book_update: float = time.time()
 
         # State
@@ -147,12 +149,91 @@ class CryptoTDMaker:
         self._last_status_time: float = 0.0
         # Last known bid per (cid, outcome) — fallback for settlement when book empties.
         self._last_bids: dict[tuple[str, str], float] = {}
+        # Map condition_id -> order_id for DB settlement tracking.
+        self._position_order_ids: dict[str, str] = {}
 
         # Stats
         self.total_fills: int = 0
         self.total_wins: int = 0
         self.total_losses: int = 0
         self.realized_pnl: float = 0.0
+
+    # ------------------------------------------------------------------
+    # DB persistence
+    # ------------------------------------------------------------------
+
+    async def _load_db_state(self) -> None:
+        """Restore active orders and positions from DB on startup."""
+        if not self._db_url:
+            return
+        from src.db.td_orders import load_orders
+        rows = await load_orders(
+            db_url=self._db_url, platform="polymarket",
+            strategy_tag=self.strategy_tag,
+        )
+        for row in rows:
+            if row.status == "pending":
+                order = PassiveOrder(
+                    order_id=row.order_id, condition_id=row.condition_id,
+                    outcome=row.outcome, token_id=row.token_id,
+                    price=row.price, size_usd=row.size_usd,
+                    placed_at=row.placed_at or 0.0,
+                )
+                self.active_orders[row.order_id] = order
+                self._orders_by_cid_outcome[(row.condition_id, row.outcome)] = row.order_id
+            elif row.status == "filled":
+                pos = OpenPosition(
+                    condition_id=row.condition_id, outcome=row.outcome,
+                    token_id=row.token_id, entry_price=row.price,
+                    size_usd=row.size_usd,
+                    shares=row.shares or row.size_usd / row.price,
+                    filled_at=row.filled_at or 0.0,
+                )
+                self.positions[row.condition_id] = pos
+        if self.active_orders or self.positions:
+            logger.info(
+                "td_db_state_loaded",
+                orders=len(self.active_orders),
+                positions=len(self.positions),
+            )
+
+    def _db_fire(self, coro) -> None:
+        """Schedule a DB coroutine as fire-and-forget."""
+        if not self._db_url:
+            return
+        try:
+            asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            pass
+
+    async def _db_save_order(self, order: PassiveOrder) -> None:
+        from src.db.td_orders import save_order
+        await save_order(
+            db_url=self._db_url, platform="polymarket",
+            strategy_tag=self.strategy_tag, order_id=order.order_id,
+            condition_id=order.condition_id, token_id=order.token_id,
+            outcome=order.outcome, price=order.price,
+            size_usd=order.size_usd, status="pending",
+            placed_at=order.placed_at,
+        )
+
+    async def _db_mark_filled(self, order_id: str, shares: float, filled_at: float) -> None:
+        from src.db.td_orders import mark_filled
+        await mark_filled(
+            db_url=self._db_url, order_id=order_id,
+            shares=shares, filled_at=filled_at,
+        )
+
+    async def _db_delete_order(self, order_id: str) -> None:
+        from src.db.td_orders import delete_order
+        await delete_order(db_url=self._db_url, order_id=order_id)
+
+    async def _db_mark_settled(self, order_id: str, pnl: float, settled_at: float) -> None:
+        from src.db.td_orders import mark_settled
+        await mark_settled(
+            db_url=self._db_url, order_id=order_id,
+            pnl=pnl, settled_at=settled_at,
+        )
 
     # ------------------------------------------------------------------
     # Market discovery
@@ -325,6 +406,7 @@ class CryptoTDMaker:
                 key = (order.condition_id, order.outcome)
                 if self._orders_by_cid_outcome.get(key) == oid:
                     del self._orders_by_cid_outcome[key]
+                self._db_fire(self._db_delete_order(oid))
                 if not self.paper_mode and self.executor:
                     try:
                         await self.executor.cancel_order(oid)
@@ -399,6 +481,7 @@ class CryptoTDMaker:
         )
         self.active_orders[pending.order_id] = order
         self._orders_by_cid_outcome[(cid, outcome)] = pending.order_id
+        self._db_fire(self._db_save_order(order))
         return pending.order_id
 
     # ------------------------------------------------------------------
@@ -463,7 +546,9 @@ class CryptoTDMaker:
             filled_at=now,
         )
         self.positions[order.condition_id] = pos
+        self._position_order_ids[order.condition_id] = order.order_id
         self.total_fills += 1
+        self._db_fire(self._db_mark_filled(order.order_id, shares, now))
 
         logger.info(
             "td_order_filled",
@@ -515,6 +600,7 @@ class CryptoTDMaker:
             oid = self._orders_by_cid_outcome.pop(key, None)
             if oid and oid in self.active_orders:
                 self.active_orders.pop(oid)
+                self._db_fire(self._db_delete_order(oid))
                 if not self.paper_mode and self.executor:
                     asyncio.create_task(self._async_cancel(oid))
                 logger.debug("td_other_side_cancelled", outcome=outcome)
@@ -578,11 +664,13 @@ class CryptoTDMaker:
                 oid = self._orders_by_cid_outcome.pop(key, None)
                 if oid:
                     order = self.active_orders.pop(oid, None)
-                    if order and not self.paper_mode and self.executor:
-                        try:
-                            await self.executor.cancel_order(oid)
-                        except Exception:
-                            pass
+                    if order:
+                        self._db_fire(self._db_delete_order(oid))
+                        if not self.paper_mode and self.executor:
+                            try:
+                                await self.executor.cancel_order(oid)
+                            except Exception:
+                                pass
 
             # Settle position if held.
             pos = self.positions.pop(cid, None)
@@ -620,6 +708,11 @@ class CryptoTDMaker:
             self.total_losses += 1
         self.realized_pnl += pnl
 
+        # Mark settled in DB.
+        oid = self._position_order_ids.pop(pos.condition_id, None)
+        if oid:
+            self._db_fire(self._db_mark_settled(oid, pnl, now))
+
         if self.guard:
             try:
                 loop = asyncio.get_running_loop()
@@ -653,6 +746,7 @@ class CryptoTDMaker:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        await self._load_db_state()
         await self.polymarket.connect()
 
         if self.user_feed:
@@ -796,6 +890,7 @@ async def main() -> None:
         maker_loop_interval=args.maker_interval,
         strategy_tag=strategy_tag,
         guard=guard,
+        db_url=args.db_url,
     )
 
     print(f"=== Crypto TD Maker {'(PAPER)' if paper_mode else '(LIVE)'} ===")
