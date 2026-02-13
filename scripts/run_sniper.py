@@ -44,6 +44,7 @@ from scripts.run_two_sided_inventory import (
     settle_resolved_inventory,
     ResolvedCondition,
 )
+from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -215,6 +216,7 @@ async def spike_monitor_loop(
     action_queue: asyncio.Queue,
     poll_interval: float = 2.0,
     book_concurrency: int = 40,
+    last_book_update_ref: Optional[list[float]] = None,
 ) -> None:
     """Poll CLOB orderbooks for all tracked tokens and detect spikes."""
     while True:
@@ -237,6 +239,8 @@ async def spike_monitor_loop(
                     asks = book.get("asks", [])
                     if not bids and not asks:
                         continue
+                    if last_book_update_ref is not None:
+                        last_book_update_ref[0] = time.time()
                     best_bid = float(bids[0]["price"]) if bids else 0.0
                     best_ask = float(asks[0]["price"]) if asks else 0.0
                     mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else max(best_bid, best_ask)
@@ -274,11 +278,20 @@ async def execution_loop(
     strategy_tag: str,
     manager: Optional[TradeManager] = None,
     dry_run: bool = False,
+    guard: Optional[RiskGuard] = None,
+    last_book_update_ref: Optional[list[float]] = None,
 ) -> None:
     """Consume actions from queue, fetch live ask, and paper-fill."""
     while True:
         action: SniperAction = await action_queue.get()
         try:
+            # Circuit breaker gate
+            if guard:
+                await guard.heartbeat()
+                _lbu = last_book_update_ref[0] if last_book_update_ref else time.time()
+                if not await guard.is_trading_allowed(last_book_update=_lbu):
+                    action_queue.task_done()
+                    continue
             # Fetch live ask price for the target token
             token_ids = mapper.token_ids_for(action.condition_id)
             entry = mapper._cid_to_entry.get(action.condition_id, {})
@@ -384,6 +397,7 @@ async def settlement_loop(
     engine: TwoSidedInventoryEngine,
     manager: Optional[TradeManager] = None,
     interval: float = 120.0,
+    guard: Optional[RiskGuard] = None,
 ) -> None:
     """Periodically check open positions for market resolution and settle them."""
     while True:
@@ -412,6 +426,11 @@ async def settlement_loop(
                                 hold_hours=round(hold_age / 3600, 1),
                                 pnl=round(fill.realized_pnl_delta, 4),
                             )
+                            if guard:
+                                try:
+                                    await guard.record_result(pnl=fill.realized_pnl_delta, won=False)
+                                except Exception:
+                                    pass
                             if manager is not None:
                                 exec_intent = ExecTradeIntent(
                                     condition_id=cid,
@@ -459,6 +478,7 @@ async def settlement_loop(
             )
 
             if resolved:
+                pnl_before = engine.get_realized_pnl()
                 settled = settle_resolved_inventory(
                     engine,
                     resolved,
@@ -466,6 +486,13 @@ async def settlement_loop(
                     now_ts=now_ts,
                 )
                 if settled:
+                    pnl_after = engine.get_realized_pnl()
+                    pnl_delta = pnl_after - pnl_before
+                    if guard:
+                        try:
+                            await guard.record_result(pnl=pnl_delta, won=pnl_delta > 0)
+                        except Exception:
+                            pass
                     logger.info("sniper_positions_settled", count=settled, resolved_markets=len(resolved))
 
         except Exception as exc:
@@ -502,6 +529,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-market-net", type=float, default=80.0)
     p.add_argument("--settlement-interval", type=float, default=120.0,
                     help="Seconds between settlement checks for resolved markets")
+    p.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    p.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    p.add_argument("--cb-stale-seconds", type=float, default=30.0, help="Circuit breaker: book staleness threshold")
+    p.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return p
 
 
@@ -541,6 +572,20 @@ async def main() -> None:
         )
         logger.info("trade_manager_ready", strategy_tag=args.strategy_tag, run_id=run_id)
 
+    db_path = args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
+    guard = RiskGuard(
+        strategy_tag=args.strategy_tag,
+        db_path=db_path,
+        max_consecutive_losses=args.cb_max_losses,
+        max_drawdown_usd=args.cb_max_drawdown,
+        stale_seconds=args.cb_stale_seconds,
+        daily_loss_limit_usd=args.cb_daily_limit,
+        telegram_alerter=manager._alerter if manager else None,
+    )
+    await guard.initialize()
+
+    last_book_update_ref: list[float] = [time.time()]
+
     prefixes = [p.strip() for p in args.event_prefixes.split(",") if p.strip()] or None
     scores_sports = [s.strip() for s in args.scores_sports.split(",") if s.strip()]
 
@@ -568,6 +613,7 @@ async def main() -> None:
                 client, detector, router, mapper, action_queue,
                 poll_interval=args.spike_poll_interval,
                 book_concurrency=args.book_concurrency,
+                last_book_update_ref=last_book_update_ref,
             )),
             asyncio.create_task(execution_loop(
                 client, action_queue, mapper, engine,
@@ -575,10 +621,13 @@ async def main() -> None:
                 strategy_tag=args.strategy_tag,
                 manager=manager,
                 dry_run=args.dry_run,
+                guard=guard,
+                last_book_update_ref=last_book_update_ref,
             )),
             asyncio.create_task(settlement_loop(
                 client, engine, manager=manager,
                 interval=args.settlement_interval,
+                guard=guard,
             )),
         ]
 

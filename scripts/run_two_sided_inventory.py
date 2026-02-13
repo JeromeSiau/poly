@@ -84,6 +84,7 @@ from src.utils.parsing import (  # noqa: E402
     parse_json_list,
 )
 from src.utils.crypto_markets import CRYPTO_SYMBOL_TO_SLUG, fetch_crypto_markets  # noqa: E402
+from src.risk.guard import RiskGuard  # noqa: E402
 
 logger = structlog.get_logger()
 
@@ -551,7 +552,15 @@ async def run_cycle(
     args: argparse.Namespace,
     signal_memory: dict[tuple[str, str, str, int], float],
     pending_maker_orders: Optional[list[PendingMakerOrder]] = None,
+    guard: Optional[RiskGuard] = None,
 ) -> None:
+    # Circuit breaker gate
+    if guard:
+        await guard.heartbeat()
+        if not await guard.is_trading_allowed(last_book_update=time.time()):
+            print(f"[{time.strftime('%H:%M:%S')}] cb=ON — skipping cycle")
+            return
+
     crypto_symbols = _parse_csv_values(getattr(args, "crypto_symbols", ""))
     if crypto_symbols:
         raw_markets = await fetch_crypto_markets(
@@ -662,13 +671,22 @@ async def run_cycle(
                 enddate_grace_seconds=args.settlement_enddate_grace_seconds,
                 fetch_chunk_size=args.settlement_fetch_chunk,
             )
+            pnl_before_settle = engine.get_realized_pnl()
             settled = settle_resolved_inventory(
                 engine=engine,
                 resolved_conditions=resolved_conditions,
                 manager=manager if args.persist_paper else None,
                 now_ts=now,
             )
+            if settled and guard:
+                pnl_after_settle = engine.get_realized_pnl()
+                settle_pnl = pnl_after_settle - pnl_before_settle
+                try:
+                    await guard.record_result(pnl=settle_pnl, won=settle_pnl > 0)
+                except Exception:
+                    pass
     if args.paper_fill and args.pair_merge:
+        pnl_before_merge = engine.get_realized_pnl()
         merged = paper_merge_binary_pairs(
             engine=engine,
             snapshots_by_condition=snapshots_by_condition,
@@ -677,6 +695,13 @@ async def run_cycle(
             min_edge_pct=args.pair_merge_min_edge,
             max_pair_notional_usd=args.max_order,
         )
+        if merged and guard:
+            pnl_after_merge = engine.get_realized_pnl()
+            merge_pnl = pnl_after_merge - pnl_before_merge
+            try:
+                await guard.record_result(pnl=merge_pnl, won=merge_pnl > 0)
+            except Exception:
+                pass
 
     if fair_runtime is not None:
         await fair_runtime.refresh_if_needed(client=client, raw_markets=raw_markets, now_ts=now)
@@ -716,7 +741,9 @@ async def run_cycle(
 
     pending_count = len(pending_maker_orders) if pending_maker_orders is not None else 0
     print(
-        f"\n[{time.strftime('%H:%M:%S')}] markets={len(raw_markets)} "
+        f"\n[{time.strftime('%H:%M:%S')}] "
+        f"cb={'ON' if (guard and guard.circuit_broken) else 'off'} "
+        f"markets={len(raw_markets)} "
         f"snapshots={len(snapshots)} intents={len(all_intents)} settled={settled} merged={merged}"
         + (f" maker_fills={maker_fills} pending={pending_count}" if args.maker_mode else "")
     )
@@ -1158,6 +1185,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=settings.DATABASE_URL,
         help="Override database URL for paper persistence/reporting.",
     )
+    parser.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    parser.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    parser.add_argument("--cb-stale-seconds", type=float, default=60.0, help="Circuit breaker: book staleness threshold")
+    parser.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return parser
 
 
@@ -1246,6 +1277,18 @@ async def main() -> None:
                 realized_pnl=engine.get_realized_pnl(),
                 mode="autopilot" if args.autopilot else ("paper" if args.paper_fill else "scan_only"),
             )
+    db_path = args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
+    guard = RiskGuard(
+        strategy_tag=strategy_tag,
+        db_path=db_path,
+        max_consecutive_losses=args.cb_max_losses,
+        max_drawdown_usd=args.cb_max_drawdown,
+        stale_seconds=args.cb_stale_seconds,
+        daily_loss_limit_usd=args.cb_daily_limit,
+        telegram_alerter=manager._alerter if manager else None,
+    )
+    await guard.initialize()
+
     logger.info(
         "runner_configuration",
         strategy_tag=strategy_tag,
@@ -1259,12 +1302,12 @@ async def main() -> None:
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             if args.mode == "scan":
-                await run_cycle(client, engine, executor, fair_runtime, manager, args, signal_memory, pending_maker_orders)
+                await run_cycle(client, engine, executor, fair_runtime, manager, args, signal_memory, pending_maker_orders, guard=guard)
                 return
 
             while True:
                 try:
-                    await run_cycle(client, engine, executor, fair_runtime, manager, args, signal_memory, pending_maker_orders)
+                    await run_cycle(client, engine, executor, fair_runtime, manager, args, signal_memory, pending_maker_orders, guard=guard)
                 except Exception as exc:
                     logger.error("watch_cycle_error", error=str(exc))
                 await asyncio.sleep(args.interval)
