@@ -3,7 +3,7 @@
 # Source this at the top of each run_*.sh:
 #   source "$(dirname "$0")/_common.sh"
 
-BASE="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
+BASE="$(cd "$(dirname "${BASH_SOURCE[1]}")/.." && pwd)"
 
 cd "$BASE"
 export PYTHONPATH="$BASE"

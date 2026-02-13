@@ -11,6 +11,7 @@ websockets>=12.0
 
 # APIs
 py-clob-client>=0.1.0  # Polymarket
+poly-web3>=1.0.0       # Polymarket gas-free redeems
 
 # Database
 sqlalchemy>=2.0.23

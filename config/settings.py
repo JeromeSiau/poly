@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     POLYMARKET_ORDER_TYPE: str = "FOK"
     POLYMARKET_POST_ONLY: bool = False
 
+    # Builder / Relayer (for gas-free redeems)
+    POLYMARKET_BUILDER_ADDRESS: str = ""
+    POLYMARKET_BUILDER_API_KEY: str = ""
+    POLYMARKET_BUILDER_SECRET: str = ""
+    POLYMARKET_BUILDER_PASSPHRASE: str = ""
+
     # WebSocket endpoints
     POLYMARKET_CLOB_HTTP: str = "https://clob.polymarket.com"
     POLYMARKET_CLOB_WS: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"

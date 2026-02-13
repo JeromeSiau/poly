@@ -44,10 +44,10 @@ python scripts/paper_trade.py --model models/impact_model.pkl --game lol --capit
 # Run strategies (all default to --paper mode)
 python scripts/run_reality_arb.py --game lol [--autopilot]
 python scripts/run_crossmarket_arb.py [--autopilot] [--scan-interval 5]
-./run_two_sided.sh [min_edge] [exit_edge] [strategy_tag] [paper|live] [wallet_usd]
-./run_crypto_minute.sh
-./run_fear_selling.sh
-./run_weather_oracle.sh
+bin/run_two_sided.sh [min_edge] [exit_edge] [strategy_tag] [paper|live] [wallet_usd]
+bin/run_crypto_minute.sh
+bin/run_fear_selling.sh
+bin/run_weather_oracle.sh
 
 # Validation and reporting
 python scripts/validate_model.py
