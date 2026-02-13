@@ -161,6 +161,8 @@ class CryptoTDMaker:
         self._last_bids: dict[tuple[str, str], float] = {}
         # Map condition_id -> order_id for DB settlement tracking.
         self._position_order_ids: dict[str, str] = {}
+        # CIDs that received a fill — blocked from re-ordering for the slot duration.
+        self._filled_cids: dict[str, float] = {}  # cid -> filled_at timestamp
 
         # Stats
         self.total_fills: int = 0
@@ -385,9 +387,17 @@ class CryptoTDMaker:
         cancel_ids: list[str] = []
         place_intents: list[tuple[str, str, str, float, str]] = []  # (cid, outcome, token_id, price, side)
 
+        # Expire old _filled_cids entries (>20 min = slot + grace).
+        stale_filled = [c for c, t in self._filled_cids.items() if now - t > 1200]
+        for c in stale_filled:
+            del self._filled_cids[c]
+
         for cid in list(self.known_markets):
             # Skip if already have a position on this market.
             if cid in self.positions:
+                continue
+            # Skip markets that already received a fill this slot.
+            if cid in self._filled_cids:
                 continue
 
             outcomes = self.market_outcomes.get(cid, [])
@@ -496,6 +506,8 @@ class CryptoTDMaker:
         for cid, outcome, token_id, price, side in place_intents:
             # Re-check we don't already have position (could have filled above).
             if cid in self.positions:
+                continue
+            if cid in self._filled_cids:
                 continue
             if (cid, outcome) in self._orders_by_cid_outcome:
                 continue
@@ -708,6 +720,7 @@ class CryptoTDMaker:
         )
         self.positions[order.condition_id] = pos
         self._position_order_ids[order.condition_id] = order.order_id
+        self._filled_cids[order.condition_id] = now
         self.total_fills += 1
         self._db_fire(self._db_mark_filled(order.order_id, shares, now))
 
@@ -789,13 +802,18 @@ class CryptoTDMaker:
             except asyncio.CancelledError:
                 break
 
+            # Skip duplicate CONFIRMED events for already-processed fills.
+            if evt.market in self.positions or evt.market in self._filled_cids:
+                continue
+
             matched_order: Optional[PassiveOrder] = None
             matched_id: Optional[str] = None
             source = "active"
 
-            # First check active orders.
+            # Match by condition_id only (not token_id) — on binary markets
+            # the fill can arrive with the complementary token's asset_id.
             for oid, order in self.active_orders.items():
-                if order.token_id == evt.asset_id and order.condition_id == evt.market:
+                if order.condition_id == evt.market:
                     matched_order = order
                     matched_id = oid
                     break
@@ -803,7 +821,7 @@ class CryptoTDMaker:
             # Then check pending cancels — late fill for an order we tried to cancel.
             if not matched_order:
                 for oid, order in self._pending_cancels.items():
-                    if order.token_id == evt.asset_id and order.condition_id == evt.market:
+                    if order.condition_id == evt.market:
                         matched_order = order
                         matched_id = oid
                         source = "pending_cancel"
@@ -817,11 +835,17 @@ class CryptoTDMaker:
                         break
 
             if not matched_order or not matched_id:
-                continue
-
-            # Skip duplicate CONFIRMED events for already-processed fills,
-            # but only AFTER checking pending_cancels above.
-            if evt.market in self.positions:
+                logger.warning(
+                    "td_fill_unmatched",
+                    market=evt.market[:16],
+                    asset_id=evt.asset_id[:16],
+                    side=evt.side,
+                    price=evt.price,
+                    size=evt.size,
+                    status=evt.status,
+                )
+                # Even if unmatched, mark the cid to prevent re-ordering.
+                self._filled_cids[evt.market] = time.time()
                 continue
 
             now = time.time()
