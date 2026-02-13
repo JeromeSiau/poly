@@ -728,7 +728,7 @@ async def main() -> None:
         db_url=args.db_url,
         event_type=TD_MAKER_EVENT_TYPE,
         run_id=run_id,
-        notify_bids=True,
+        notify_bids=False,
         notify_fills=True,
         notify_closes=True,
     )

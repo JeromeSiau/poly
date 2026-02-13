@@ -514,6 +514,9 @@ async def main() -> None:
         paper=paper_mode,
         db_url=settings.DATABASE_URL,
         event_type=KALSHI_TD_MAKER_EVENT_TYPE,
+        notify_bids=False,
+        notify_fills=True,
+        notify_closes=True,
     )
 
     maker = KalshiTDMaker(
