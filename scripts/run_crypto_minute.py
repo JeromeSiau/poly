@@ -39,9 +39,9 @@ async def main() -> None:
         db_url=DB_URL,
         event_type=CRYPTO_MINUTE_EVENT_TYPE,
         run_id=run_id,
-        notify_bids=True,
+        notify_bids=False,
         notify_fills=False,
-        notify_closes=True,
+        notify_closes=False,
     )
 
     engine = CryptoMinuteEngine(database_url=DB_URL, manager=manager)

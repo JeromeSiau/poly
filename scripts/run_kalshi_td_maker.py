@@ -515,8 +515,8 @@ async def main() -> None:
         db_url=settings.DATABASE_URL,
         event_type=KALSHI_TD_MAKER_EVENT_TYPE,
         notify_bids=False,
-        notify_fills=True,
-        notify_closes=True,
+        notify_fills=not paper_mode,
+        notify_closes=not paper_mode,
     )
 
     maker = KalshiTDMaker(

@@ -535,6 +535,9 @@ async def main() -> None:
             db_url=args.db_url,
             event_type="sniper_sports",
             run_id=run_id,
+            notify_bids=False,
+            notify_fills=False,
+            notify_closes=False,
         )
         logger.info("trade_manager_ready", strategy_tag=args.strategy_tag, run_id=run_id)
 

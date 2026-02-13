@@ -329,6 +329,9 @@ async def main(args: argparse.Namespace) -> None:
         db_url=settings.DATABASE_URL or "sqlite+aiosqlite:///data/arb.db",
         event_type="fear_selling",
         run_id="",
+        notify_bids=False,
+        notify_fills=args.autopilot,
+        notify_closes=args.autopilot,
     )
     logger.info("trade_manager_ready", strategy="fear_selling")
 

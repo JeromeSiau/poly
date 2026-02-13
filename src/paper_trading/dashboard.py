@@ -26,6 +26,30 @@ CRYPTO_MAKER_EVENT_TYPE = "crypto_maker"
 TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
+_LIVE_MODES = {"live", "live_fill", "autopilot", "settlement"}
+
+
+def _is_live_mode(observation: LiveObservation) -> bool:
+    """Return True if the observation was recorded in live (non-paper) mode."""
+    gs = observation.game_state if isinstance(observation.game_state, dict) else {}
+    mode = str(gs.get("mode", "paper")).lower()
+    return mode in _LIVE_MODES
+
+
+def filter_by_execution_mode(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+    mode_filter: str,
+) -> tuple[list[LiveObservation], list[PaperTrade]]:
+    """Filter observations and trades by execution mode (Paper / Live / All)."""
+    if mode_filter == "All":
+        return observations, trades
+    keep_live = mode_filter == "Live"
+    filtered_obs = [o for o in observations if _is_live_mode(o) == keep_live]
+    obs_ids = {int(o.id) for o in filtered_obs if o.id is not None}
+    filtered_trades = [t for t in trades if int(t.observation_id) in obs_ids]
+    return filtered_obs, filtered_trades
+
 
 def load_data(db_path: str = "data/arb.db"):
     """Load data from SQLite database.
@@ -1636,6 +1660,7 @@ def main():
     # Sidebar
     st.sidebar.header("Settings")
     db_path = st.sidebar.text_input("Database Path", "data/arb.db")
+    mode_filter = st.sidebar.radio("Execution Mode", ["All", "Paper", "Live"], horizontal=True)
     refresh = st.sidebar.button("Refresh Data")
 
     # Load data
@@ -1648,6 +1673,9 @@ def main():
         st.code(f"Expected database at: {db_path}")
         observations = []
         trades = []
+
+    # Apply global execution-mode filter
+    observations, trades = filter_by_execution_mode(observations, trades, mode_filter)
 
     # Load fear positions
     try:

@@ -1223,6 +1223,9 @@ async def main() -> None:
             db_url=args.db_url,
             event_type=TWO_SIDED_EVENT_TYPE,
             run_id=run_id,
+            notify_bids=False,
+            notify_fills=args.autopilot,
+            notify_closes=args.autopilot,
         )
         # Replay uses TwoSidedPaperRecorder (reads DB, feeds engine state)
         if args.resume_paper:
