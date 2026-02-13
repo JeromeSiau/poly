@@ -26,14 +26,11 @@ CRYPTO_MAKER_EVENT_TYPE = "crypto_maker"
 TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
-_LIVE_MODES = {"live", "live_fill", "autopilot", "settlement"}
-
-
-def _is_live_mode(observation: LiveObservation) -> bool:
-    """Return True if the observation was recorded in live (non-paper) mode."""
+def _obs_is_paper(observation: LiveObservation) -> bool:
+    """Return True if the observation was recorded in paper mode."""
     gs = observation.game_state if isinstance(observation.game_state, dict) else {}
     mode = str(gs.get("mode", "paper")).lower()
-    return mode in _LIVE_MODES
+    return mode.startswith("paper") or mode.startswith("maker_paper")
 
 
 def filter_by_execution_mode(
@@ -44,8 +41,8 @@ def filter_by_execution_mode(
     """Filter observations and trades by execution mode (Paper / Live / All)."""
     if mode_filter == "All":
         return observations, trades
-    keep_live = mode_filter == "Live"
-    filtered_obs = [o for o in observations if _is_live_mode(o) == keep_live]
+    want_paper = mode_filter == "Paper"
+    filtered_obs = [o for o in observations if _obs_is_paper(o) == want_paper]
     obs_ids = {int(o.id) for o in filtered_obs if o.id is not None}
     filtered_trades = [t for t in trades if int(t.observation_id) in obs_ids]
     return filtered_obs, filtered_trades

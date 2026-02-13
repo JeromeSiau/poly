@@ -73,6 +73,7 @@ class TradeManager:
                 strategy_tag=strategy,
                 event_type=event_type,
                 run_id=run_id,
+                paper=paper,
             )
             self.recorder.bootstrap()
 

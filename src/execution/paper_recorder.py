@@ -119,6 +119,7 @@ class TwoSidedPaperRecorder:
             strategy_tag=strategy_tag,
             event_type=event_type,
             run_id=run_id,
+            paper=True,
         )
 
     def bootstrap(self) -> None:

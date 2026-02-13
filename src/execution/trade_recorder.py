@@ -31,11 +31,13 @@ class TradeRecorder:
         strategy_tag: str,
         event_type: str = "",
         run_id: str = "",
+        paper: bool = True,
     ) -> None:
         self._db_url = _ensure_sync_url(db_url)
         self._strategy_tag = strategy_tag
         self._event_type = event_type
         self._run_id = run_id
+        self._paper = paper
 
     def bootstrap(self) -> None:
         """Create tables and run migrations."""
@@ -77,7 +79,7 @@ class TradeRecorder:
             intent=intent,
             fill=fill,
             fair_prices=fair_prices,
-            execution_mode="settlement",
+            execution_mode="paper_settlement" if self._paper else "live_settlement",
             is_settle=True,
             extra_state=extra_state,
         )
