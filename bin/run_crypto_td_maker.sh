@@ -14,6 +14,7 @@ MAX_BID="${MAX_BID:-0.85}"
 WALLET_USD=""
 ORDER_SIZE_OVERRIDE=""
 MAX_EXPOSURE_OVERRIDE=""
+LADDER_RUNGS="${LADDER_RUNGS:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     --wallet)         WALLET_USD="$2"; shift 2 ;;
     --order-size)     ORDER_SIZE_OVERRIDE="$2"; shift 2 ;;
     --max-exposure)   MAX_EXPOSURE_OVERRIDE="$2"; shift 2 ;;
+    --ladder-rungs)   LADDER_RUNGS="$2"; shift 2 ;;
     *)                shift ;;
   esac
 done
@@ -59,6 +61,7 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start tag=$TAG mode=$MODE wallet=${WALLET
 exec "$PYTHON" "$BASE/scripts/run_crypto_td_maker.py" \
   --symbols "$SYMBOLS" $MODE_FLAG \
   --target-bid "$TARGET_BID" --max-bid "$MAX_BID" \
+  --ladder-rungs "$LADDER_RUNGS" \
   "${SIZING_ARGS[@]}" \
   --discovery-interval "$DISCOVERY_INTERVAL" --maker-interval "$MAKER_INTERVAL" \
   --strategy-tag "$TAG" --db-url "$DB_URL" \

@@ -62,6 +62,21 @@ logger = structlog.get_logger()
 TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 
 
+def compute_rung_prices(lo: float, hi: float, n_rungs: int) -> list[float]:
+    """Compute evenly-spaced rung prices within [lo, hi], snapped to 1c."""
+    if n_rungs <= 1:
+        return [round((lo + hi) / 2, 2)]
+    raw = [lo + i * (hi - lo) / (n_rungs - 1) for i in range(n_rungs)]
+    seen: set[float] = set()
+    result: list[float] = []
+    for p in raw:
+        rounded = round(p, 2)
+        if rounded not in seen:
+            seen.add(rounded)
+            result.append(rounded)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -125,6 +140,7 @@ class CryptoTDMaker:
         strategy_tag: str = "crypto_td_maker",
         guard: Optional[RiskGuard] = None,
         db_url: str = "",
+        ladder_rungs: int = 1,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -143,6 +159,8 @@ class CryptoTDMaker:
         self.strategy_tag = strategy_tag
         self.guard = guard
         self._db_url = db_url
+        self.ladder_rungs = ladder_rungs
+        self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
         # State
@@ -161,8 +179,10 @@ class CryptoTDMaker:
         self._last_bids: dict[tuple[str, str], float] = {}
         # Map condition_id -> order_id for DB settlement tracking.
         self._position_order_ids: dict[str, str] = {}
-        # CIDs that received a fill — blocked from re-ordering for the slot duration.
-        self._filled_cids: dict[str, float] = {}  # cid -> filled_at timestamp
+        # Per-cid fill count — blocks re-ordering when >= ladder_rungs.
+        self._cid_fill_count: dict[str, int] = {}  # cid -> number of fills
+        # Rung-level dedup: (cid, outcome, price_cents) of placed/active rungs.
+        self._rung_placed: set[tuple[str, str, int]] = set()
 
         # Stats
         self.total_fills: int = 0
@@ -387,17 +407,9 @@ class CryptoTDMaker:
         cancel_ids: list[str] = []
         place_intents: list[tuple[str, str, str, float, str]] = []  # (cid, outcome, token_id, price, side)
 
-        # Expire old _filled_cids entries (>20 min = slot + grace).
-        stale_filled = [c for c, t in self._filled_cids.items() if now - t > 1200]
-        for c in stale_filled:
-            del self._filled_cids[c]
-
         for cid in list(self.known_markets):
-            # Skip if already have a position on this market.
-            if cid in self.positions:
-                continue
-            # Skip markets that already received a fill this slot.
-            if cid in self._filled_cids:
+            # Skip markets where all ladder rungs have filled.
+            if self._cid_fill_count.get(cid, 0) >= self.ladder_rungs:
                 continue
 
             outcomes = self.market_outcomes.get(cid, [])
@@ -414,8 +426,6 @@ class CryptoTDMaker:
                     self._last_bids[(cid, outcome)] = bid
                     self._last_book_update = now
                 existing_key = (cid, outcome)
-                existing_oid = self._orders_by_cid_outcome.get(existing_key)
-                existing_order = self.active_orders.get(existing_oid) if existing_oid else None
 
                 # BUY signal: bid in [target_bid, max_bid]
                 bid_in_range = (
@@ -429,40 +439,51 @@ class CryptoTDMaker:
                     and self.sell_lo <= ask <= self.sell_hi
                 )
 
-                if existing_order:
-                    if existing_order.side == "BUY":
-                        if not bid_in_range:
-                            cancel_ids.append(existing_order.order_id)
-                        elif existing_order.price != bid:
-                            if self.paper_mode and bid < existing_order.price:
-                                self._process_fill(existing_order, now)
-                                oid = existing_order.order_id
-                                self.active_orders.pop(oid, None)
-                                if self._orders_by_cid_outcome.get(existing_key) == oid:
-                                    del self._orders_by_cid_outcome[existing_key]
-                                self._cancel_other_side(cid, outcome)
-                            # else: bid moved within range — keep existing order.
-                            # DO NOT cancel+replace: the CLOB fills faster than
-                            # cancels propagate, causing runaway duplicate fills.
-                    else:  # SELL
-                        if not ask_in_range:
-                            cancel_ids.append(existing_order.order_id)
-                        elif existing_order.price != ask:
-                            if self.paper_mode and ask > existing_order.price:
-                                self._process_fill(existing_order, now)
-                                oid = existing_order.order_id
-                                self.active_orders.pop(oid, None)
-                                if self._orders_by_cid_outcome.get(existing_key) == oid:
-                                    del self._orders_by_cid_outcome[existing_key]
-                                self._cancel_other_side(cid, outcome)
-                            # else: ask moved within range — keep existing order.
-                    # else: order still at correct price, do nothing.
+                if self.ladder_rungs > 1 and bid_in_range:
+                    # ---- Ladder BUY: place at each rung price not yet placed ----
+                    for rung_price in self.rung_prices:
+                        rung_key = (cid, outcome, int(round(rung_price * 100)))
+                        if rung_key not in self._rung_placed:
+                            place_intents.append((cid, outcome, token_id, rung_price, "BUY"))
                 else:
-                    # No existing order — place if in range
-                    if bid_in_range and budget_left >= self.order_size_usd:
-                        place_intents.append((cid, outcome, token_id, bid, "BUY"))
-                    elif ask_in_range and budget_left >= self.order_size_usd:
-                        place_intents.append((cid, outcome, token_id, ask, "SELL"))
+                    # ---- Single-order mode (original logic) ----
+                    existing_oid = self._orders_by_cid_outcome.get(existing_key)
+                    existing_order = self.active_orders.get(existing_oid) if existing_oid else None
+
+                    if existing_order:
+                        if existing_order.side == "BUY":
+                            if not bid_in_range:
+                                cancel_ids.append(existing_order.order_id)
+                            elif existing_order.price != bid:
+                                if self.paper_mode and bid < existing_order.price:
+                                    self._process_fill(existing_order, now)
+                                    oid = existing_order.order_id
+                                    self.active_orders.pop(oid, None)
+                                    if self._orders_by_cid_outcome.get(existing_key) == oid:
+                                        del self._orders_by_cid_outcome[existing_key]
+                                    self._cancel_other_side(cid, outcome)
+                                # else: bid moved within range — keep existing order.
+                                # DO NOT cancel+replace: the CLOB fills faster than
+                                # cancels propagate, causing runaway duplicate fills.
+                        else:  # SELL
+                            if not ask_in_range:
+                                cancel_ids.append(existing_order.order_id)
+                            elif existing_order.price != ask:
+                                if self.paper_mode and ask > existing_order.price:
+                                    self._process_fill(existing_order, now)
+                                    oid = existing_order.order_id
+                                    self.active_orders.pop(oid, None)
+                                    if self._orders_by_cid_outcome.get(existing_key) == oid:
+                                        del self._orders_by_cid_outcome[existing_key]
+                                    self._cancel_other_side(cid, outcome)
+                                # else: ask moved within range — keep existing order.
+                        # else: order still at correct price, do nothing.
+                    else:
+                        # No existing order — place if in range
+                        if bid_in_range and budget_left >= self.order_size_usd:
+                            place_intents.append((cid, outcome, token_id, bid, "BUY"))
+                        elif ask_in_range and budget_left >= self.order_size_usd:
+                            place_intents.append((cid, outcome, token_id, ask, "SELL"))
 
         # Execute cancels.
         for oid in cancel_ids:
@@ -498,32 +519,41 @@ class CryptoTDMaker:
                     del self._orders_by_cid_outcome[key]
                 self._db_fire(self._db_delete_order(oid))
 
-        # Execute placements (at most one order per market).
+        # Execute placements.
         placed = 0
-        placed_cids: set[str] = set()
+        placed_cids_this_tick: set[str] = set()  # prevent BUY Up + SELL Down on same cid
         # Collect condition_ids with pending cancels — don't place new orders there.
         pending_cancel_cids = {o.condition_id for o in self._pending_cancels.values()}
         for cid, outcome, token_id, price, side in place_intents:
-            # Re-check we don't already have position (could have filled above).
-            if cid in self.positions:
-                continue
-            if cid in self._filled_cids:
-                continue
-            if (cid, outcome) in self._orders_by_cid_outcome:
-                continue
-            # Avoid duplicate orders on same market (e.g. BUY Up + SELL Down).
-            if cid in placed_cids:
-                continue
-            if any(o.condition_id == cid for o in self.active_orders.values()):
+            if self._cid_fill_count.get(cid, 0) >= self.ladder_rungs:
                 continue
             # Don't place new orders while a cancel is in-flight for this market.
             if cid in pending_cancel_cids:
                 continue
 
+            if self.ladder_rungs > 1:
+                # Ladder mode: allow multiple orders per cid, dedup by rung.
+                rung_key = (cid, outcome, int(round(price * 100)))
+                if rung_key in self._rung_placed:
+                    continue
+            else:
+                # Single-order mode: existing dedup.
+                if cid in self.positions:
+                    continue
+                if (cid, outcome) in self._orders_by_cid_outcome:
+                    continue
+                if cid in placed_cids_this_tick:
+                    continue
+                if any(o.condition_id == cid for o in self.active_orders.values()):
+                    continue
+
+            if budget_left < self.order_size_usd:
+                continue
+
             order_id = await self._place_order(cid, outcome, token_id, price, now, side=side)
             if order_id:
                 placed += 1
-                placed_cids.add(cid)
+                placed_cids_this_tick.add(cid)
                 budget_left -= self.order_size_usd
 
         # Periodic status (every 30s wall-clock).
@@ -568,7 +598,7 @@ class CryptoTDMaker:
 
         # Pre-register a placeholder BEFORE the await so the fill listener
         # can match fills that arrive while we're waiting for the API response.
-        temp_id = f"_placing_{cid}_{outcome}"
+        temp_id = f"_placing_{cid}_{outcome}_{int(round(price*100))}"
         placeholder = PassiveOrder(
             order_id=temp_id, condition_id=cid, outcome=outcome,
             token_id=token_id, price=price, size_usd=self.order_size_usd,
@@ -576,6 +606,8 @@ class CryptoTDMaker:
         )
         self.active_orders[temp_id] = placeholder
         self._orders_by_cid_outcome[(cid, outcome)] = temp_id
+        rung_key = (cid, outcome, int(round(price * 100)))
+        self._rung_placed.add(rung_key)
 
         slug = _first_event_slug(self.known_markets.get(cid, {}))
         intent = TradeIntent(
@@ -590,6 +622,7 @@ class CryptoTDMaker:
             self.active_orders.pop(temp_id, None)
             if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
                 del self._orders_by_cid_outcome[(cid, outcome)]
+            self._rung_placed.discard(rung_key)
             logger.warning("order_place_exception", error=str(exc)[:80])
             return None
 
@@ -597,14 +630,16 @@ class CryptoTDMaker:
             self.active_orders.pop(temp_id, None)
             if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
                 del self._orders_by_cid_outcome[(cid, outcome)]
+            self._rung_placed.discard(rung_key)
             return None
 
         # Fill listener may have already processed a fill for the placeholder.
-        if cid in self.positions:
-            self.active_orders.pop(temp_id, None)
+        # For single-order mode: position means this rung was filled.
+        # For ladder: position may exist from a previous rung — only skip if
+        # THIS rung was filled (detected by temp_id no longer in active_orders).
+        if temp_id not in self.active_orders:
             if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
                 del self._orders_by_cid_outcome[(cid, outcome)]
-            # Update DB with real order_id.
             self._position_order_ids[cid] = pending.order_id
             order = PassiveOrder(
                 order_id=pending.order_id, condition_id=cid, outcome=outcome,
@@ -700,36 +735,50 @@ class CryptoTDMaker:
                 key = (order.condition_id, order.outcome)
                 if self._orders_by_cid_outcome.get(key) == oid:
                     del self._orders_by_cid_outcome[key]
-                self._cancel_other_side(order.condition_id, order.outcome)
+                # Cancel other side only on first fill for this cid.
+                if self._cid_fill_count.get(order.condition_id, 0) <= 1:
+                    self._cancel_other_side(order.condition_id, order.outcome)
 
     def _process_fill(self, order: PassiveOrder, now: float) -> None:
-        """Record a filled order as an open position."""
+        """Record a filled order as an open position (with scale-in for ladder)."""
         if order.side == "BUY":
-            shares = order.size_usd / order.price
+            new_shares = order.size_usd / order.price
         else:  # SELL: collateral per share = (1 - price)
-            shares = order.size_usd / (1.0 - order.price)
-        pos = OpenPosition(
-            condition_id=order.condition_id,
-            outcome=order.outcome,
-            token_id=order.token_id,
-            entry_price=order.price,
-            size_usd=order.size_usd,
-            shares=shares,
-            filled_at=now,
-            side=order.side,
-        )
-        self.positions[order.condition_id] = pos
+            new_shares = order.size_usd / (1.0 - order.price)
+
+        existing = self.positions.get(order.condition_id)
+        if existing and self.ladder_rungs > 1:
+            # Scale-in: accumulate into existing position.
+            old_shares = existing.shares
+            total_shares = old_shares + new_shares
+            avg_price = (old_shares * existing.entry_price + new_shares * order.price) / total_shares
+            existing.shares = total_shares
+            existing.entry_price = avg_price
+            existing.size_usd += order.size_usd
+        else:
+            pos = OpenPosition(
+                condition_id=order.condition_id,
+                outcome=order.outcome,
+                token_id=order.token_id,
+                entry_price=order.price,
+                size_usd=order.size_usd,
+                shares=new_shares,
+                filled_at=now,
+                side=order.side,
+            )
+            self.positions[order.condition_id] = pos
+
         self._position_order_ids[order.condition_id] = order.order_id
-        self._filled_cids[order.condition_id] = now
+        self._cid_fill_count[order.condition_id] = self._cid_fill_count.get(order.condition_id, 0) + 1
         self.total_fills += 1
-        self._db_fire(self._db_mark_filled(order.order_id, shares, now))
+        self._db_fire(self._db_mark_filled(order.order_id, new_shares, now))
 
         logger.info(
             "td_order_filled",
             condition_id=order.condition_id[:16],
             outcome=order.outcome,
             price=order.price,
-            shares=round(shares, 2),
+            shares=round(new_shares, 2),
             total_fills=self.total_fills,
             paper=self.paper_mode,
         )
@@ -765,15 +814,19 @@ class CryptoTDMaker:
                 pass
 
     def _cancel_other_side(self, cid: str, filled_outcome: str) -> None:
-        """Cancel the unfilled side's order after one side fills."""
+        """Cancel ALL orders on the opposite outcome (supports ladder)."""
         outcomes = self.market_outcomes.get(cid, [])
         for outcome in outcomes:
             if outcome == filled_outcome:
                 continue
-            key = (cid, outcome)
-            oid = self._orders_by_cid_outcome.pop(key, None)
-            if oid and oid in self.active_orders:
+            # Cancel all active orders on this (cid, outcome).
+            self._orders_by_cid_outcome.pop((cid, outcome), None)
+            oids_to_cancel = [oid for oid, o in self.active_orders.items()
+                              if o.condition_id == cid and o.outcome == outcome]
+            for oid in oids_to_cancel:
                 order = self.active_orders.pop(oid)
+                # Clean up rung tracking.
+                self._rung_placed.discard((cid, outcome, int(round(order.price * 100))))
                 if not self.paper_mode and self.executor:
                     order.cancelled_at = time.time()
                     self._pending_cancels[oid] = order
@@ -802,8 +855,11 @@ class CryptoTDMaker:
             except asyncio.CancelledError:
                 break
 
-            # Skip duplicate CONFIRMED events for already-processed fills.
-            if evt.market in self.positions or evt.market in self._filled_cids:
+            # Skip if all ladder rungs already filled for this market.
+            if self._cid_fill_count.get(evt.market, 0) >= self.ladder_rungs:
+                continue
+            # For single-order mode, also skip if position already exists.
+            if self.ladder_rungs <= 1 and evt.market in self.positions:
                 continue
 
             matched_order: Optional[PassiveOrder] = None
@@ -844,8 +900,8 @@ class CryptoTDMaker:
                     size=evt.size,
                     status=evt.status,
                 )
-                # Even if unmatched, mark the cid to prevent re-ordering.
-                self._filled_cids[evt.market] = time.time()
+                # Even if unmatched, count it to prevent re-ordering.
+                self._cid_fill_count[evt.market] = self._cid_fill_count.get(evt.market, 0) + 1
                 continue
 
             now = time.time()
@@ -857,7 +913,9 @@ class CryptoTDMaker:
             key = (matched_order.condition_id, matched_order.outcome)
             if self._orders_by_cid_outcome.get(key) == matched_id:
                 del self._orders_by_cid_outcome[key]
-            self._cancel_other_side(matched_order.condition_id, matched_order.outcome)
+            # Don't cancel other side on every ladder fill — only on first fill.
+            if self._cid_fill_count.get(matched_order.condition_id, 0) <= 1:
+                self._cancel_other_side(matched_order.condition_id, matched_order.outcome)
 
     # ------------------------------------------------------------------
     # Settlement
@@ -877,24 +935,29 @@ class CryptoTDMaker:
                     to_remove.append(cid)
 
         for cid in to_remove:
-            # Cancel any remaining orders.
+            # Cancel ALL remaining orders for this market (supports ladder).
+            oids_to_cancel = [oid for oid, o in self.active_orders.items()
+                              if o.condition_id == cid]
+            for oid in oids_to_cancel:
+                order = self.active_orders.pop(oid)
+                self._rung_placed.discard(
+                    (cid, order.outcome, int(round(order.price * 100))))
+                self._db_fire(self._db_delete_order(oid))
+                if not self.paper_mode and self.executor:
+                    try:
+                        await self.executor.cancel_order(oid)
+                    except Exception:
+                        pass
             for outcome in self.market_outcomes.get(cid, []):
-                key = (cid, outcome)
-                oid = self._orders_by_cid_outcome.pop(key, None)
-                if oid:
-                    order = self.active_orders.pop(oid, None)
-                    if order:
-                        self._db_fire(self._db_delete_order(oid))
-                        if not self.paper_mode and self.executor:
-                            try:
-                                await self.executor.cancel_order(oid)
-                            except Exception:
-                                pass
+                self._orders_by_cid_outcome.pop((cid, outcome), None)
 
             # Settle position if held.
             pos = self.positions.pop(cid, None)
             if pos:
                 self._settle_position(pos, now)
+
+            # Clean up fill count.
+            self._cid_fill_count.pop(cid, None)
 
             # Unsubscribe.
             try:
@@ -1022,6 +1085,8 @@ class CryptoTDMaker:
                 symbols=self.symbols,
                 paper=self.paper_mode,
                 buy_range=f"[{self.target_bid}, {self.max_bid}]",
+                ladder_rungs=self.ladder_rungs,
+                rung_prices=self.rung_prices,
                 sell_range=f"[{self.sell_lo}, {self.sell_hi}]" if self.sell_lo > 0 else "off",
                 order_size=self.order_size_usd,
                 max_exposure=self.max_total_exposure_usd,
@@ -1086,6 +1151,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Max total USD exposure (0 = derive from wallet * 0.50)")
     p.add_argument("--discovery-interval", type=float, default=60.0)
     p.add_argument("--maker-interval", type=float, default=0.5, help="Maker loop tick interval")
+    p.add_argument(
+        "--ladder-rungs", type=int, default=1,
+        help="Number of price ladder rungs (1=single order, >1=ladder with scale-in)",
+    )
     p.add_argument("--strategy-tag", type=str, default="crypto_td_maker")
     p.add_argument("--db-url", type=str, default=settings.DATABASE_URL)
     p.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
@@ -1179,17 +1248,21 @@ async def main() -> None:
         strategy_tag=strategy_tag,
         guard=guard,
         db_url=args.db_url,
+        ladder_rungs=args.ladder_rungs,
     )
 
     sell_enabled = sell_lo > 0 and sell_hi > 0
     wallet_src = "auto" if args.wallet <= 0 else "manual"
+    rung_str = ", ".join(f"{p:.2f}" for p in maker.rung_prices)
     print(f"=== Crypto TD Maker {'(PAPER)' if paper_mode else '(LIVE)'} ===")
     print(f"  Symbols:     {', '.join(symbols)}")
     print(f"  Wallet:      ${wallet:.0f} ({wallet_src})")
     print(f"  BUY range:   [{args.target_bid}, {args.max_bid}]")
+    if args.ladder_rungs > 1:
+        print(f"  Ladder:      {args.ladder_rungs} rungs at [{rung_str}]")
     if sell_enabled:
         print(f"  SELL range:  [{sell_lo}, {sell_hi}]")
-    print(f"  Order size:  ${order_size:.2f}")
+    print(f"  Order size:  ${order_size:.2f}/rung")
     print(f"  Max exposure: ${max_exposure:.2f}")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print(f"               BUY favourites + {'SELL longshots' if sell_enabled else 'no sell side'}")
