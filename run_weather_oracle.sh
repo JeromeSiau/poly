@@ -1,8 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-
-# Portable base path (works locally and on server).
-BASE="$(cd "$(dirname "$0")" && pwd)"
+source "$(dirname "$0")/_common.sh"
 
 # Args:
 #   1: mode -> "watch" (default), "scan"
@@ -17,10 +15,6 @@ PAPER_SIZE_USD="${PAPER_SIZE_USD:-3.0}"
 MAX_DAILY_SPEND="${MAX_DAILY_SPEND:-50.0}"
 FORECAST_DAYS="${FORECAST_DAYS:-7}"
 
-cd "$BASE"
-export PYTHONPATH="$BASE"
-export PYTHONUNBUFFERED=1
-mkdir -p "$BASE/logs" "$BASE/data"
 LOG_FILE="$BASE/logs/weather_oracle.log"
 
 # Inject settings via env
@@ -34,10 +28,11 @@ export WEATHER_ORACLE_FORECAST_DAYS="$FORECAST_DAYS"
 exec >> "$LOG_FILE" 2>&1
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start mode=$MODE interval=$SCAN_INTERVAL max_entry=$MAX_ENTRY_PRICE min_conf=$MIN_CONFIDENCE paper_size=$PAPER_SIZE_USD max_daily=$MAX_DAILY_SPEND"
 
-exec "$BASE/.venv/bin/python" "$BASE/scripts/run_weather_oracle.py" \
+exec "$PYTHON" "$BASE/scripts/run_weather_oracle.py" \
   "$MODE" \
   --interval "$SCAN_INTERVAL" \
   --max-entry-price "$MAX_ENTRY_PRICE" \
   --min-confidence "$MIN_CONFIDENCE" \
   --paper-size "$PAPER_SIZE_USD" \
-  --max-daily-spend "$MAX_DAILY_SPEND"
+  --max-daily-spend "$MAX_DAILY_SPEND" \
+  "${CB_ARGS[@]}"

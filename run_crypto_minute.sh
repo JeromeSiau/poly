@@ -1,8 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-
-# Portable base path (works locally and on server).
-BASE="$(cd "$(dirname "$0")" && pwd)"
+source "$(dirname "$0")/_common.sh"
 
 # Args:
 #   1: strategy -> "both" (default), "time_decay", "long_vol"
@@ -29,11 +27,6 @@ PAPER_SIZE_USD="${PAPER_SIZE_USD:-10.0}"
 PAPER_CAPITAL="${PAPER_CAPITAL:-1000.0}"
 
 TAG="crypto_minute_${STRATEGY}_${SYMBOLS//,/_}_td${TD_THRESHOLD}_lv${LV_THRESHOLD}"
-
-cd "$BASE"
-export PYTHONPATH="$BASE"
-export PYTHONUNBUFFERED=1
-mkdir -p "$BASE/logs" "$BASE/data"
 LOG_FILE="$BASE/logs/crypto_minute_${TAG}.log"
 
 # Inject settings via env
@@ -51,8 +44,9 @@ export CRYPTO_MINUTE_PAPER_CAPITAL="$PAPER_CAPITAL"
 exec >> "$LOG_FILE" 2>&1
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start strategy=$STRATEGY symbols=$SYMBOLS td_threshold=$TD_THRESHOLD lv_threshold=$LV_THRESHOLD scan_interval=$SCAN_INTERVAL min_entry_time=$MIN_ENTRY_TIME max_entry_time=$MAX_ENTRY_TIME td_min_gap=$TD_MIN_GAP_PCT lv_max_gap=$LV_MAX_GAP_PCT paper_size=$PAPER_SIZE_USD paper_capital=$PAPER_CAPITAL"
 
-exec "$BASE/.venv/bin/python" "$BASE/scripts/run_crypto_minute.py" \
+exec "$PYTHON" "$BASE/scripts/run_crypto_minute.py" \
   --symbols "$SYMBOLS" \
   --td-threshold "$TD_THRESHOLD" \
   --lv-threshold "$LV_THRESHOLD" \
-  --scan-interval "$SCAN_INTERVAL"
+  --scan-interval "$SCAN_INTERVAL" \
+  "${CB_ARGS[@]}"

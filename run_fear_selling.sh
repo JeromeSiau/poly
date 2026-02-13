@@ -1,8 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-
-# Portable base path (works locally and on server).
-BASE="$(cd "$(dirname "$0")" && pwd)"
+source "$(dirname "$0")/_common.sh"
 
 # Args:
 #   1: mode           -> "paper" (default) or "autopilot"
@@ -36,10 +34,6 @@ if [[ "$MODE" == "autopilot" ]]; then
   AUTOPILOT_FLAG=("--autopilot")
 fi
 
-cd "$BASE"
-export PYTHONPATH="$BASE"
-export PYTHONUNBUFFERED=1
-mkdir -p "$BASE/logs" "$BASE/data"
 LOG_FILE="$BASE/logs/fear_selling.log"
 
 # Inject settings via env
@@ -60,6 +54,7 @@ export CAPITAL_ALLOCATION_FEAR_PCT="$FEAR_ALLOCATION"
 exec >> "$LOG_FILE" 2>&1
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start mode=$MODE interval=$SCAN_INTERVAL fear_score=$MIN_FEAR_SCORE cluster_pct=$MAX_CLUSTER_PCT kelly=$KELLY_FRACTION exit_no=$EXIT_NO_PRICE stop_yes=$STOP_YES_PRICE alloc=$FEAR_ALLOCATION"
 
-exec "$BASE/.venv/bin/python" "$BASE/scripts/run_fear_selling.py" \
+exec "$PYTHON" "$BASE/scripts/run_fear_selling.py" \
   --scan-interval "$SCAN_INTERVAL" \
-  "${AUTOPILOT_FLAG[@]}"
+  "${AUTOPILOT_FLAG[@]}" \
+  "${CB_ARGS[@]}"
