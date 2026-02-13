@@ -1,5 +1,7 @@
 # Core
 python-dotenv>=1.0.0
+python-socks[asyncio]>=2.0.0
+httpx[socks]>=0.27.0
 pydantic>=2.10.0
 pydantic-settings>=2.6.0
 
