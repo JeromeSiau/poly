@@ -282,10 +282,7 @@ class CryptoMaker:
             loop.create_task(self.manager.record_fill_direct(
                 exec_intent, fill_result,
                 execution_mode="paper_fill" if self.paper_mode else "live_fill",
-                extra_state={
-                    "strategy_tag": self.strategy_tag,
-                    "condition_id": intent.condition_id,
-                },
+                extra_state={"condition_id": intent.condition_id},
             ))
         except RuntimeError:
             pass
