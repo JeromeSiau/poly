@@ -206,6 +206,8 @@ class PolymarketFeed(BaseFeed):
         self,
         market_id: str,
         token_map: dict[str, str] | None = None,
+        *,
+        send: bool = True,
     ) -> None:
         """Subscribe to order book updates for a market.
 
@@ -214,6 +216,11 @@ class PolymarketFeed(BaseFeed):
             token_map: ``{outcome: token_id}`` mapping.  Required for the CLOB WS
                        to know which token streams to open.  If ``None``, the call
                        is a no-op.
+            send: If False, register the tokens locally but do NOT send the WS
+                  message yet.  Call ``flush_subscriptions()`` afterwards to send
+                  a single batched subscription.  This avoids a rapid-fire race
+                  where multiple replace messages within milliseconds cause the
+                  server to drop book snapshots.
 
         If the WebSocket is temporarily disconnected, the subscription is
         recorded locally and will be sent on the next reconnect.
@@ -230,29 +237,31 @@ class PolymarketFeed(BaseFeed):
                 self._subscribed_tokens.add(token_id)
                 self._local_orderbook.setdefault(token_id, {"bids": [], "asks": []})
 
-        if new_tokens and self._ws and self._connected:
-            # Send ALL subscribed tokens — "type": "MARKET" replaces the
-            # entire subscription set on the server side.
-            all_tokens = list(self._subscribed_tokens)
-            msg = json.dumps({
-                "assets_ids": all_tokens,
-                "type": "MARKET",
-            })
-            await self._ws.send(msg)
-            logger.debug(
-                "clob_ws_subscribed",
-                market_id=market_id,
-                tokens=len(new_tokens),
-                total=len(all_tokens),
-            )
+        if new_tokens and send:
+            await self.flush_subscriptions()
         elif new_tokens:
             logger.debug(
-                "clob_ws_queued_for_reconnect",
+                "clob_ws_queued",
                 market_id=market_id,
                 tokens=len(new_tokens),
             )
 
         self._subscriptions.add(("prediction", market_id))
+
+    async def flush_subscriptions(self) -> None:
+        """Send the current subscription set to the WS in a single message.
+
+        Safe to call multiple times — only sends if connected.
+        """
+        if not self._subscribed_tokens or not self._ws or not self._connected:
+            return
+        all_tokens = list(self._subscribed_tokens)
+        msg = json.dumps({"assets_ids": all_tokens, "type": "MARKET"})
+        await self._ws.send(msg)
+        logger.info(
+            "clob_ws_subscribed",
+            tokens=len(all_tokens),
+        )
 
     async def unsubscribe_market(self, market_id: str) -> None:
         """Unsubscribe from order book updates for a market."""
@@ -384,7 +393,7 @@ class PolymarketFeed(BaseFeed):
 
         Messages are either:
         - list: initial ``book`` snapshots (one per subscribed token)
-        - dict: incremental ``price_change`` events
+        - dict: ``book`` refresh, ``price_change``, or ``last_trade_price``
         """
         if isinstance(data, list):
             for item in data:
@@ -393,7 +402,9 @@ class PolymarketFeed(BaseFeed):
                     self._handle_book_snapshot(item)
         elif isinstance(data, dict):
             event_type = data.get("event_type", "")
-            if event_type == "price_change":
+            if event_type == "book":
+                self._handle_book_snapshot(data)
+            elif event_type == "price_change":
                 self._handle_price_change(data)
 
     def _handle_book_snapshot(self, item: dict[str, Any]) -> None:
