@@ -1438,9 +1438,12 @@ def _render_td_maker_tab(
     # Win/loss breakdown by entry price bucket
     if sells:
         st.subheader("Performance by Entry Price")
+        # Map condition_id → entry fill_price from BUY rows
+        entry_price_by_cid = {r["condition_id"]: r["fill_price"] for r in buys if r.get("fill_price")}
         sell_data = []
         for r in sells:
-            entry = r.get("fill_price", 0)
+            # Use the BUY entry price, not the settlement price
+            entry = entry_price_by_cid.get(r.get("condition_id"), r.get("fill_price", 0))
             bucket = f"{int(entry * 20) * 5}c"  # 5c buckets
             sell_data.append({"bucket": bucket, "won": (r.get("pnl") or 0) > 0, "pnl": r.get("pnl", 0)})
         sell_df = pd.DataFrame(sell_data)
