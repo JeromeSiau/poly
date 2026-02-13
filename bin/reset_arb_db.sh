@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-BASE="$(cd "$(dirname "$0")" && pwd)"
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 DB_PATH="$BASE/data/arb.db"
 MAKE_BACKUP=1
 ASSUME_YES=0
