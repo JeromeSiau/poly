@@ -45,6 +45,7 @@ class PolymarketExecutor:
             chain_id=chain_id,
             key=private_key,
             funder=funder,
+            signature_type=1,  # POLY_PROXY: EOA signs for proxy wallet
         )
         self._api_key = api_key
         self._api_secret = api_secret
