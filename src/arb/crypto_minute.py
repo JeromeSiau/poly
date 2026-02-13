@@ -29,6 +29,7 @@ from config.settings import settings
 
 if TYPE_CHECKING:
     from src.execution.trade_manager import TradeManager
+    from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -318,12 +319,15 @@ class CryptoMinuteEngine:
         scanner: Optional[MarketScanner] = None,
         database_url: str = "sqlite:///data/arb.db",
         manager: Optional["TradeManager"] = None,
+        guard: Optional["RiskGuard"] = None,
     ):
         symbols = settings.CRYPTO_MINUTE_SYMBOLS.split(",")
         self.poller = poller or BinanceSpotPoller(symbols)
         self.scanner = scanner or MarketScanner(symbols)
         self._database_url = database_url
         self.manager = manager
+        self.guard = guard
+        self._last_book_update: float = time.time()
 
         # Strategy thresholds
         self.td_threshold = settings.CRYPTO_MINUTE_TD_THRESHOLD
@@ -507,6 +511,13 @@ class CryptoMinuteEngine:
                     self._stats[trade.strategy]["wins"] += 1
                 self._stats[trade.strategy]["pnl"] += trade.pnl_usd
 
+                # Record result in RiskGuard
+                if self.guard:
+                    try:
+                        await self.guard.record_result(pnl=trade.pnl_usd, won=won)
+                    except Exception:
+                        pass
+
                 await self._save_trade(trade)
                 resolved.append(trade)
 
@@ -642,6 +653,16 @@ class CryptoMinuteEngine:
 
         while True:
             try:
+                # Heartbeat + circuit breaker gate
+                if self.guard:
+                    await self.guard.heartbeat()
+                    self._last_book_update = time.time()  # REST-based
+                    if not await self.guard.is_trading_allowed(last_book_update=self._last_book_update):
+                        # Still resolve expired trades
+                        await self.resolve_expired_trades()
+                        await asyncio.sleep(scan_interval)
+                        continue
+
                 # Scan for opportunities
                 opportunities = await self.scan_once()
                 for opp in opportunities:

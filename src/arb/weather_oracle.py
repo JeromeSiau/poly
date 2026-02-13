@@ -26,6 +26,7 @@ from config.settings import settings
 
 if TYPE_CHECKING:
     from src.execution.trade_manager import TradeManager
+    from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -390,11 +391,14 @@ class WeatherOracleEngine:
         scanner=None,
         database_url: str = "sqlite:///data/arb.db",
         manager: Optional["TradeManager"] = None,
+        guard: Optional["RiskGuard"] = None,
     ):
         self.fetcher = fetcher or OpenMeteoFetcher()
         self.scanner = scanner or WeatherMarketScanner()
         self._database_url = database_url
         self.manager = manager
+        self.guard = guard
+        self._last_book_update: float = time.time()
 
         # Days-to-resolution filter
         self.min_days_to_resolution = settings.WEATHER_ORACLE_MIN_DAYS_TO_RESOLUTION
@@ -776,6 +780,13 @@ class WeatherOracleEngine:
                 self._stats["wins"] += 1
             self._stats["pnl"] += trade.pnl_usd
 
+            # Record result in RiskGuard
+            if self.guard:
+                try:
+                    await self.guard.record_result(pnl=trade.pnl_usd, won=trade.won)
+                except Exception:
+                    pass
+
             await self._save_trade(trade)
             resolved.append(trade)
 
@@ -904,6 +915,16 @@ class WeatherOracleEngine:
 
         while True:
             try:
+                # Heartbeat + circuit breaker gate
+                if self.guard:
+                    await self.guard.heartbeat()
+                    self._last_book_update = time.time()  # REST-based
+                    if not await self.guard.is_trading_allowed(last_book_update=self._last_book_update):
+                        # Still resolve trades
+                        await self.resolve_trades()
+                        await asyncio.sleep(scan_interval)
+                        continue
+
                 new_markets = await self.scanner.scan()
                 if new_markets:
                     for m in new_markets:

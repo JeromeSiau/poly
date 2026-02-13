@@ -36,10 +36,12 @@ from src.arb.fear_spike_detector import FearSpikeDetector
 from src.arb.polymarket_executor import PolymarketExecutor
 from src.db.database import get_sync_session, init_db
 from src.db.models import FearPosition
+import time
+
 from src.execution import TradeManager
 from src.execution import TradeIntent as ExecTradeIntent
 from src.execution import FillResult as ExecFillResult
-from src.risk.manager import UnifiedRiskManager
+from src.risk.guard import RiskGuard
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +58,10 @@ def parse_args() -> argparse.Namespace:
         default=settings.FEAR_SELLING_SCAN_INTERVAL,
         help=f"Seconds between scan cycles (default: {settings.FEAR_SELLING_SCAN_INTERVAL})",
     )
+    parser.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    parser.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    parser.add_argument("--cb-stale-seconds", type=float, default=300.0, help="Circuit breaker: book staleness threshold")
+    parser.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return parser.parse_args()
 
 
@@ -110,6 +116,7 @@ GAMMA_MARKETS_API = "https://gamma-api.polymarket.com/markets"
 async def _check_exits(
     engine: FearSellingEngine,
     manager: TradeManager | None = None,
+    guard: RiskGuard | None = None,
 ) -> int:
     """Check open FearPositions for exit signals or market resolution.
 
@@ -217,6 +224,13 @@ async def _check_exits(
                             )
                             closed_count += 1
 
+                            # Record result in RiskGuard
+                            if guard:
+                                try:
+                                    await guard.record_result(pnl=realized_pnl, won=realized_pnl > 0)
+                                except Exception:
+                                    pass
+
                             # Settle via TradeManager for Telegram + LiveObservation
                             if manager is not None:
                                 try:
@@ -277,16 +291,6 @@ async def main(args: argparse.Namespace) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
-    # --- Risk manager ---------------------------------------------------
-    risk_manager = UnifiedRiskManager(
-        global_capital=settings.GLOBAL_CAPITAL,
-        reality_allocation_pct=settings.CAPITAL_ALLOCATION_REALITY_PCT,
-        crossmarket_allocation_pct=settings.CAPITAL_ALLOCATION_CROSSMARKET_PCT,
-        max_position_pct=settings.MAX_POSITION_PCT,
-        daily_loss_limit_pct=settings.DAILY_LOSS_LIMIT_PCT,
-        fear_allocation_pct=settings.CAPITAL_ALLOCATION_FEAR_PCT,
-    )
-
     # --- Executor (only in autopilot with a private key) ----------------
     executor = None
     if args.autopilot:
@@ -307,7 +311,6 @@ async def main(args: argparse.Namespace) -> None:
 
     # --- Fear selling engine --------------------------------------------
     engine = FearSellingEngine(
-        risk_manager=risk_manager,
         executor=executor,
         max_cluster_pct=settings.FEAR_SELLING_MAX_CLUSTER_PCT,
         max_position_pct=settings.FEAR_SELLING_MAX_POSITION_PCT,
@@ -335,6 +338,23 @@ async def main(args: argparse.Namespace) -> None:
     )
     logger.info("trade_manager_ready", strategy="fear_selling")
 
+    # --- RiskGuard (replaces UnifiedRiskManager) -------------------------
+    db_url = settings.DATABASE_URL or "sqlite+aiosqlite:///data/arb.db"
+    db_path = db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
+    guard = RiskGuard(
+        strategy_tag="fear_selling",
+        db_path=db_path,
+        max_consecutive_losses=args.cb_max_losses,
+        max_drawdown_usd=args.cb_max_drawdown,
+        stale_seconds=args.cb_stale_seconds,
+        daily_loss_limit_usd=args.cb_daily_limit,
+        telegram_alerter=manager._alerter,
+    )
+    await guard.initialize()
+    logger.info("risk_guard_ready", strategy="fear_selling")
+
+    _last_book_update = time.time()
+
     logger.info(
         "fear_selling_bot_started",
         autopilot=args.autopilot,
@@ -347,6 +367,22 @@ async def main(args: argparse.Namespace) -> None:
     try:
         while not shutdown_event.is_set():
             cycle += 1
+
+            # Circuit breaker gate
+            await guard.heartbeat()
+            _last_book_update = time.time()  # REST-based: staleness = time since last successful API call
+            if not await guard.is_trading_allowed(last_book_update=_last_book_update):
+                logger.info("scan_cycle_skipped_circuit_breaker", cycle=cycle)
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=args.scan_interval)
+                except asyncio.TimeoutError:
+                    pass
+                # Still check exits even when circuit broken
+                closed = await _check_exits(engine, manager=manager, guard=guard)
+                if closed:
+                    logger.info("fear_exits_triggered", cycle=cycle, closed=closed)
+                continue
+
             logger.info("scan_cycle_start", cycle=cycle)
 
             try:
@@ -431,7 +467,7 @@ async def main(args: argparse.Namespace) -> None:
                 logger.info("scan_cycle_complete", cycle=cycle, signals=signals_count)
 
                 # Check exit conditions for open positions
-                closed = await _check_exits(engine, manager=manager)
+                closed = await _check_exits(engine, manager=manager, guard=guard)
                 if closed:
                     logger.info("fear_exits_triggered", cycle=cycle, closed=closed)
 

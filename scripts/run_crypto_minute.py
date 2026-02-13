@@ -22,6 +22,7 @@ configure_logging()
 from config.settings import settings
 from src.arb.crypto_minute import CryptoMinuteEngine, CRYPTO_MINUTE_EVENT_TYPE
 from src.execution import TradeManager
+from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -44,7 +45,19 @@ async def main() -> None:
         notify_closes=False,
     )
 
-    engine = CryptoMinuteEngine(database_url=DB_URL, manager=manager)
+    db_path = DB_URL.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
+    guard = RiskGuard(
+        strategy_tag="crypto_minute",
+        db_path=db_path,
+        max_consecutive_losses=5,
+        max_drawdown_usd=-50.0,
+        stale_seconds=300.0,
+        daily_loss_limit_usd=-200.0,
+        telegram_alerter=manager._alerter,
+    )
+    await guard.initialize()
+
+    engine = CryptoMinuteEngine(database_url=DB_URL, manager=manager, guard=guard)
     try:
         await engine.run()
     finally:
@@ -57,6 +70,10 @@ if __name__ == "__main__":
     parser.add_argument("--td-threshold", type=float, default=settings.CRYPTO_MINUTE_TD_THRESHOLD)
     parser.add_argument("--lv-threshold", type=float, default=settings.CRYPTO_MINUTE_LV_THRESHOLD)
     parser.add_argument("--scan-interval", type=float, default=settings.CRYPTO_MINUTE_SCAN_INTERVAL)
+    parser.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    parser.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    parser.add_argument("--cb-stale-seconds", type=float, default=300.0, help="Circuit breaker: book staleness threshold")
+    parser.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     args = parser.parse_args()
 
     # Override settings from CLI args

@@ -22,6 +22,7 @@ configure_logging()
 from config.settings import settings
 from src.arb.weather_oracle import WeatherOracleEngine, WEATHER_ORACLE_EVENT_TYPE
 from src.execution import TradeManager
+from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
@@ -59,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="sqlite:///data/arb.db",
         help="Database URL for persistence.",
     )
+    parser.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
+    parser.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
+    parser.add_argument("--cb-stale-seconds", type=float, default=600.0, help="Circuit breaker: book staleness threshold")
+    parser.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return parser
 
 
@@ -88,7 +93,11 @@ async def run_scan_once(engine: WeatherOracleEngine) -> None:
                 f"| conf={signal.confidence:.0%} "
                 f"| {signal.reason}"
             )
-            trade = engine.enter_paper_trade(signal)
+            # Guard gate: skip entry if circuit broken
+            if engine.guard and engine.guard.circuit_broken:
+                print("  (skipped — circuit breaker ON)")
+                continue
+            trade = await engine.enter_paper_trade(signal)
             if trade:
                 total_signals += 1
 
@@ -115,7 +124,19 @@ async def main():
         notify_closes=False,
     )
 
-    engine = WeatherOracleEngine(database_url=args.db_url, manager=manager)
+    db_path = args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
+    guard = RiskGuard(
+        strategy_tag="weather_oracle",
+        db_path=db_path,
+        max_consecutive_losses=args.cb_max_losses,
+        max_drawdown_usd=args.cb_max_drawdown,
+        stale_seconds=args.cb_stale_seconds,
+        daily_loss_limit_usd=args.cb_daily_limit,
+        telegram_alerter=manager._alerter,
+    )
+    await guard.initialize()
+
+    engine = WeatherOracleEngine(database_url=args.db_url, manager=manager, guard=guard)
     engine.max_entry_price = args.max_entry_price
     engine.min_confidence = args.min_confidence
     engine.paper_size = args.paper_size
