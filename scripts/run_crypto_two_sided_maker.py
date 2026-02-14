@@ -1360,7 +1360,7 @@ async def main() -> None:
             return
         logger.info("auto_wallet_detected", wallet_usd=round(wallet, 2))
 
-    order_size = args.order_size if args.order_size > 0 else max(wallet * 0.025, 1.0)
+    order_size = args.order_size if args.order_size > 0 else max(wallet * 0.025, 5.0)
     max_exposure = args.max_exposure if args.max_exposure > 0 else max(wallet * 0.50, 50.0)
 
     maker = CryptoTwoSidedMaker(
