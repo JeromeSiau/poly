@@ -149,6 +149,28 @@ def list_trades(
 # /balance — paper or live USDC balance
 # ---------------------------------------------------------------------------
 
+def _fetch_live_balance() -> float:
+    """Fetch on-chain USDC.e balance via Polygon RPC (no executor needed)."""
+    import httpx
+
+    usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    selector = "0x70a08231"
+    rpc_url = settings.POLYGON_RPC_URL or "https://polygon-rpc.com"
+    wallet = settings.POLYMARKET_WALLET_ADDRESS
+    if not wallet:
+        raise ValueError("POLYMARKET_WALLET_ADDRESS not configured")
+    padded = wallet.lower().replace("0x", "").zfill(64)
+    data = selector + padded
+    resp = httpx.post(
+        rpc_url,
+        json={"jsonrpc": "2.0", "method": "eth_call",
+              "params": [{"to": usdc_e, "data": data}, "latest"], "id": 1},
+        timeout=10,
+    )
+    result = resp.json().get("result", "0x0")
+    return int(result, 16) / 1e6
+
+
 @app.get("/balance")
 def balance(
     mode: str = Query(default="paper", description="'live' or 'paper'."),
@@ -156,11 +178,10 @@ def balance(
     """Return current balance for paper or live mode."""
     if mode == "live":
         try:
-            from src.arb.polymarket_executor import PolymarketExecutor
-            bal = PolymarketExecutor()._get_balance_sync()
+            bal = _fetch_live_balance()
             return {"balance": round(bal, 2), "mode": "live"}
-        except Exception:
-            return {"balance": 0.0, "mode": "live", "error": "Could not fetch on-chain balance"}
+        except Exception as exc:
+            return {"balance": 0.0, "mode": "live", "error": str(exc)}
 
     # Paper: starting capital + sum of closed paper-mode pnl
     session = get_sync_session(DB_URL)
