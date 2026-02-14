@@ -198,19 +198,19 @@ async def slot_loop(
                 except asyncio.TimeoutError:
                     pass
 
-                # Risk check
-                if not await guard.is_trading_allowed(
-                    last_book_update=feed.last_update_ts or time.time()
-                ):
-                    logger.info("trading_blocked_by_guard", slug=slug)
-                    break
-
-                # Get best ask levels
+                # Get best ask levels — need book data before any checks
                 _, _, ask_up, _ = feed.get_best_levels(market.condition_id, up_outcome)
                 _, _, ask_down, _ = feed.get_best_levels(market.condition_id, down_outcome)
 
                 if ask_up is None or ask_down is None:
                     continue  # keep waiting for book data
+
+                # Risk check (only after we have book data)
+                if not await guard.is_trading_allowed(
+                    last_book_update=feed.last_update_ts or time.time()
+                ):
+                    logger.info("trading_blocked_by_guard", slug=slug)
+                    break
 
                 now = time.time()
                 market_age_s = now - market.event_start
