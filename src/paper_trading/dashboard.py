@@ -638,8 +638,8 @@ with tab_analysis:
             )
             if has_move:
                 df_m = pd.DataFrame(has_move)
-                bins = [-float("inf"), -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, float("inf")]
-                labels = ["<-1%", "-1~-0.5", "-0.5~-0.2", "-0.2~0", "0~0.2", "0.2~0.5", "0.5~1%", ">1%"]
+                bins = [-float("inf"), 0.0, 0.1, 0.2, 0.5, 1.0, float("inf")]
+                labels = ["<0%", "0~0.1%", "0.1~0.2%", "0.2~0.5%", "0.5~1%", ">1%"]
                 df_m["bucket"] = pd.cut(df_m["dir_move_pct"], bins=bins, labels=labels)
                 grouped = df_m.groupby("bucket", observed=True).agg(
                     wins=("pnl", lambda x: (x > 0).sum()),
