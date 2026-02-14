@@ -1,4 +1,4 @@
-"""Tests for CryptoTDMaker paper fill detection."""
+"""Tests for CryptoTDMaker paper fill detection and sequential ladder."""
 
 import asyncio
 import time
@@ -6,6 +6,7 @@ import time
 import pytest
 
 from src.feeds.polymarket import PolymarketFeed
+from src.execution.trade_manager import TradeManager
 from scripts.run_crypto_td_maker import CryptoTDMaker, PassiveOrder, OpenPosition
 
 
@@ -207,3 +208,191 @@ class TestAskCrossFill:
 
         assert oid not in maker.active_orders
         assert maker.total_fills == 1
+
+
+# ---------------------------------------------------------------------------
+# Sequential ladder: rungs placed one at a time, lowest first
+# ---------------------------------------------------------------------------
+
+CID = "0xcond_ladder"
+TOK_UP = "tok_up_l"
+TOK_DOWN = "tok_down_l"
+
+
+def _make_feed_both_sides(
+    cid: str, bid_up: float, ask_up: float,
+    bid_down: float | None = None, ask_down: float | None = None,
+) -> PolymarketFeed:
+    """Create a PolymarketFeed with order books for both Up and Down outcomes."""
+    if bid_down is None:
+        bid_down = round(1.0 - ask_up, 2)
+    if ask_down is None:
+        ask_down = round(1.0 - bid_up, 2)
+    feed = PolymarketFeed.__new__(PolymarketFeed)
+    feed._token_map = {(cid, "Up"): TOK_UP, (cid, "Down"): TOK_DOWN}
+    feed._best_cache = {
+        TOK_UP: (bid_up, 100.0, ask_up, 100.0),
+        TOK_DOWN: (bid_down, 100.0, ask_down, 100.0),
+    }
+    feed.book_updated = asyncio.Event()
+    feed._connected = False
+    feed._local_orderbook = {}
+    feed._subscribed_tokens = set()
+    feed._connection_task = None
+    feed._shutdown = False
+    feed._ws = None
+    feed.last_update_ts = time.monotonic()
+    return feed
+
+
+def _make_ladder_maker(
+    feed: PolymarketFeed, ladder_rungs: int = 2, **kwargs,
+) -> CryptoTDMaker:
+    """Create a CryptoTDMaker wired for ladder testing (paper, no guard)."""
+    manager = TradeManager(
+        strategy="test_ladder", paper=True,
+        notify_bids=False, notify_fills=False, notify_closes=False,
+    )
+    defaults = dict(
+        executor=None,
+        polymarket=feed,
+        user_feed=None,
+        manager=manager,
+        symbols=["BTCUSDT"],
+        target_bid=0.75,
+        max_bid=0.85,
+        order_size_usd=5.0,
+        max_total_exposure_usd=200.0,
+        paper_mode=True,
+        ladder_rungs=ladder_rungs,
+    )
+    defaults.update(kwargs)
+    maker = CryptoTDMaker(**defaults)
+    # Register a market so _maker_tick can see it.
+    maker.known_markets[CID] = {"events": [{"slug": "btc-updown-1700000000"}]}
+    maker.market_outcomes[CID] = ["Up", "Down"]
+    maker.market_tokens[(CID, "Up")] = TOK_UP
+    maker.market_tokens[(CID, "Down")] = TOK_DOWN
+    return maker
+
+
+def _orders_for_outcome(maker: CryptoTDMaker, outcome: str) -> list[PassiveOrder]:
+    """Return all active orders for a given outcome."""
+    return [o for o in maker.active_orders.values() if o.outcome == outcome]
+
+
+class TestSequentialLadder:
+    """Sequential ladder: rung[0] first, rung[1] only after rung[0] fills, etc."""
+
+    @pytest.mark.asyncio
+    async def test_only_first_rung_placed_initially(self):
+        """With ladder_rungs=2 and no fills, only rung[0] (0.75) should be placed."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=2)
+
+        await maker._maker_tick()
+
+        down_orders = _orders_for_outcome(maker, "Down")
+        assert len(down_orders) == 1, f"Expected 1 order, got {len(down_orders)}"
+        assert down_orders[0].price == 0.75
+
+    @pytest.mark.asyncio
+    async def test_second_rung_after_first_fill(self):
+        """After rung[0] fills (fill_count=1), rung[1] (0.85) should be placed."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=2)
+
+        # Simulate first rung already filled.
+        maker._cid_fill_count[CID] = 1
+        maker.positions[CID] = OpenPosition(
+            condition_id=CID, outcome="Down", token_id=TOK_DOWN,
+            entry_price=0.75, size_usd=5.0, shares=6.67,
+            filled_at=time.time(), side="BUY",
+        )
+
+        await maker._maker_tick()
+
+        down_orders = _orders_for_outcome(maker, "Down")
+        assert len(down_orders) == 1, f"Expected 1 order, got {len(down_orders)}"
+        assert down_orders[0].price == 0.85
+
+    @pytest.mark.asyncio
+    async def test_no_more_orders_after_all_rungs_filled(self):
+        """After all rungs filled, no new orders should be placed."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=2)
+
+        maker._cid_fill_count[CID] = 2
+        maker.positions[CID] = OpenPosition(
+            condition_id=CID, outcome="Down", token_id=TOK_DOWN,
+            entry_price=0.80, size_usd=10.0, shares=13.0,
+            filled_at=time.time(), side="BUY",
+        )
+
+        await maker._maker_tick()
+
+        assert len(maker.active_orders) == 0
+
+    @pytest.mark.asyncio
+    async def test_five_rungs_sequential_order(self):
+        """With 5 rungs, each tick places only the next unfilled rung."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=5)
+        expected_prices = maker.rung_prices  # [0.75, 0.78, 0.80, 0.83, 0.85]
+
+        for i, expected_price in enumerate(expected_prices):
+            # Clear orders from previous tick to simulate fill.
+            if i > 0:
+                maker._cid_fill_count[CID] = i
+                # Clear active orders (simulating fill + cleanup).
+                maker.active_orders.clear()
+                maker._orders_by_cid_outcome.clear()
+
+            await maker._maker_tick()
+
+            down_orders = _orders_for_outcome(maker, "Down")
+            assert len(down_orders) == 1, (
+                f"Rung {i}: expected 1 order, got {len(down_orders)}"
+            )
+            assert down_orders[0].price == expected_price, (
+                f"Rung {i}: expected price {expected_price}, got {down_orders[0].price}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_cancel_clears_rung_placed(self):
+        """When bid goes out of range and order is cancelled, _rung_placed is cleaned
+        so the rung can be re-placed when bid returns to range."""
+        # Start with bid in range → rung[0] placed.
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=2)
+
+        await maker._maker_tick()
+        assert len(_orders_for_outcome(maker, "Down")) == 1
+        assert len(maker._rung_placed) == 1
+
+        # Bid goes ABOVE max_bid (0.85) → out of range → cancel.
+        # (Using bid > max_bid avoids triggering bid-through paper fill.)
+        feed._best_cache[TOK_DOWN] = (0.90, 100.0, 0.92, 100.0)
+        feed._best_cache[TOK_UP] = (0.10, 100.0, 0.12, 100.0)
+        feed.last_update_ts = time.monotonic()
+
+        await maker._maker_tick()
+        assert len(maker.active_orders) == 0
+        assert len(maker._rung_placed) == 0, (
+            "_rung_placed should be empty after cancel"
+        )
+
+        # Bid returns to range → rung[0] should be re-placed.
+        feed._best_cache[TOK_DOWN] = (0.80, 100.0, 0.82, 100.0)
+        feed._best_cache[TOK_UP] = (0.20, 100.0, 0.22, 100.0)
+        feed.last_update_ts = time.monotonic()
+
+        await maker._maker_tick()
+        down_orders = _orders_for_outcome(maker, "Down")
+        assert len(down_orders) == 1
+        assert down_orders[0].price == 0.75

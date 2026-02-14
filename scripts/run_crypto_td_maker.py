@@ -472,8 +472,10 @@ class CryptoTDMaker:
                 )
 
                 if self.ladder_rungs > 1 and bid_in_range:
-                    # ---- Ladder BUY: place at each rung price not yet placed ----
-                    for rung_price in self.rung_prices:
+                    # ---- Sequential ladder: place only the next rung ----
+                    next_idx = self._cid_fill_count.get(cid, 0)
+                    if next_idx < len(self.rung_prices):
+                        rung_price = self.rung_prices[next_idx]
                         rung_key = (cid, outcome, int(round(rung_price * 100)))
                         if rung_key not in self._rung_placed:
                             place_intents.append((cid, outcome, token_id, rung_price, "BUY"))
@@ -534,6 +536,8 @@ class CryptoTDMaker:
                     self.active_orders.pop(oid, None)
                     if self._orders_by_cid_outcome.get(key) == oid:
                         del self._orders_by_cid_outcome[key]
+                    self._rung_placed.discard(
+                        (order.condition_id, order.outcome, int(round(order.price * 100))))
                     self._db_fire(self._db_delete_order(oid))
                 except Exception as exc:
                     # Cancel request failed — order likely still live.
@@ -549,6 +553,8 @@ class CryptoTDMaker:
                 self.active_orders.pop(oid, None)
                 if self._orders_by_cid_outcome.get(key) == oid:
                     del self._orders_by_cid_outcome[key]
+                self._rung_placed.discard(
+                    (order.condition_id, order.outcome, int(round(order.price * 100))))
                 self._db_fire(self._db_delete_order(oid))
 
         # Execute placements.
