@@ -340,7 +340,7 @@ class CryptoTDMaker:
             threshold = self.min_move_pct
         allowed = move >= threshold
         if not allowed:
-            logger.info(
+            logger.debug(
                 "min_move_filtered",
                 cid=cid[:16],
                 outcome=outcome,
