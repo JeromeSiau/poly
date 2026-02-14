@@ -356,6 +356,21 @@ class CryptoTDMaker:
             if not cached or now - cached[1] >= self._SPOT_CACHE_TTL:
                 await self._get_spot_price(sym)
 
+    def _get_dir_move(self, cid: str, outcome: str) -> Optional[float]:
+        """Directional move of underlying vs slot open (%), positive = in bet direction.
+
+        Returns None when data is unavailable.
+        """
+        ref = self._ref_prices.get(cid)
+        sym = self._cid_binance_symbol.get(cid)
+        if not ref or not sym:
+            return None
+        cached = self._spot_cache.get(sym)
+        if not cached:
+            return None
+        move_pct = (cached[0] - ref) / ref * 100
+        return -move_pct if outcome == "Down" else move_pct
+
     def _check_min_move(self, cid: str, outcome: str) -> bool:
         """Check if underlying has moved enough in the bet direction.
 
@@ -363,19 +378,10 @@ class CryptoTDMaker:
         """
         if self.min_move_pct <= 0:
             return True
-        ref = self._ref_prices.get(cid)
-        sym = self._cid_binance_symbol.get(cid)
-        if not ref or not sym:
-            return True  # no ref data → allow
-        cached = self._spot_cache.get(sym)
-        if not cached:
-            return True  # no spot data → allow
-        spot = cached[0]
-        move_pct = (spot - ref) / ref * 100
-        # For "Down" bets, a negative move (price dropped) is in our favour.
-        if outcome == "Down":
-            move_pct = -move_pct
-        return move_pct >= self.min_move_pct
+        move = self._get_dir_move(cid, outcome)
+        if move is None:
+            return True
+        return move >= self.min_move_pct
 
     @staticmethod
     def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
@@ -880,6 +886,12 @@ class CryptoTDMaker:
         self.total_fills += 1
         self._db_fire(self._db_mark_filled(order.order_id, new_shares, now))
 
+        # Underlying move at fill time (reuses shared helper).
+        dir_move = self._get_dir_move(order.condition_id, order.outcome)
+        ref = self._ref_prices.get(order.condition_id)
+        sym = self._cid_binance_symbol.get(order.condition_id)
+        spot_cached = self._spot_cache.get(sym) if sym else None
+
         logger.info(
             "td_order_filled",
             condition_id=order.condition_id[:16],
@@ -888,6 +900,9 @@ class CryptoTDMaker:
             shares=round(new_shares, 2),
             total_fills=self.total_fills,
             paper=self.paper_mode,
+            ref_price=ref,
+            spot_price=spot_cached[0] if spot_cached else None,
+            dir_move_pct=round(dir_move, 3) if dir_move is not None else None,
         )
 
         # Persist fill to DB + Telegram via TradeManager.
