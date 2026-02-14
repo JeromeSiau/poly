@@ -116,12 +116,13 @@ def test_redeem_all_sync_passes_all_positions_to_service(mock_get):
 
     service = FakeService(redeem_results=[{"tx": "0x123"}])
     redeemer = PolymarketRedeemer(service)
-    results = redeemer._redeem_all_sync(batch_size=10)
+    data = redeemer._redeem_all_sync(batch_size=10)
 
     # Service received both positions (not just winning)
     assert service.positions_received == positions
-    assert len(results) == 1
-    assert results[0] == {"tx": "0x123"}
+    assert len(data["results"]) == 1
+    assert data["results"][0] == {"tx": "0x123"}
+    assert data["positions"] == positions
 
 
 @patch("src.execution.redeemer.requests.get")
@@ -131,21 +132,23 @@ def test_redeem_all_sync_handles_none_results(mock_get):
 
     service = FakeService(redeem_results=[None])
     redeemer = PolymarketRedeemer(service)
-    results = redeemer._redeem_all_sync(batch_size=10)
+    data = redeemer._redeem_all_sync(batch_size=10)
 
-    assert results == [{"status": "failed"}]
+    assert data["results"] == [{"status": "failed"}]
+    assert data["positions"] == [WINNING_POSITION]
 
 
 @patch("src.execution.redeemer.requests.get")
 def test_redeem_all_sync_no_positions(mock_get):
-    """No redeemable positions → empty list."""
+    """No redeemable positions → empty dict."""
     mock_get.return_value = _mock_response([])
 
     service = FakeService()
     redeemer = PolymarketRedeemer(service)
-    results = redeemer._redeem_all_sync(batch_size=10)
+    data = redeemer._redeem_all_sync(batch_size=10)
 
-    assert results == []
+    assert data["results"] == []
+    assert data["positions"] == []
     assert service.positions_received is None  # service not called
 
 

@@ -101,11 +101,11 @@ class PolymarketRedeemer:
         )
         return positions
 
-    def _redeem_all_sync(self, batch_size: int = 10) -> list[dict[str, Any]]:
+    def _redeem_all_sync(self, batch_size: int = 10) -> dict[str, Any]:
         wallet = self._service._resolve_user_address()
         positions = self._fetch_redeemable(wallet)
         if not positions:
-            return []
+            return {"results": [], "positions": []}
         results = self._service._redeem_from_positions(positions, batch_size)
         out: list[dict[str, Any]] = []
         for r in results:
@@ -115,10 +115,14 @@ class PolymarketRedeemer:
                 out.append(r)
             else:
                 out.append({"status": "ok", "result": r})
-        return out
+        return {"results": out, "positions": positions}
 
-    async def redeem_all(self, batch_size: int = 10) -> list[dict[str, Any]]:
-        """Redeem all redeemable positions. Returns list of results."""
+    async def redeem_all(self, batch_size: int = 10) -> dict[str, Any]:
+        """Redeem all redeemable positions.
+
+        Returns dict with ``results`` (tx outcomes) and ``positions``
+        (the position dicts that were submitted for redemption).
+        """
         return await asyncio.to_thread(self._redeem_all_sync, batch_size)
 
     def _redeem_sync(self, condition_ids: list[str], batch_size: int = 10) -> list[dict[str, Any]]:

@@ -47,14 +47,17 @@ async def run_once(
     """Single redeem pass. Returns number of successful redeems."""
     logger.info("redeem_scan_start")
     try:
-        results = await redeemer.redeem_all(batch_size=batch_size)
+        data = await redeemer.redeem_all(batch_size=batch_size)
     except Exception as exc:
         logger.error("redeem_scan_failed", error=str(exc))
         if alerter:
             await alerter.send_custom_alert(
-                f"AUTO-REDEEM ERROR\nScan failed: {exc}"
+                f"\U0001f534 AUTO-REDEEM ERROR\nScan failed: {exc}"
             )
         return 0
+
+    results = data["results"]
+    positions = data["positions"]
 
     if not results:
         logger.info("redeem_scan_done", redeemed=0, msg="no redeemable positions")
@@ -65,17 +68,28 @@ async def run_once(
     logger.info("redeem_scan_done", redeemed=ok, failed=failed, results=results)
 
     if alerter and ok > 0:
-        lines = [f"AUTO-REDEEM: {ok} position(s) redeemed"]
+        total_value = sum(p.get("currentValue") or 0 for p in positions)
+        total_pnl = sum(p.get("cashPnl") or 0 for p in positions)
+        n_pos = len(positions)
+
+        lines = [f"\u2705 AUTO-REDEEM: {n_pos} position(s)"]
+        if total_value > 0:
+            lines.append(f"\U0001f4b0 ${total_value:.2f} USDC redeemed")
+        pnl_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+        lines.append(f"{pnl_emoji} PnL: ${total_pnl:+.2f}")
         if failed:
-            lines.append(f"({failed} failed)")
-        for r in results:
-            if r.get("status") != "failed":
-                lines.append(f"  - {r}")
+            lines.append(f"\u26a0\ufe0f {failed} batch(es) failed")
+        for p in positions:
+            val = p.get("currentValue") or 0
+            pnl = p.get("cashPnl") or 0
+            slug = p.get("slug", "?")
+            outcome = p.get("outcome", "")
+            icon = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
+            lines.append(f"  {icon} {slug} {outcome} ${val:.2f}")
         await alerter.send_custom_alert("\n".join(lines))
     elif alerter and failed > 0:
         await alerter.send_custom_alert(
-            f"AUTO-REDEEM: {failed} redemption(s) failed\n"
-            + "\n".join(f"  - {r}" for r in results)
+            f"\U0001f534 AUTO-REDEEM: {failed} batch(es) failed"
         )
 
     return ok
