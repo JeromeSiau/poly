@@ -266,6 +266,8 @@ def positions(
             return {"positions": [], "error": "No wallet configured"}
         try:
             raw = _fetch_positions(wallet)
+            # Filter out resolved positions (curPrice 0 or 1 = market settled)
+            active = [p for p in raw if 0 < float(p.get("curPrice", 0)) < 1]
             items = [
                 {
                     "title": p.get("title", ""),
@@ -278,7 +280,7 @@ def positions(
                     "pnl": round(float(p.get("cashPnl", 0)), 2),
                     "pnl_pct": round(float(p.get("percentPnl", 0)), 1),
                 }
-                for p in raw
+                for p in active
             ]
             return {"mode": "live", "count": len(items), "positions": items}
         except Exception as exc:

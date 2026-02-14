@@ -534,6 +534,7 @@ with tab_live:
                 else:
                     continue
                 rows.append({
+                    "_sort": dt,
                     "Time": dt.strftime("%H:%M"),
                     "Market": mk.get("title", ""),
                     "Side": mk.get("outcome", ""),
@@ -542,7 +543,7 @@ with tab_live:
                     "PnL": f"${mk['pnl']:+.2f}",
                     "Result": mk.get("status", ""),
                 })
-            display = pd.DataFrame(rows)
+            display = pd.DataFrame(rows).sort_values("_sort", ascending=False).drop(columns=["_sort"])
             styled = display.style.map(_style_pnl, subset=["PnL"]).map(
                 _style_result, subset=["Result"]
             )
