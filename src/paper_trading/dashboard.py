@@ -1746,35 +1746,57 @@ def _render_fear_selling_tab(positions: list) -> None:
         st.info("No closed positions yet.")
 
 
+def _extract_last_penny_rows(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> list[dict[str, Any]]:
+    """Build normalized rows for last-penny sniper analysis."""
+    obs_by_id = {obs.id: obs for obs in observations}
+    rows: list[dict[str, Any]] = []
+
+    for trade in trades:
+        obs = obs_by_id.get(trade.observation_id)
+        if obs is None or obs.event_type != LAST_PENNY_EVENT_TYPE:
+            continue
+        gs = _observation_game_state(obs)
+        rows.append({
+            "timestamp": trade.created_at or obs.timestamp,
+            "side": trade.side,
+            "outcome": gs.get("outcome", ""),
+            "condition_id": gs.get("condition_id", ""),
+            "title": gs.get("title", ""),
+            "entry_price": _safe_float(trade.entry_price),
+            "exit_price": _safe_float(trade.exit_price),
+            "size_usd": _safe_float(trade.size),
+            "pnl": _safe_float(trade.pnl),
+            "is_open": trade.is_open,
+        })
+    return rows
+
+
 def _render_last_penny_tab(
     observations: list[LiveObservation],
     trades: list[PaperTrade],
 ) -> None:
     """Render the Last Penny Sniper tab — buy quasi-certain outcomes, hold to resolution."""
-    # Filter trades by event type
-    lp_trades = [t for t in trades if t.event_type == LAST_PENNY_EVENT_TYPE]
-    lp_obs = [o for o in observations if o.event_type == LAST_PENNY_EVENT_TYPE]
+    rows = _extract_last_penny_rows(observations, trades)
 
-    if not lp_trades:
+    if not rows:
         st.info("No Last Penny Sniper trades found. Start with: ./run scripts/run_sniper.py")
         return
 
-    # Separate fills and settlements
-    fills = [t for t in lp_trades if t.side == "BUY"]
-    settlements = [t for t in lp_trades if t.side == "SELL"]
+    fills = [r for r in rows if r["side"] == "BUY"]
+    settlements = [r for r in rows if r["side"] == "SELL"]
 
-    # Compute stats
-    wins = sum(1 for s in settlements if s.pnl and s.pnl > 0)
-    losses = sum(1 for s in settlements if s.pnl is not None and s.pnl <= 0)
-    total_pnl = sum(s.pnl for s in settlements if s.pnl is not None)
-    open_positions = len(fills) - len(settlements)
+    wins = sum(1 for s in settlements if s["pnl"] and s["pnl"] > 0)
+    losses = sum(1 for s in settlements if s["pnl"] is not None and s["pnl"] <= 0)
+    total_pnl = sum(s["pnl"] for s in settlements if s["pnl"])
 
-    # Exposure: sum of fill sizes for unsettled positions
-    settled_cids = {s.condition_id for s in settlements}
-    open_fills = [f for f in fills if f.condition_id not in settled_cids]
-    exposure = sum(f.size_usd for f in open_fills if f.size_usd)
+    # Exposure: open BUY positions
+    settled_cids = {s["condition_id"] for s in settlements}
+    open_fills = [f for f in fills if f["condition_id"] not in settled_cids]
+    exposure = sum(f["size_usd"] for f in open_fills if f["size_usd"])
 
-    # Metrics row
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Fills", len(fills))
     c2.metric("Settled", len(settlements))
@@ -1789,12 +1811,12 @@ def _render_last_penny_tab(
     if settlements:
         pnl_data = []
         cumulative = 0.0
-        for s in sorted(settlements, key=lambda t: t.timestamp or 0):
-            if s.pnl is not None:
-                cumulative += s.pnl
+        for s in sorted(settlements, key=lambda r: r["timestamp"] or datetime.min):
+            if s["pnl"]:
+                cumulative += s["pnl"]
                 pnl_data.append({
-                    "time": datetime.fromtimestamp(s.timestamp) if s.timestamp else None,
-                    "pnl": s.pnl,
+                    "time": s["timestamp"],
+                    "pnl": s["pnl"],
                     "cumulative": cumulative,
                 })
 
@@ -1816,7 +1838,7 @@ def _render_last_penny_tab(
 
     # Entry price histogram
     if fills:
-        prices = [f.price for f in fills if f.price]
+        prices = [f["entry_price"] for f in fills if f["entry_price"]]
         if prices:
             fig_hist = go.Figure(data=[go.Histogram(
                 x=prices, nbinsx=20,
@@ -1833,15 +1855,16 @@ def _render_last_penny_tab(
     # Recent trades table
     st.subheader("Recent Trades")
     table_data = []
-    for t in sorted(lp_trades, key=lambda x: x.timestamp or 0, reverse=True)[:50]:
+    for r in sorted(rows, key=lambda x: x["timestamp"] or datetime.min, reverse=True)[:50]:
+        ts = r["timestamp"]
         table_data.append({
-            "Time": datetime.fromtimestamp(t.timestamp).strftime("%Y-%m-%d %H:%M") if t.timestamp else "",
-            "Side": t.side,
-            "Outcome": t.outcome or "",
-            "Price": f"{t.price:.4f}" if t.price else "",
-            "Size": f"${t.size_usd:.2f}" if t.size_usd else "",
-            "P&L": f"${t.pnl:+.4f}" if t.pnl is not None else "",
-            "Title": (t.title or "")[:50],
+            "Time": ts.strftime("%Y-%m-%d %H:%M") if ts else "",
+            "Side": r["side"],
+            "Outcome": r["outcome"],
+            "Price": f"{r['entry_price']:.4f}" if r["entry_price"] else "",
+            "Size": f"${r['size_usd']:.2f}" if r["size_usd"] else "",
+            "P&L": f"${r['pnl']:+.4f}" if r["pnl"] else "",
+            "Title": r["title"][:50],
         })
 
     if table_data:
