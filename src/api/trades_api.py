@@ -171,15 +171,63 @@ def _fetch_live_balance() -> float:
     return int(result, 16) / 1e6
 
 
+def _fetch_positions(wallet: str) -> list[dict]:
+    """Fetch open positions from Polymarket Data API."""
+    import httpx
+
+    positions: list[dict] = []
+    offset = 0
+    with httpx.Client(timeout=15) as client:
+        while True:
+            resp = client.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": wallet, "sizeThreshold": 0.1,
+                        "limit": 100, "offset": offset},
+            )
+            if resp.status_code != 200:
+                break
+            batch = resp.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            positions.extend(batch)
+            if len(batch) < 100:
+                break
+            offset += len(batch)
+    return positions
+
+
 @app.get("/balance")
 def balance(
     mode: str = Query(default="paper", description="'live' or 'paper'."),
 ) -> dict:
-    """Return current balance for paper or live mode."""
+    """Return current balance for paper or live mode.
+
+    Live mode returns portfolio value = USDC cash + market value of open positions
+    (same as Polymarket profile page).
+    """
     if mode == "live":
         try:
-            bal = _fetch_live_balance()
-            return {"balance": round(bal, 2), "mode": "live"}
+            wallet = settings.POLYMARKET_WALLET_ADDRESS
+            if not wallet:
+                raise ValueError("POLYMARKET_WALLET_ADDRESS not configured")
+
+            cash = _fetch_live_balance()
+            positions = _fetch_positions(wallet)
+
+            positions_value = sum(float(p.get("currentValue", 0)) for p in positions)
+            unrealized_pnl = sum(float(p.get("cashPnl", 0)) for p in positions)
+            portfolio = cash + positions_value
+
+            return {
+                "mode": "live",
+                "portfolio": round(portfolio, 2),
+                "cash": round(cash, 2),
+                "positions_value": round(positions_value, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "n_positions": len(positions),
+                # Keep backward compat
+                "balance": round(portfolio, 2),
+            }
         except Exception as exc:
             return {"balance": 0.0, "mode": "live", "error": str(exc)}
 
