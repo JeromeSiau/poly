@@ -619,12 +619,105 @@ with tab_analysis:
             return
 
         # ---------------------------------------------------------------
-        # Market Correlation — do markets win/lose together per slot?
+        # 1. Win Rate by Move % and Timing (always shown)
+        # ---------------------------------------------------------------
+
+        has_move = [t for t in resolved if t.get("dir_move_pct") is not None]
+        has_timing = [t for t in resolved if t.get("minutes_into_slot") is not None]
+
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            st.markdown(
+                '<p class="section-label">Win Rate by Underlying Move %</p>',
+                unsafe_allow_html=True,
+            )
+            if has_move:
+                df_m = pd.DataFrame(has_move)
+                bins = [-float("inf"), -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, float("inf")]
+                labels = ["<-1%", "-1~-0.5", "-0.5~-0.2", "-0.2~0", "0~0.2", "0.2~0.5", "0.5~1%", ">1%"]
+                df_m["bucket"] = pd.cut(df_m["dir_move_pct"], bins=bins, labels=labels)
+                grouped = df_m.groupby("bucket", observed=True).agg(
+                    wins=("pnl", lambda x: (x > 0).sum()),
+                    total=("pnl", "count"),
+                ).reset_index()
+                grouped["wr"] = (grouped["wins"] / grouped["total"] * 100).round(1)
+
+                colors = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped["wr"]]
+
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=grouped["bucket"], y=grouped["wr"],
+                    marker_color=colors, marker_line_width=0,
+                    opacity=0.85,
+                    text=grouped.apply(
+                        lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                    ),
+                    textposition="outside",
+                    cliponaxis=False,
+                    textfont=dict(size=10),
+                    hovertemplate="%{x}<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
+                    customdata=grouped[["wins", "total"]].values,
+                ))
+                layout_mv = _plotly_layout(height=260)
+                layout_mv["yaxis"]["tickprefix"] = ""
+                layout_mv["yaxis"]["ticksuffix"] = "%"
+                layout_mv["yaxis"]["range"] = [0, min(grouped["wr"].max() + 20, 110)]
+                fig.update_layout(**layout_mv)
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.caption("Waiting for trades with move data (needs deploy)")
+
+        with col_right:
+            st.markdown(
+                '<p class="section-label">Win Rate by Entry Timing (min)</p>',
+                unsafe_allow_html=True,
+            )
+            if has_timing:
+                df_t = pd.DataFrame(has_timing)
+                bins_t = [0, 2, 4, 6, 8, 10, 12, 15]
+                labels_t = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12", "12-15"]
+                df_t["bucket"] = pd.cut(df_t["minutes_into_slot"], bins=bins_t, labels=labels_t, include_lowest=True)
+                grouped_t = df_t.groupby("bucket", observed=True).agg(
+                    wins=("pnl", lambda x: (x > 0).sum()),
+                    total=("pnl", "count"),
+                ).reset_index()
+                grouped_t["wr"] = (grouped_t["wins"] / grouped_t["total"] * 100).round(1)
+
+                colors_t = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped_t["wr"]]
+
+                fig_t = go.Figure()
+                fig_t.add_trace(go.Bar(
+                    x=grouped_t["bucket"], y=grouped_t["wr"],
+                    marker_color=colors_t, marker_line_width=0,
+                    opacity=0.85,
+                    text=grouped_t.apply(
+                        lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                    ),
+                    textposition="outside",
+                    cliponaxis=False,
+                    textfont=dict(size=10),
+                    hovertemplate="%{x} min<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
+                    customdata=grouped_t[["wins", "total"]].values,
+                ))
+                layout_t = _plotly_layout(height=260)
+                layout_t["yaxis"]["tickprefix"] = ""
+                layout_t["yaxis"]["ticksuffix"] = "%"
+                layout_t["yaxis"]["range"] = [0, min(grouped_t["wr"].max() + 20, 110)]
+                layout_t["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
+                fig_t.update_layout(**layout_t)
+                st.plotly_chart(fig_t, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.caption("Waiting for trades with timing data (needs deploy)")
+
+        st.markdown('<div style="height: 16px"></div>', unsafe_allow_html=True)
+
+        # ---------------------------------------------------------------
+        # 2. Market Correlation — do markets win/lose together per slot?
         # ---------------------------------------------------------------
 
         st.markdown('<p class="section-label">Market Correlation per Slot</p>', unsafe_allow_html=True)
 
-        # Group trades by slot timestamp
         slot_trades: dict[int, list] = {}
         for t in resolved:
             title = t.get("title", "")
@@ -634,7 +727,6 @@ with tab_analysis:
             slot_trades.setdefault(slot_ts, []).append(t)
 
         if slot_trades:
-            # For each slot, compute: how many markets, how many won
             slot_rows = []
             for slot_ts, st_trades in sorted(slot_trades.items()):
                 n_markets = len(st_trades)
@@ -653,15 +745,12 @@ with tab_analysis:
                 })
 
             df_slots = pd.DataFrame(slot_rows)
-
-            # Only analyze slots with 2+ markets (actual correlation)
             multi = df_slots[df_slots["n_markets"] >= 2]
 
             if not multi.empty:
                 col_corr1, col_corr2 = st.columns(2)
 
                 with col_corr1:
-                    # Distribution of outcomes per slot
                     st.markdown(
                         '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
                         'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
@@ -673,7 +762,6 @@ with tab_analysis:
                     pattern_counts.columns = ["pattern", "count"]
                     pattern_counts = pattern_counts.sort_values("pattern")
 
-                    # Color: all-win = green, all-loss = red, mixed = accent
                     def _pattern_color(p):
                         if "0L" in p:
                             return C_GREEN
@@ -704,7 +792,6 @@ with tab_analysis:
                     st.plotly_chart(fig_p, use_container_width=True, config={"displayModeBar": False})
 
                 with col_corr2:
-                    # PnL distribution by pattern
                     st.markdown(
                         '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
                         'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
@@ -740,7 +827,6 @@ with tab_analysis:
                     fig_pnl.update_layout(**layout_pnl)
                     st.plotly_chart(fig_pnl, use_container_width=True, config={"displayModeBar": False})
 
-                # Summary stats
                 all_win = multi[multi["n_losses"] == 0]
                 all_loss = multi[multi["n_wins"] == 0]
                 mixed = multi[(multi["n_wins"] > 0) & (multi["n_losses"] > 0)]
@@ -753,96 +839,5 @@ with tab_analysis:
 
             else:
                 st.caption("No slots with multiple markets found")
-
-        st.markdown('<div style="height: 16px"></div>', unsafe_allow_html=True)
-
-        # ---------------------------------------------------------------
-        # Win Rate by Move % and Timing
-        # ---------------------------------------------------------------
-
-        has_move = [t for t in resolved if t.get("dir_move_pct") is not None]
-        has_timing = [t for t in resolved if t.get("minutes_into_slot") is not None]
-
-        if has_move or has_timing:
-            col_left, col_right = st.columns(2)
-
-            if has_move:
-                with col_left:
-                    st.markdown(
-                        '<p class="section-label">Win Rate by Underlying Move %</p>',
-                        unsafe_allow_html=True,
-                    )
-                    df_m = pd.DataFrame(has_move)
-                    bins = [-float("inf"), -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, float("inf")]
-                    labels = ["<-1%", "-1~-0.5", "-0.5~-0.2", "-0.2~0", "0~0.2", "0.2~0.5", "0.5~1%", ">1%"]
-                    df_m["bucket"] = pd.cut(df_m["dir_move_pct"], bins=bins, labels=labels)
-                    grouped = df_m.groupby("bucket", observed=True).agg(
-                        wins=("pnl", lambda x: (x > 0).sum()),
-                        total=("pnl", "count"),
-                    ).reset_index()
-                    grouped["wr"] = (grouped["wins"] / grouped["total"] * 100).round(1)
-
-                    colors = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped["wr"]]
-
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(
-                        x=grouped["bucket"], y=grouped["wr"],
-                        marker_color=colors, marker_line_width=0,
-                        opacity=0.85,
-                        text=grouped.apply(
-                            lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
-                        ),
-                        textposition="outside",
-                        cliponaxis=False,
-                        textfont=dict(size=10),
-                        hovertemplate="%{x}<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
-                        customdata=grouped[["wins", "total"]].values,
-                    ))
-                    layout_mv = _plotly_layout(height=260)
-                    layout_mv["yaxis"]["tickprefix"] = ""
-                    layout_mv["yaxis"]["ticksuffix"] = "%"
-                    layout_mv["yaxis"]["range"] = [0, min(grouped["wr"].max() + 20, 110)]
-                    fig.update_layout(**layout_mv)
-                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-            if has_timing:
-                with col_right:
-                    st.markdown(
-                        '<p class="section-label">Win Rate by Entry Timing (min)</p>',
-                        unsafe_allow_html=True,
-                    )
-                    df_t = pd.DataFrame(has_timing)
-                    bins_t = [0, 2, 4, 6, 8, 10, 12, 15]
-                    labels_t = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12", "12-15"]
-                    df_t["bucket"] = pd.cut(df_t["minutes_into_slot"], bins=bins_t, labels=labels_t, include_lowest=True)
-                    grouped_t = df_t.groupby("bucket", observed=True).agg(
-                        wins=("pnl", lambda x: (x > 0).sum()),
-                        total=("pnl", "count"),
-                    ).reset_index()
-                    grouped_t["wr"] = (grouped_t["wins"] / grouped_t["total"] * 100).round(1)
-
-                    colors_t = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped_t["wr"]]
-
-                    fig_t = go.Figure()
-                    fig_t.add_trace(go.Bar(
-                        x=grouped_t["bucket"], y=grouped_t["wr"],
-                        marker_color=colors_t, marker_line_width=0,
-                        opacity=0.85,
-                        text=grouped_t.apply(
-                            lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
-                        ),
-                        textposition="outside",
-                        cliponaxis=False,
-                        textfont=dict(size=10),
-                        hovertemplate="%{x} min<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
-                        customdata=grouped_t[["wins", "total"]].values,
-                    ))
-                    layout_t = _plotly_layout(height=260)
-                    layout_t["yaxis"]["tickprefix"] = ""
-                    layout_t["yaxis"]["ticksuffix"] = "%"
-                    layout_t["yaxis"]["range"] = [0, min(grouped_t["wr"].max() + 20, 110)]
-                    layout_t["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
-                    fig_t.update_layout(**layout_t)
-                    st.plotly_chart(fig_t, use_container_width=True, config={"displayModeBar": False})
 
     analysis_tab_content()
