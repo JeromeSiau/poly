@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Query
-from sqlalchemy import select, func as sa_func
+from sqlalchemy import select
 
 from config.settings import settings
 from src.api.winrate import fetch_activity, analyse, resolve_open_markets
@@ -162,13 +162,6 @@ def balance(
     # Paper: starting capital + sum of closed paper-mode pnl
     session = get_sync_session(DB_URL)
     try:
-        q = (
-            select(sa_func.coalesce(sa_func.sum(PT.pnl), 0.0))
-            .join(LO, LO.id == PT.observation_id)
-            .where(PT.is_open == False)  # noqa: E712
-            .where(PT.pnl.isnot(None))
-        )
-        # Only count paper-mode trades (exclude live modes)
         rows = session.execute(
             select(PT.pnl, LO.game_state)
             .join(LO, LO.id == PT.observation_id)
