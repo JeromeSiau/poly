@@ -24,8 +24,6 @@ try:
 except ImportError:
     _json_loads = json.loads
 
-import os
-
 import structlog
 import websockets
 
@@ -157,7 +155,7 @@ class PolymarketFeed(BaseFeed):
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL, proxy=os.environ.get("HTTPS_PROXY") or None)
+                self._ws = await websockets.connect(self.WS_URL, proxy=None)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("polymarket_ws_connected")
@@ -622,7 +620,7 @@ class PolymarketUserFeed:
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL, proxy=os.environ.get("HTTPS_PROXY") or None)
+                self._ws = await websockets.connect(self.WS_URL, proxy=None)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("user_ws_connected")
