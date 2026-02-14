@@ -371,8 +371,12 @@ class CryptoTDMaker:
         move_pct = (cached[0] - ref) / ref * 100
         return -move_pct if outcome == "Down" else move_pct
 
-    def _check_min_move(self, cid: str, outcome: str) -> bool:
+    def _check_min_move(self, cid: str, outcome: str, price: float = 0.0) -> bool:
         """Check if underlying has moved enough in the bet direction.
+
+        When *price* is provided, the threshold scales with loss:win asymmetry.
+        At 0.85 one loss wipes ~5.7 wins vs ~3 at 0.75, so expensive rungs
+        demand proportionally more confirmation.
 
         Returns True (allow) when min_move_pct is 0 or data is unavailable.
         """
@@ -381,7 +385,13 @@ class CryptoTDMaker:
         move = self._get_dir_move(cid, outcome)
         if move is None:
             return True
-        return move >= self.min_move_pct
+        if price > 0 and price < 1.0:
+            base_ratio = self.target_bid / (1 - self.target_bid)
+            rung_ratio = price / (1 - price)
+            threshold = self.min_move_pct * (rung_ratio / base_ratio)
+        else:
+            threshold = self.min_move_pct
+        return move >= threshold
 
     @staticmethod
     def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
@@ -582,17 +592,17 @@ class CryptoTDMaker:
                 bid_in_range = (
                     bid is not None
                     and self.target_bid <= bid <= self.max_bid
-                    and self._check_min_move(cid, outcome)
+                    and self._check_min_move(cid, outcome, bid)
                 )
 
                 if self.ladder_rungs > 1 and bid is not None and bid >= self.target_bid:
-                    # Min-move filter for ladder mode.
-                    if not self._check_min_move(cid, outcome):
-                        continue
                     # ---- Sequential ladder: place only the next rung ----
                     next_idx = self._cid_fill_count.get(cid, 0)
                     if next_idx < len(self.rung_prices):
                         rung_price = self.rung_prices[next_idx]
+                        # Min-move filter scaled to rung price.
+                        if not self._check_min_move(cid, outcome, rung_price):
+                            continue
                         # Skip if rung would cross the book (post-only rejection)
                         if ask is not None and rung_price >= ask:
                             continue
