@@ -968,6 +968,7 @@ class CryptoTDMaker:
                 if now > slot_end + 300:  # 5 min grace for resolution
                     to_remove.append(cid)
 
+        actually_removed: list[str] = []
         for cid in to_remove:
             # Cancel ALL remaining orders for this market (supports ladder).
             oids_to_cancel = [oid for oid, o in self.active_orders.items()
@@ -988,7 +989,12 @@ class CryptoTDMaker:
             # Settle position if held.
             pos = self.positions.pop(cid, None)
             if pos:
-                await self._settle_position(pos, now)
+                settled = await self._settle_position(pos, now)
+                if not settled:
+                    # Deferred — keep market data for retry on next prune cycle
+                    continue
+
+            actually_removed.append(cid)
 
             # Clean up fill count.
             self._cid_fill_count.pop(cid, None)
@@ -1003,85 +1009,133 @@ class CryptoTDMaker:
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
-        if to_remove:
-            logger.info("td_markets_pruned", count=len(to_remove), remaining=len(self.known_markets))
+        if actually_removed:
+            logger.info("td_markets_pruned", count=len(actually_removed), remaining=len(self.known_markets))
 
         # Settle orphaned positions whose markets are no longer known
         # (e.g. loaded from DB after restart, but the 15-min slot expired).
         orphan_cids = [cid for cid in self.positions if cid not in self.known_markets]
         for cid in orphan_cids:
             pos = self.positions.pop(cid)
-            logger.warning("td_orphan_position_settled", condition_id=cid[:16], outcome=pos.outcome)
+            logger.warning("td_orphan_position_settling", condition_id=cid[:16], outcome=pos.outcome)
             await self._settle_position(pos, now)
 
     async def _query_resolution(self, pos: OpenPosition) -> Optional[bool]:
-        """Query Gamma API for actual market resolution.
+        """Query Gamma/CLOB API for actual market resolution.
 
         Returns True if the token resolved to 1, False if 0, None if unknown.
+        Tries Gamma event slug first, then CLOB condition_id as fallback.
         """
+        if not self._http_client:
+            return None
+
+        # --- Attempt 1: Gamma API via event slug ---
         GAMMA_URL = "https://gamma-api.polymarket.com"
         slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
 
-        if not self._http_client or not slug:
-            return None
+        if slug:
+            try:
+                resp = await self._http_client.get(
+                    f"{GAMMA_URL}/events",
+                    params={"slug": slug},
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    events = resp.json()
+                    if events:
+                        mkt = events[0].get("markets", [{}])[0]
+                        outcome_prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
+                        outcomes_raw = json.loads(mkt.get("outcomes", "[]"))
 
+                        for i, outcome in enumerate(outcomes_raw):
+                            if outcome == pos.outcome and i < len(outcome_prices_raw):
+                                price = float(outcome_prices_raw[i])
+                                if price >= 0.9:
+                                    return True
+                                if price <= 0.1:
+                                    return False
+            except Exception as exc:
+                logger.warning(
+                    "gamma_resolution_failed",
+                    condition_id=pos.condition_id[:16],
+                    slug=slug,
+                    error=str(exc)[:60],
+                )
+
+        # --- Attempt 2: CLOB API via condition_id (works for orphans too) ---
+        CLOB_URL = settings.POLYMARKET_CLOB_HTTP
         try:
             resp = await self._http_client.get(
-                f"{GAMMA_URL}/events",
-                params={"slug": slug},
+                f"{CLOB_URL}/markets/{pos.condition_id}",
                 timeout=10.0,
             )
-            if resp.status_code != 200:
-                return None
-            events = resp.json()
-            if not events:
-                return None
-
-            mkt = events[0].get("markets", [{}])[0]
-            outcome_prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
-            outcomes_raw = json.loads(mkt.get("outcomes", "[]"))
-
-            for i, outcome in enumerate(outcomes_raw):
-                if outcome == pos.outcome and i < len(outcome_prices_raw):
-                    price = float(outcome_prices_raw[i])
-                    # Resolved prices are ~0 or ~1; only trust if clearly resolved
-                    if price >= 0.9:
-                        return True
-                    if price <= 0.1:
-                        return False
+            if resp.status_code == 200:
+                mkt_data = resp.json()
+                # CLOB returns tokens array with outcome + price
+                tokens = mkt_data.get("tokens", [])
+                for tok in tokens:
+                    if tok.get("outcome") == pos.outcome:
+                        price = float(tok.get("price", 0.5))
+                        if price >= 0.9:
+                            return True
+                        if price <= 0.1:
+                            return False
         except Exception as exc:
             logger.warning(
-                "gamma_resolution_failed",
+                "clob_resolution_failed",
                 condition_id=pos.condition_id[:16],
-                slug=slug,
                 error=str(exc)[:60],
             )
+
         return None
 
-    async def _settle_position(self, pos: OpenPosition, now: float) -> None:
-        """Determine win/loss from Gamma API resolution (bid fallback).
+    async def _settle_position(self, pos: OpenPosition, now: float, *, allow_defer: bool = True) -> bool:
+        """Determine win/loss from Gamma/CLOB API resolution.
 
         BUY: won if token resolves to 1, pnl = shares * (1 - entry)
         SELL: won if token resolves to 0, pnl = shares * entry
+
+        Returns True if settled, False if deferred (resolution unknown).
         """
-        # Primary: query Gamma API for actual resolved outcome prices
+        # Primary: query APIs for actual resolved outcome prices
         resolution = await self._query_resolution(pos)
 
         if resolution is not None:
             token_resolved_1 = resolution
         else:
-            # Fallback: last book state (unreliable — logged as warning)
+            # Fallback: last book state — only trust clear signals (bid >= 0.9 or <= 0.1)
             bid, _, _, _ = self.polymarket.get_best_levels(pos.condition_id, pos.outcome)
             if bid is None:
                 bid = self._last_bids.get((pos.condition_id, pos.outcome))
-            token_resolved_1 = bid is not None and bid >= 0.5
-            logger.warning(
-                "td_settle_fallback_bid",
-                condition_id=pos.condition_id[:16],
-                outcome=pos.outcome,
-                bid=bid,
-                resolved_1=token_resolved_1,
-            )
+
+            if bid is not None and bid >= 0.9:
+                token_resolved_1 = True
+            elif bid is not None and bid <= 0.1:
+                token_resolved_1 = False
+            else:
+                # Cannot determine resolution — defer settlement
+                age_min = (now - pos.filled_at) / 60
+                if allow_defer and age_min < 60:
+                    logger.warning(
+                        "td_settle_deferred",
+                        condition_id=pos.condition_id[:16],
+                        outcome=pos.outcome,
+                        bid=bid,
+                        age_min=round(age_min, 1),
+                    )
+                    # Put position back so next prune cycle retries
+                    self.positions[pos.condition_id] = pos
+                    return False
+                # Too old to defer — force settle using bid if available, else loss
+                token_resolved_1 = bid is not None and bid >= 0.5
+                logger.error(
+                    "td_settle_forced_unknown",
+                    condition_id=pos.condition_id[:16],
+                    outcome=pos.outcome,
+                    bid=bid,
+                    resolved_1=token_resolved_1,
+                    age_min=round(age_min, 1),
+                )
 
         if pos.side == "BUY":
             won = token_resolved_1
@@ -1124,12 +1178,13 @@ class CryptoTDMaker:
         # Use record_settle_direct with explicit pnl to handle both BUY/SELL correctly.
         if self.manager:
             slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
+            resolution_price = 1.0 if token_resolved_1 else 0.0
             settle_intent = TradeIntent(
                 condition_id=pos.condition_id,
                 token_id=pos.token_id,
                 outcome=pos.outcome,
                 side="SELL" if pos.side == "BUY" else "BUY",
-                price=1.0 if token_resolved_1 else 0.0,
+                price=pos.entry_price,
                 size_usd=pos.size_usd,
                 reason="settlement",
                 title=slug,
@@ -1138,7 +1193,7 @@ class CryptoTDMaker:
             settle_fill = FillResult(
                 filled=True,
                 shares=pos.shares,
-                avg_price=1.0 if token_resolved_1 else 0.0,
+                avg_price=resolution_price,
                 pnl_delta=pnl,
             )
             try:
@@ -1148,6 +1203,8 @@ class CryptoTDMaker:
                 ))
             except RuntimeError:
                 pass
+
+        return True
 
     # ------------------------------------------------------------------
     # Run

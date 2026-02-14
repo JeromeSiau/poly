@@ -640,21 +640,23 @@ class PolymarketUserFeed:
             backoff = min(backoff * 2, self.RECONNECT_MAX)
 
     async def _resubscribe_all(self) -> None:
-        """Re-authenticate and re-subscribe all markets after reconnect."""
-        if not self._subscribed_markets or not self._ws:
+        """Authenticate (required) and re-subscribe all markets after connect/reconnect."""
+        if not self._ws:
             return
-        market_ids = list(self._subscribed_markets)
-        msg = json.dumps({
-            "markets": market_ids,
+        # Always send auth — server closes unauthenticated connections quickly.
+        market_ids = list(self._subscribed_markets) if self._subscribed_markets else []
+        msg: dict[str, Any] = {
             "type": "user",
             "auth": {
                 "apiKey": self._api_key,
                 "secret": self._api_secret,
                 "passphrase": self._api_passphrase,
             },
-        })
-        await self._ws.send(msg)
-        logger.info("user_ws_resubscribed", markets=len(market_ids))
+        }
+        if market_ids:
+            msg["markets"] = market_ids
+        await self._ws.send(json.dumps(msg))
+        logger.info("user_ws_authenticated", markets=len(market_ids))
 
     async def subscribe_markets(self, market_ids: list[str]) -> None:
         """Subscribe to trade/order events for condition IDs.
@@ -701,7 +703,7 @@ class PolymarketUserFeed:
             try:
                 await asyncio.sleep(self.PING_INTERVAL)
                 if self._ws:
-                    await self._ws.send("PING")
+                    await self._ws.ping()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
