@@ -141,12 +141,20 @@ section[data-testid="stSidebar"] .stMultiSelect > label {
     color: #64748b;
 }
 
-/* KPI cards */
+/* KPI cards — equal height */
 [data-testid="stMetric"] {
     background: #111827;
     border: 1px solid #1e2a3a;
     border-radius: 8px;
     padding: 14px 18px 12px;
+    min-height: 100px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+[data-testid="column"] {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
 }
 [data-testid="stMetricLabel"] {
     font-family: 'JetBrains Mono', monospace !important;
@@ -164,28 +172,6 @@ section[data-testid="stSidebar"] .stMultiSelect > label {
 [data-testid="stMetricDelta"] {
     font-family: 'JetBrains Mono', monospace !important;
     font-size: 0.7rem !important;
-}
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 0;
-    border-bottom: 1px solid #1e2a3a;
-}
-.stTabs [data-baseweb="tab"] {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: #64748b;
-    border: none;
-    border-bottom: 2px solid transparent;
-    padding: 10px 24px;
-    background: transparent;
-}
-.stTabs [aria-selected="true"] {
-    color: #38bdf8 !important;
-    border-bottom: 2px solid #38bdf8 !important;
-    background: transparent !important;
 }
 
 /* Divider */
@@ -338,125 +324,145 @@ st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# Charts + Positions
+# Cumulative PnL
 # ---------------------------------------------------------------------------
 
 @st.fragment(run_every="15s")
-def charts_section():
+def pnl_chart_section():
     m = st.session_state.get("mode", "Live").lower()
     h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
 
-    tab_pnl, tab_dist, tab_open = st.tabs(["Cumulative PnL", "Trade Distribution", "Open Positions"])
+    st.markdown('<p class="section-label">Cumulative PnL</p>', unsafe_allow_html=True)
 
-    # -- Cumulative PnL --
-    with tab_pnl:
-        winrate_data = _api("/winrate", {"mode": m, "hours": h})
-        markets = winrate_data.get("markets", [])
+    winrate_data = _api("/winrate", {"mode": m, "hours": h})
+    markets = winrate_data.get("markets", [])
 
-        if not markets:
-            st.caption("No resolved trades yet")
-            return
+    if not markets:
+        st.caption("No resolved trades yet")
+        return
 
-        rows = []
-        for mk in markets:
-            ts_val = mk.get("timestamp")
-            if ts_val is None:
-                continue
-            if isinstance(ts_val, (int, float)):
-                dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
-            else:
-                dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
-            rows.append({"time": dt, "pnl": mk["pnl"], "status": mk.get("status", "")})
+    rows = []
+    for mk in markets:
+        ts_val = mk.get("timestamp")
+        if ts_val is None:
+            continue
+        if isinstance(ts_val, (int, float)):
+            dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
+        rows.append({"time": dt, "pnl": mk["pnl"], "status": mk.get("status", "")})
 
-        if not rows:
-            st.caption("No timestamped data")
-            return
+    if not rows:
+        return
 
-        df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
-        df["cum_pnl"] = df["pnl"].cumsum()
+    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+    df["cum_pnl"] = df["pnl"].cumsum()
 
-        # Area chart with gradient fill
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df["time"], y=df["cum_pnl"],
-            mode="lines",
-            line=dict(color=C_GREEN if df["cum_pnl"].iloc[-1] >= 0 else C_RED, width=1.5),
-            fill="tozeroy",
-            fillcolor=f"rgba(52,211,153,0.08)" if df["cum_pnl"].iloc[-1] >= 0 else "rgba(248,113,113,0.08)",
-            hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<extra></extra>",
-        ))
-        # Zero line
-        fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
-        fig.update_layout(**_plotly_layout(height=320))
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    final_pnl = df["cum_pnl"].iloc[-1]
+    color = C_GREEN if final_pnl >= 0 else C_RED
+    fill = "rgba(52,211,153,0.08)" if final_pnl >= 0 else "rgba(248,113,113,0.08)"
 
-    # -- Trade Distribution --
-    with tab_dist:
-        if not rows:
-            st.caption("No data")
-            return
-
-        win_pnls = [r["pnl"] for r in rows if r["status"] == "WIN"]
-        loss_pnls = [r["pnl"] for r in rows if r["status"] == "LOSS"]
-
-        fig2 = go.Figure()
-        if win_pnls:
-            fig2.add_trace(go.Bar(
-                x=list(range(len(win_pnls))), y=win_pnls,
-                marker_color=C_GREEN, marker_line_width=0,
-                name="Win", opacity=0.85,
-                hovertemplate="$%{y:+.2f}<extra>Win</extra>",
-            ))
-        if loss_pnls:
-            fig2.add_trace(go.Bar(
-                x=list(range(len(win_pnls), len(win_pnls) + len(loss_pnls))), y=loss_pnls,
-                marker_color=C_RED, marker_line_width=0,
-                name="Loss", opacity=0.85,
-                hovertemplate="$%{y:+.2f}<extra>Loss</extra>",
-            ))
-
-        fig2.update_layout(**_plotly_layout(
-            height=220,
-            showlegend=False,
-            xaxis=dict(gridcolor=C_GRID, zerolinecolor=C_GRID, showticklabels=False),
-            bargap=0.15,
-        ))
-        fig2.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
-        st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
-
-        # Win/Loss summary
-        avg_w = sum(win_pnls) / len(win_pnls) if win_pnls else 0
-        avg_l = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0
-        st.caption(
-            f"{len(win_pnls)} wins (avg ${avg_w:+.2f})  /  "
-            f"{len(loss_pnls)} losses (avg ${avg_l:+.2f})"
-        )
-
-    # -- Open Positions --
-    with tab_open:
-        open_data = _api("/trades", {"mode": m, "is_open": "true", "hours": 2})
-        trades = [t for t in open_data.get("trades", []) if not _is_stale_position(t)]
-
-        if not trades:
-            st.caption("No active positions")
-            return
-
-        odf = pd.DataFrame(trades)
-        for tag, group in odf.groupby("strategy_tag", sort=True):
-            st.markdown(f'<p class="section-label">{tag}</p>', unsafe_allow_html=True)
-            display = pd.DataFrame({
-                "Market": group["title"],
-                "Side": group["outcome"],
-                "Entry": group["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
-                "Size": group["size"].apply(lambda x: f"${x:.2f}" if x is not None else ""),
-                "Age": group["timestamp"].apply(_humanize_age),
-            })
-            st.dataframe(display, use_container_width=True, hide_index=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["time"], y=df["cum_pnl"],
+        mode="lines",
+        line=dict(color=color, width=1.5),
+        fill="tozeroy", fillcolor=fill,
+        hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+    fig.update_layout(**_plotly_layout(height=300))
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
-charts_section()
+pnl_chart_section()
 
-st.markdown('<div style="height: 4px"></div>', unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Hourly PnL
+# ---------------------------------------------------------------------------
+
+@st.fragment(run_every="15s")
+def hourly_pnl_section():
+    m = st.session_state.get("mode", "Live").lower()
+    h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+
+    st.markdown('<p class="section-label">PnL by Hour</p>', unsafe_allow_html=True)
+
+    winrate_data = _api("/winrate", {"mode": m, "hours": h})
+    markets = winrate_data.get("markets", [])
+
+    if not markets:
+        st.caption("No data")
+        return
+
+    rows = []
+    for mk in markets:
+        ts_val = mk.get("timestamp")
+        if ts_val is None:
+            continue
+        if isinstance(ts_val, (int, float)):
+            dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
+        rows.append({"time": dt, "pnl": mk["pnl"]})
+
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows)
+    df["hour"] = df["time"].dt.floor("h")
+    hourly = df.groupby("hour").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
+
+    colors = [C_GREEN if p >= 0 else C_RED for p in hourly["pnl"]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=hourly["hour"], y=hourly["pnl"],
+        marker_color=colors, marker_line_width=0,
+        opacity=0.85,
+        hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<br>%{customdata} trades<extra></extra>",
+        customdata=hourly["trades"],
+    ))
+    fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+    fig.update_layout(**_plotly_layout(height=220))
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+hourly_pnl_section()
+
+
+# ---------------------------------------------------------------------------
+# Open Positions
+# ---------------------------------------------------------------------------
+
+@st.fragment(run_every="15s")
+def open_positions_section():
+    m = st.session_state.get("mode", "Live").lower()
+
+    open_data = _api("/trades", {"mode": m, "is_open": "true", "hours": 2})
+    trades = [t for t in open_data.get("trades", []) if not _is_stale_position(t)]
+
+    st.markdown('<p class="section-label">Open Positions</p>', unsafe_allow_html=True)
+
+    if not trades:
+        st.caption("No active positions")
+        return
+
+    odf = pd.DataFrame(trades)
+    for tag, group in odf.groupby("strategy_tag", sort=True):
+        st.caption(tag)
+        display = pd.DataFrame({
+            "Market": group["title"],
+            "Side": group["outcome"],
+            "Entry": group["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+            "Size": group["size"].apply(lambda x: f"${x:.2f}" if x is not None else ""),
+            "Age": group["timestamp"].apply(_humanize_age),
+        })
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+open_positions_section()
 
 
 # ---------------------------------------------------------------------------
