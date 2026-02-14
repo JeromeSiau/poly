@@ -481,6 +481,9 @@ class CryptoTDMaker:
                     next_idx = self._cid_fill_count.get(cid, 0)
                     if next_idx < len(self.rung_prices):
                         rung_price = self.rung_prices[next_idx]
+                        # Skip if rung would cross the book (post-only rejection)
+                        if ask is not None and rung_price >= ask:
+                            continue
                         rung_key = (cid, outcome, int(round(rung_price * 100)))
                         if rung_key not in self._rung_placed:
                             place_intents.append((cid, outcome, token_id, rung_price, "BUY"))

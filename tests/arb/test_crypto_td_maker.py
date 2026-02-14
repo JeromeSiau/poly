@@ -301,8 +301,8 @@ class TestSequentialLadder:
     @pytest.mark.asyncio
     async def test_second_rung_after_first_fill(self):
         """After rung[0] fills (fill_count=1), rung[1] (0.85) should be placed."""
-        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
-                                     bid_down=0.80, ask_down=0.82)
+        feed = _make_feed_both_sides(CID, bid_up=0.12, ask_up=0.14,
+                                     bid_down=0.80, ask_down=0.88)
         maker = _make_ladder_maker(feed, ladder_rungs=2)
 
         # Simulate first rung already filled.
@@ -340,8 +340,8 @@ class TestSequentialLadder:
     @pytest.mark.asyncio
     async def test_five_rungs_sequential_order(self):
         """With 5 rungs, each tick places only the next unfilled rung."""
-        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
-                                     bid_down=0.80, ask_down=0.82)
+        feed = _make_feed_both_sides(CID, bid_up=0.12, ask_up=0.14,
+                                     bid_down=0.80, ask_down=0.88)
         maker = _make_ladder_maker(feed, ladder_rungs=5)
         expected_prices = maker.rung_prices  # [0.75, 0.78, 0.80, 0.83, 0.85]
 
