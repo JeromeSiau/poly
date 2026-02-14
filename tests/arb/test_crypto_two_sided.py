@@ -2,6 +2,7 @@ import pytest
 from src.arb.crypto_two_sided import (
     next_slots, compute_edge, compute_sweep,
     MarketPosition, CryptoTwoSidedEngine,
+    SlotScanner, SlotMarket,
 )
 
 
@@ -172,3 +173,42 @@ class TestCryptoTwoSidedEngine:
         resolved = e.cleanup_resolved()
         assert len(resolved) == 1
         assert "0xabc" not in e._positions
+
+
+class TestSlotScanner:
+    def test_parse_market(self):
+        scanner = SlotScanner(["BTCUSDT"], [300])
+        raw = {
+            "conditionId": "0xabc123",
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '["0.45", "0.55"]',
+            "clobTokenIds": '["token_up", "token_down"]',
+            "eventStartTime": "2026-02-14T03:10:00Z",
+            "endDate": "2026-02-14T03:15:00Z",
+        }
+        result = scanner._parse_market(raw, "BTCUSDT", "btc-updown-5m-123")
+        assert result is not None
+        assert result.condition_id == "0xabc123"
+        assert result.token_ids["Up"] == "token_up"
+        assert result.token_ids["Down"] == "token_down"
+        assert result.outcome_prices["Up"] == pytest.approx(0.45)
+
+    def test_parse_missing_fields(self):
+        scanner = SlotScanner(["BTCUSDT"], [300])
+        assert scanner._parse_market({}, "BTCUSDT", "slug") is None
+
+    def test_cleanup_expired(self):
+        scanner = SlotScanner(["BTCUSDT"], [300])
+        scanner._markets["old"] = SlotMarket(
+            condition_id="x", slug="old", symbol="BTCUSDT",
+            event_start=1000, end_time=1100, timeframe=300,
+            token_ids={}, outcome_prices={},
+        )
+        scanner._markets["fresh"] = SlotMarket(
+            condition_id="y", slug="fresh", symbol="BTCUSDT",
+            event_start=9000, end_time=9200, timeframe=300,
+            token_ids={}, outcome_prices={},
+        )
+        scanner._cleanup_expired(9300)
+        assert "old" not in scanner._markets
+        assert "fresh" in scanner._markets

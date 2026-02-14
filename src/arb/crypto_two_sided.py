@@ -182,3 +182,130 @@ class CryptoTwoSidedEngine:
         for p in resolved:
             del self._positions[p.condition_id]
         return resolved
+
+
+@dataclass
+class SlotMarket:
+    """A discovered crypto up/down market for a specific time slot."""
+    condition_id: str
+    slug: str
+    symbol: str
+    event_start: float
+    end_time: float
+    timeframe: int
+    token_ids: dict[str, str]
+    outcome_prices: dict[str, float]
+
+
+class SlotScanner:
+    """Discovers crypto up/down markets by polling Gamma API by slug."""
+
+    CLEANUP_GRACE_S = 120
+
+    def __init__(
+        self,
+        symbols: list[str],
+        timeframes: list[int],
+        gamma_url: str = "https://gamma-api.polymarket.com",
+    ) -> None:
+        self._symbols = symbols
+        self._timeframes = timeframes
+        self._gamma_url = gamma_url
+        self._markets: dict[str, SlotMarket] = {}
+
+    @property
+    def markets(self) -> dict[str, SlotMarket]:
+        return dict(self._markets)
+
+    async def discover_slot(self, slug: str, symbol: str, timeframe: int) -> Optional[SlotMarket]:
+        import aiohttp
+        if slug in self._markets:
+            return self._markets[slug]
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self._gamma_url}/events?slug={slug}"
+                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                                       timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        return None
+                    events = await resp.json()
+                    if not events:
+                        return None
+                    mkt_data = events[0].get("markets", [])
+                    if not mkt_data:
+                        return None
+                    market = self._parse_market(mkt_data[0], symbol, slug)
+                    if market:
+                        self._markets[slug] = market
+                    return market
+        except Exception as e:
+            logger.debug("slot_discover_error", slug=slug, error=str(e))
+            return None
+
+    def _parse_market(self, mkt: dict[str, Any], symbol: str, slug: str) -> Optional[SlotMarket]:
+        try:
+            condition_id = mkt.get("conditionId", "")
+            outcomes = json.loads(mkt.get("outcomes", "[]"))
+            prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
+            token_ids_raw = json.loads(mkt.get("clobTokenIds", "[]"))
+            if len(outcomes) < 2 or len(token_ids_raw) < 2:
+                return None
+            token_ids = {outcomes[i]: token_ids_raw[i] for i in range(2)}
+            outcome_prices = {
+                outcomes[i]: float(prices_raw[i]) if i < len(prices_raw) else 0.0
+                for i in range(2)
+            }
+            event_start = self._parse_iso(mkt.get("eventStartTime") or mkt.get("startDate", ""))
+            end_time = self._parse_iso(mkt.get("endDate", ""))
+            if not event_start or not end_time:
+                return None
+            tf = int(end_time - event_start)
+            return SlotMarket(
+                condition_id=condition_id, slug=slug, symbol=symbol,
+                event_start=event_start, end_time=end_time, timeframe=tf,
+                token_ids=token_ids, outcome_prices=outcome_prices,
+            )
+        except Exception as e:
+            logger.debug("parse_market_error", slug=slug, error=str(e))
+            return None
+
+    @staticmethod
+    def _parse_iso(iso_str: str) -> Optional[float]:
+        if not iso_str:
+            return None
+        try:
+            iso_str = iso_str.replace("Z", "+00:00")
+            return datetime.fromisoformat(iso_str).timestamp()
+        except ValueError:
+            return None
+
+    def _cleanup_expired(self, now: float) -> None:
+        expired = [slug for slug, m in self._markets.items()
+                   if m.end_time < now - self.CLEANUP_GRACE_S]
+        for slug in expired:
+            del self._markets[slug]
+
+    async def refresh_prices(self, slug: str) -> Optional[SlotMarket]:
+        import aiohttp
+        market = self._markets.get(slug)
+        if not market:
+            return None
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self._gamma_url}/events?slug={slug}"
+                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                                       timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        return market
+                    events = await resp.json()
+                    if not events:
+                        return market
+                    mkt = events[0].get("markets", [{}])[0]
+                    prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
+                    outcomes = json.loads(mkt.get("outcomes", "[]"))
+                    for i, outcome in enumerate(outcomes):
+                        if i < len(prices_raw):
+                            market.outcome_prices[outcome] = float(prices_raw[i])
+        except Exception as e:
+            logger.debug("refresh_prices_error", slug=slug, error=str(e))
+        return market
