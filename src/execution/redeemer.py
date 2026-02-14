@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import requests
 import structlog
 
 from config.settings import settings
@@ -24,6 +25,8 @@ except ImportError:
     BuilderApiKeyCreds = None  # type: ignore[assignment,misc]
     PolyWeb3Service = None  # type: ignore[assignment,misc]
     RELAYER_URL = ""
+
+POSITIONS_API = "https://data-api.polymarket.com/positions"
 
 
 class PolymarketRedeemer:
@@ -71,8 +74,39 @@ class PolymarketRedeemer:
         logger.info("redeemer_initialized", wallet=settings.POLYMARKET_WALLET_ADDRESS)
         return cls(service)
 
+    @staticmethod
+    def _fetch_redeemable(wallet: str) -> list[dict[str, Any]]:
+        """Fetch all redeemable positions without the broken percentPnl filter.
+
+        poly_web3's fetch_positions filters on ``percentPnl > 0`` which
+        silently drops losing positions (they still need redeeming to free
+        collateral) and crashes on ``None`` values.  We call the API directly.
+        """
+        params = {
+            "user": wallet,
+            "sizeThreshold": 1,
+            "limit": 100,
+            "redeemable": True,
+            "sortBy": "RESOLVING",
+            "sortDirection": "DESC",
+        }
+        resp = requests.get(POSITIONS_API, params=params, timeout=30)
+        resp.raise_for_status()
+        positions = resp.json()
+        logger.info(
+            "fetch_redeemable",
+            total=len(positions),
+            winning=sum(1 for p in positions if (p.get("percentPnl") or 0) > 0),
+            losing=sum(1 for p in positions if (p.get("percentPnl") or 0) <= 0),
+        )
+        return positions
+
     def _redeem_all_sync(self, batch_size: int = 10) -> list[dict[str, Any]]:
-        results = self._service.redeem_all(batch_size=batch_size)
+        wallet = self._service._resolve_user_address()
+        positions = self._fetch_redeemable(wallet)
+        if not positions:
+            return []
+        results = self._service._redeem_from_positions(positions, batch_size)
         out: list[dict[str, Any]] = []
         for r in results:
             if r is None:
