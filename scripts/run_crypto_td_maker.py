@@ -244,11 +244,22 @@ class CryptoTDMaker:
                 self._position_order_ids[row.condition_id] = row.order_id
         if stale_count:
             logger.info("td_stale_orders_cleaned", count=stale_count)
+
+        # Restore ladder state from loaded DB rows.
+        for cid, pos in self.positions.items():
+            # Each restored filled position counts as one ladder fill.
+            self._cid_fill_count[cid] = self._cid_fill_count.get(cid, 0) + 1
+        for oid, order in self.active_orders.items():
+            # Restore rung dedup for pending orders.
+            self._rung_placed.add(
+                (order.condition_id, order.outcome, int(round(order.price * 100))))
+
         if self.active_orders or self.positions:
             logger.info(
                 "td_db_state_loaded",
                 orders=len(self.active_orders),
                 positions=len(self.positions),
+                fill_counts=dict(self._cid_fill_count),
             )
 
     def _db_fire(self, coro) -> None:
