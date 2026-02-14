@@ -155,9 +155,12 @@ def balance(
 ) -> dict:
     """Return current balance for paper or live mode."""
     if mode == "live":
-        from src.arb.polymarket_executor import PolymarketExecutor
-        bal = PolymarketExecutor()._get_balance_sync()
-        return {"balance": bal, "mode": "live"}
+        try:
+            from src.arb.polymarket_executor import PolymarketExecutor
+            bal = PolymarketExecutor()._get_balance_sync()
+            return {"balance": round(bal, 2), "mode": "live"}
+        except Exception:
+            return {"balance": 0.0, "mode": "live", "error": "Could not fetch on-chain balance"}
 
     # Paper: starting capital + sum of closed paper-mode pnl
     session = get_sync_session(DB_URL)
