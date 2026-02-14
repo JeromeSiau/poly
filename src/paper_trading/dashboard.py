@@ -200,10 +200,16 @@ section[data-testid="stSidebar"] .stMultiSelect > label {
     font-size: 0.7rem !important;
 }
 
-/* Tabs */
+/* Tabs — single bottom border only */
 .stTabs [data-baseweb="tab-list"] {
     gap: 0;
-    border-bottom: 1px solid #1e2a3a;
+    border-bottom: 1px solid #1e2a3a !important;
+}
+.stTabs [data-baseweb="tab-highlight"] {
+    display: none !important;
+}
+.stTabs [data-baseweb="tab-border"] {
+    display: none !important;
 }
 .stTabs [data-baseweb="tab"] {
     font-family: 'JetBrains Mono', monospace;
@@ -212,7 +218,7 @@ section[data-testid="stSidebar"] .stMultiSelect > label {
     letter-spacing: 1.5px;
     color: #64748b;
     padding: 8px 24px;
-    border: none;
+    border: none !important;
     background: transparent;
 }
 .stTabs [aria-selected="true"] {
@@ -687,6 +693,7 @@ with tab_analysis:
                             lambda r: f"{int(r['count'])} ({r['count']/total_slots*100:.0f}%)", axis=1
                         ),
                         textposition="outside",
+                        cliponaxis=False,
                         textfont=dict(size=10),
                         hovertemplate="%{x}<br>%{y} slots<extra></extra>",
                     ))
@@ -722,6 +729,7 @@ with tab_analysis:
                             lambda r: f"${r['avg_pnl']:+.2f}", axis=1
                         ),
                         textposition="outside",
+                        cliponaxis=False,
                         textfont=dict(size=10),
                         hovertemplate="%{x}<br>Avg: $%{y:+.2f}<br>Total: $%{customdata[0]:+.2f}<br>%{customdata[1]} slots<extra></extra>",
                         customdata=pnl_by_pattern[["total_pnl", "count"]].values,
@@ -785,6 +793,7 @@ with tab_analysis:
                             lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
                         ),
                         textposition="outside",
+                        cliponaxis=False,
                         textfont=dict(size=10),
                         hovertemplate="%{x}<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
                         customdata=grouped[["wins", "total"]].values,
@@ -823,6 +832,7 @@ with tab_analysis:
                             lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
                         ),
                         textposition="outside",
+                        cliponaxis=False,
                         textfont=dict(size=10),
                         hovertemplate="%{x} min<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
                         customdata=grouped_t[["wins", "total"]].values,
