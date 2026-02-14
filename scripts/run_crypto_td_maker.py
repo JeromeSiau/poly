@@ -404,16 +404,10 @@ class CryptoTDMaker:
         now = time.time()
         self._cycle_count += 1
 
-        # Sync book freshness from the feed itself (not gated behind guard).
-        # This prevents a chicken-and-egg deadlock where the guard blocks the
-        # code that would update _last_book_update after a WS reconnection.
+        # Sync book freshness from the feed (not gated behind guard).
         feed_ts = self.polymarket.last_update_ts
-        if feed_ts > 0:
-            # last_update_ts is monotonic; convert to wall-clock offset.
-            mono_age = time.monotonic() - feed_ts
-            wall_ts = now - mono_age
-            if wall_ts > self._last_book_update:
-                self._last_book_update = wall_ts
+        if feed_ts > self._last_book_update:
+            self._last_book_update = feed_ts
 
         # Expire stale pending cancels (>30s since cancel was sent).
         stale_cancel_ids = [

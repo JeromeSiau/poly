@@ -24,6 +24,8 @@ try:
 except ImportError:
     _json_loads = json.loads
 
+import os
+
 import structlog
 import websockets
 
@@ -155,7 +157,7 @@ class PolymarketFeed(BaseFeed):
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL, proxy=None)
+                self._ws = await websockets.connect(self.WS_URL, proxy=os.environ.get("HTTPS_PROXY") or None)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("polymarket_ws_connected")
@@ -476,7 +478,7 @@ class PolymarketFeed(BaseFeed):
             asks[0][0] if asks else None,
             asks[0][1] if asks else None,
         )
-        self.last_update_ts = time.monotonic()
+        self.last_update_ts = time.time()
         self.book_updated.set()
 
     def _merge_levels(
@@ -620,7 +622,7 @@ class PolymarketUserFeed:
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL, proxy=None)
+                self._ws = await websockets.connect(self.WS_URL, proxy=os.environ.get("HTTPS_PROXY") or None)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("user_ws_connected")

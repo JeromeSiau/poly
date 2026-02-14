@@ -158,7 +158,7 @@ async def slot_loop(
 
             # Risk check
             if not await guard.is_trading_allowed(
-                last_book_update=feed.last_update_ts or time.monotonic()
+                last_book_update=feed.last_update_ts or time.time()
             ):
                 logger.info("trading_blocked_by_guard", slug=slug)
                 continue

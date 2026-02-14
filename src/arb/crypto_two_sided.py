@@ -222,7 +222,7 @@ class SlotScanner:
         if slug in self._markets:
             return self._markets[slug]
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=True) as session:
                 url = f"{self._gamma_url}/events?slug={slug}"
                 async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
                                        timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -291,7 +291,7 @@ class SlotScanner:
         if not market:
             return None
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=True) as session:
                 url = f"{self._gamma_url}/events?slug={slug}"
                 async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
                                        timeout=aiohttp.ClientTimeout(total=5)) as resp:
