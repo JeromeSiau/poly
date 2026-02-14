@@ -13,6 +13,7 @@ token IDs internally via the ``token_map`` passed to ``subscribe_market()``.
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -111,6 +112,8 @@ class PolymarketFeed(BaseFeed):
         # Event signaled on every book update (for event-driven consumers).
         self.book_updated: asyncio.Event = asyncio.Event()
         self._shutdown = False
+        # Timestamp of the last book data received (for staleness checks).
+        self.last_update_ts: float = 0.0
 
     async def connect(self) -> None:
         """Start the auto-reconnecting connection loop."""
@@ -473,6 +476,7 @@ class PolymarketFeed(BaseFeed):
             asks[0][0] if asks else None,
             asks[0][1] if asks else None,
         )
+        self.last_update_ts = time.monotonic()
         self.book_updated.set()
 
     def _merge_levels(

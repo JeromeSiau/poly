@@ -376,6 +376,17 @@ class CryptoTDMaker:
         now = time.time()
         self._cycle_count += 1
 
+        # Sync book freshness from the feed itself (not gated behind guard).
+        # This prevents a chicken-and-egg deadlock where the guard blocks the
+        # code that would update _last_book_update after a WS reconnection.
+        feed_ts = self.polymarket.last_update_ts
+        if feed_ts > 0:
+            # last_update_ts is monotonic; convert to wall-clock offset.
+            mono_age = time.monotonic() - feed_ts
+            wall_ts = now - mono_age
+            if wall_ts > self._last_book_update:
+                self._last_book_update = wall_ts
+
         # Expire stale pending cancels (>30s since cancel was sent).
         stale_cancel_ids = [
             oid for oid, order in self._pending_cancels.items()
@@ -390,6 +401,9 @@ class CryptoTDMaker:
         if self.guard:
             await self.guard.heartbeat()
             if not await self.guard.is_trading_allowed(last_book_update=self._last_book_update):
+                # Stale escalation: cancel all live orders to avoid adverse fills.
+                if self.guard.should_cancel_orders and self.active_orders:
+                    await self._cancel_all_orders("stale_escalation")
                 # Still check paper fills and settle — just don't place new orders
                 if self.paper_mode:
                     self._check_fills_paper(now)
@@ -846,6 +860,25 @@ class CryptoTDMaker:
             # Keep in _pending_cancels; _fill_listener or expiry will handle it.
             pass
 
+    async def _cancel_all_orders(self, reason: str) -> None:
+        """Cancel every active order (stale escalation / emergency)."""
+        count = len(self.active_orders)
+        for oid in list(self.active_orders):
+            order = self.active_orders.pop(oid)
+            key = (order.condition_id, order.outcome)
+            if self._orders_by_cid_outcome.get(key) == oid:
+                del self._orders_by_cid_outcome[key]
+            self._rung_placed.discard(
+                (order.condition_id, order.outcome, int(round(order.price * 100)))
+            )
+            if not self.paper_mode and self.executor:
+                order.cancelled_at = time.time()
+                self._pending_cancels[oid] = order
+                asyncio.create_task(self._async_cancel(oid))
+            else:
+                self._db_fire(self._db_delete_order(oid))
+        logger.warning("td_all_orders_cancelled", reason=reason, count=count)
+
     async def _fill_listener(self) -> None:
         """Drain fills from WS User channel (live mode real-time detection)."""
         if not self.user_feed:
@@ -1218,6 +1251,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")
     p.add_argument("--cb-max-drawdown", type=float, default=-50.0, help="Circuit breaker: max session drawdown USD")
     p.add_argument("--cb-stale-seconds", type=float, default=30.0, help="Circuit breaker: book staleness threshold")
+    p.add_argument("--cb-stale-cancel", type=float, default=120.0, help="Stale escalation: cancel all orders after N seconds")
+    p.add_argument("--cb-stale-exit", type=float, default=300.0, help="Stale escalation: exit process after N seconds")
     p.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
     return p
 
@@ -1257,6 +1292,8 @@ async def main() -> None:
         max_consecutive_losses=args.cb_max_losses,
         max_drawdown_usd=args.cb_max_drawdown,
         stale_seconds=args.cb_stale_seconds,
+        stale_cancel_seconds=args.cb_stale_cancel,
+        stale_exit_seconds=args.cb_stale_exit,
         daily_loss_limit_usd=args.cb_daily_limit,
         telegram_alerter=manager._alerter,
     )

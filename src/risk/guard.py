@@ -77,6 +77,8 @@ class RiskGuard:
         max_consecutive_losses: int = 5,
         max_drawdown_usd: float = -50.0,
         stale_seconds: float = 30.0,
+        stale_cancel_seconds: float = 120.0,
+        stale_exit_seconds: float = 300.0,
         daily_loss_limit_usd: float = -200.0,
         telegram_alerter: Optional[object] = None,
     ) -> None:
@@ -85,6 +87,8 @@ class RiskGuard:
         self.max_consecutive_losses = max_consecutive_losses
         self.max_drawdown_usd = max_drawdown_usd
         self.stale_seconds = stale_seconds
+        self.stale_cancel_seconds = stale_cancel_seconds
+        self.stale_exit_seconds = stale_exit_seconds
         self.daily_loss_limit_usd = daily_loss_limit_usd
         self._alerter = telegram_alerter
 
@@ -95,6 +99,10 @@ class RiskGuard:
         self.circuit_broken: bool = False
         self.circuit_reason: str = ""
         self._alert_sent: bool = False
+        self._last_stale_log: float = 0.0
+        # Stale escalation state (reset when book recovers).
+        self.should_cancel_orders: bool = False
+        self._stale_cancel_alerted: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -206,6 +214,11 @@ class RiskGuard:
 
         * Circuit broken  ->  ``False`` (permanent until restart).
         * Stale book      ->  ``False`` (temporary — not a circuit break).
+          - ``> stale_seconds`` (30s default): block new orders.
+          - ``> stale_cancel_seconds`` (120s): set ``should_cancel_orders``
+            flag so the caller can pull live orders. Sends Telegram alert.
+          - ``> stale_exit_seconds`` (300s): raise ``SystemExit`` so the
+            process supervisor restarts the strategy cleanly.
         * Global halt     ->  ``False`` (circuit break).
         * Otherwise       ->  ``True``.
         """
@@ -213,14 +226,53 @@ class RiskGuard:
             return False
 
         now = time.time()
-        if now - last_book_update > self.stale_seconds:
-            logger.warning(
-                "book_stale",
-                strategy_tag=self.strategy_tag,
-                age_s=round(now - last_book_update, 1),
-                threshold_s=self.stale_seconds,
-            )
+        stale_age = now - last_book_update
+
+        if stale_age > self.stale_seconds:
+            # --- Escalation 3: exit process for clean restart ---
+            if self.stale_exit_seconds > 0 and stale_age > self.stale_exit_seconds:
+                logger.error(
+                    "stale_exit",
+                    strategy_tag=self.strategy_tag,
+                    age_s=round(stale_age, 0),
+                    threshold_s=self.stale_exit_seconds,
+                )
+                await self._send_stale_alert(
+                    f"STALE EXIT: book stale {stale_age:.0f}s, killing process"
+                )
+                raise SystemExit(1)
+
+            # --- Escalation 2: signal caller to cancel live orders ---
+            if self.stale_cancel_seconds > 0 and stale_age > self.stale_cancel_seconds:
+                if not self._stale_cancel_alerted:
+                    self._stale_cancel_alerted = True
+                    self.should_cancel_orders = True
+                    logger.warning(
+                        "stale_cancel_orders",
+                        strategy_tag=self.strategy_tag,
+                        age_s=round(stale_age, 0),
+                        threshold_s=self.stale_cancel_seconds,
+                    )
+                    await self._send_stale_alert(
+                        f"STALE: book stale {stale_age:.0f}s, cancelling orders"
+                    )
+
+            # --- Escalation 1: block new orders (rate-limited log) ---
+            if now - self._last_stale_log >= 30.0:
+                self._last_stale_log = now
+                logger.warning(
+                    "book_stale",
+                    strategy_tag=self.strategy_tag,
+                    age_s=round(stale_age, 1),
+                    threshold_s=self.stale_seconds,
+                )
             return False
+
+        # Book is fresh — reset stale escalation state.
+        if self._stale_cancel_alerted:
+            self._stale_cancel_alerted = False
+            self.should_cancel_orders = False
+            logger.info("book_recovered", strategy_tag=self.strategy_tag)
 
         if await self._check_global_halt():
             return False
@@ -318,6 +370,15 @@ class RiskGuard:
             await self._alerter.send_custom_alert(msg)
         except Exception:
             logger.exception("telegram_alert_failed", strategy_tag=self.strategy_tag)
+
+    async def _send_stale_alert(self, message: str) -> None:
+        """Send a Telegram alert for stale escalation (not gated by _alert_sent)."""
+        if self._alerter is None:
+            return
+        try:
+            await self._alerter.send_custom_alert(f"⚠️ {self.strategy_tag}\n{message}")
+        except Exception:
+            logger.exception("telegram_stale_alert_failed", strategy_tag=self.strategy_tag)
 
     # ------------------------------------------------------------------
     # Utilities
