@@ -122,9 +122,9 @@ def match_daemon(daemon: dict, keys: set[str]) -> bool:
 
 
 def restart(name: str) -> bool:
-    """Restart a supervisor daemon. Returns True on success."""
+    """Restart a supervisor daemon group. Returns True on success."""
     result = subprocess.run(
-        ["sudo", "supervisorctl", "restart", name],
+        ["sudo", "supervisorctl", "restart", f"{name}:*"],
         capture_output=True, text=True,
     )
     return result.returncode == 0
