@@ -560,3 +560,119 @@ def recent_trades_section():
 
 
 recent_trades_section()
+
+
+# ---------------------------------------------------------------------------
+# Analytics: Move % & Timing
+# ---------------------------------------------------------------------------
+
+@st.fragment(run_every="30s")
+def analytics_section():
+    m = st.session_state.get("mode", "Live").lower()
+    h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+    selected_tags = st.session_state.get("strategies", [])
+
+    data = _api("/trades", {"mode": m, "hours": h, "limit": 2000})
+    trades = data.get("trades", [])
+
+    # Filter to resolved trades with analytics fields
+    has_move = [t for t in trades if t.get("dir_move_pct") is not None and t.get("pnl") is not None]
+    has_timing = [t for t in trades if t.get("minutes_into_slot") is not None and t.get("pnl") is not None]
+
+    # Apply strategy tag filter
+    if selected_tags:
+        has_move = [t for t in has_move if t.get("strategy_tag") in selected_tags]
+        has_timing = [t for t in has_timing if t.get("strategy_tag") in selected_tags]
+
+    if not has_move and not has_timing:
+        return
+
+    st.markdown('<p class="section-label">Strategy Analytics</p>', unsafe_allow_html=True)
+
+    col_left, col_right = st.columns(2)
+
+    # -- Win Rate by Move % --
+    if has_move:
+        with col_left:
+            st.markdown(
+                '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
+                'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
+                'Win Rate by Underlying Move %</p>',
+                unsafe_allow_html=True,
+            )
+            df_m = pd.DataFrame(has_move)
+            bins = [-float("inf"), -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, float("inf")]
+            labels = ["<-1%", "-1~-0.5", "-0.5~-0.2", "-0.2~0", "0~0.2", "0.2~0.5", "0.5~1%", ">1%"]
+            df_m["bucket"] = pd.cut(df_m["dir_move_pct"], bins=bins, labels=labels)
+            grouped = df_m.groupby("bucket", observed=True).agg(
+                wins=("pnl", lambda x: (x > 0).sum()),
+                total=("pnl", "count"),
+            ).reset_index()
+            grouped["wr"] = (grouped["wins"] / grouped["total"] * 100).round(1)
+
+            colors = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped["wr"]]
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=grouped["bucket"], y=grouped["wr"],
+                marker_color=colors, marker_line_width=0,
+                opacity=0.85,
+                text=grouped.apply(
+                    lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                ),
+                textposition="outside",
+                textfont=dict(size=10),
+                hovertemplate="%{x}<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
+                customdata=grouped[["wins", "total"]].values,
+            ))
+            layout = _plotly_layout(height=260)
+            layout["yaxis"]["tickprefix"] = ""
+            layout["yaxis"]["ticksuffix"] = "%"
+            layout["yaxis"]["range"] = [0, min(grouped["wr"].max() + 20, 110)]
+            fig.update_layout(**layout)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    # -- Win Rate by Minutes Into Slot --
+    if has_timing:
+        with col_right:
+            st.markdown(
+                '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
+                'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
+                'Win Rate by Entry Timing (min)</p>',
+                unsafe_allow_html=True,
+            )
+            df_t = pd.DataFrame(has_timing)
+            bins_t = [0, 2, 4, 6, 8, 10, 12, 15]
+            labels_t = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12", "12-15"]
+            df_t["bucket"] = pd.cut(df_t["minutes_into_slot"], bins=bins_t, labels=labels_t, include_lowest=True)
+            grouped_t = df_t.groupby("bucket", observed=True).agg(
+                wins=("pnl", lambda x: (x > 0).sum()),
+                total=("pnl", "count"),
+            ).reset_index()
+            grouped_t["wr"] = (grouped_t["wins"] / grouped_t["total"] * 100).round(1)
+
+            colors_t = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped_t["wr"]]
+
+            fig_t = go.Figure()
+            fig_t.add_trace(go.Bar(
+                x=grouped_t["bucket"], y=grouped_t["wr"],
+                marker_color=colors_t, marker_line_width=0,
+                opacity=0.85,
+                text=grouped_t.apply(
+                    lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                ),
+                textposition="outside",
+                textfont=dict(size=10),
+                hovertemplate="%{x} min<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
+                customdata=grouped_t[["wins", "total"]].values,
+            ))
+            layout_t = _plotly_layout(height=260)
+            layout_t["yaxis"]["tickprefix"] = ""
+            layout_t["yaxis"]["ticksuffix"] = "%"
+            layout_t["yaxis"]["range"] = [0, min(grouped_t["wr"].max() + 20, 110)]
+            layout_t["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
+            fig_t.update_layout(**layout_t)
+            st.plotly_chart(fig_t, use_container_width=True, config={"displayModeBar": False})
+
+
+analytics_section()

@@ -109,9 +109,10 @@ def list_trades(
                     "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
                 })
 
-            # Extra fields from game_state for crypto_minute
+            # Extra fields from game_state (crypto_minute + td_maker analytics)
             for key in ("gap_pct", "gap_bucket", "time_bucket", "time_remaining_s",
-                        "spot_at_entry", "spot_at_resolution", "sub_strategy"):
+                        "spot_at_entry", "spot_at_resolution", "sub_strategy",
+                        "dir_move_pct", "minutes_into_slot"):
                 if key in gs:
                     entry[key] = gs[key]
 
