@@ -19,12 +19,12 @@ from src.ml.validation.calibration import reliability_diagram_data
 from src.paper_trading.metrics import PaperTradingMetrics, TradeRecord
 
 TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
-CRYPTO_TWO_SIDED_EVENT_TYPE = "crypto_two_sided"
 SNIPER_EVENT_TYPE = "sniper_sports"
 CRYPTO_MINUTE_EVENT_TYPE = "crypto_minute"
 WEATHER_ORACLE_EVENT_TYPE = "weather_oracle"
 CRYPTO_MAKER_EVENT_TYPE = "crypto_maker"
 TD_MAKER_EVENT_TYPE = "crypto_td_maker"
+TWO_SIDED_MAKER_EVENT_TYPE = "crypto_2s_maker"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
 _LIVE_MODES = {"live", "live_fill", "live_settlement", "autopilot"}
@@ -1477,60 +1477,53 @@ def _render_td_maker_tab(
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-def _render_crypto_two_sided_tab(
+def _render_two_sided_maker_tab(
     observations: list[LiveObservation],
     trades: list[PaperTrade],
 ) -> None:
-    """Render the Crypto Two-Sided arbitrage tab content."""
+    """Render the Two-Sided Maker tab content."""
     rows = extract_two_sided_trade_rows(
-        observations, trades, event_types={CRYPTO_TWO_SIDED_EVENT_TYPE}
+        observations, trades, event_types={TWO_SIDED_MAKER_EVENT_TYPE}
     )
 
     if not rows:
-        st.info("No crypto two-sided trades found. Run: ./run scripts/run_crypto_two_sided.py --paper")
+        st.info("No two-sided maker trades found. Run: bin/run_crypto_two_sided_maker.sh")
         return
 
     tags = available_two_sided_tags(rows)
-    selected_tag = st.selectbox("Strategy Tag", ["All"] + tags, key="c2s_tag_select")
+    selected_tag = st.selectbox("Strategy Tag", ["All"] + tags, key="2sm_tag_select")
     rows_view = rows if selected_tag == "All" else [r for r in rows if r["strategy_tag"] == selected_tag]
 
-    # Separate entries (BUY) and settlements (SELL)
     entries = [r for r in rows_view if r["side"] == "BUY"]
     settlements = [r for r in rows_view if r["side"] == "SELL"]
-    pnls = [r["pnl"] for r in rows_view if r.get("pnl")]
+    pnls = [r["pnl"] for r in settlements if r.get("pnl")]
     total_pnl = sum(pnls)
+    sell_wins = sum(1 for r in settlements if (r.get("pnl") or 0) > 0)
 
-    # Each entry is one side of a pair — count pairs
-    settled_cids = {r.get("condition_id") for r in settlements}
-    entry_cids = {r.get("condition_id") for r in entries}
-    # A "pair" has 2 BUY entries for the same condition_id
-    pair_cids: dict[str, int] = {}
+    # Count pairs by condition_id
+    buy_by_cid: dict[str, int] = {}
     for r in entries:
         cid = r.get("condition_id", "")
-        pair_cids[cid] = pair_cids.get(cid, 0) + 1
-    complete_pairs = sum(1 for c in pair_cids.values() if c >= 2)
-    open_cids = entry_cids - settled_cids
+        buy_by_cid[cid] = buy_by_cid.get(cid, 0) + 1
+    both_filled = sum(1 for c in buy_by_cid.values() if c >= 2)
+    one_sided = sum(1 for c in buy_by_cid.values() if c == 1)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Entries", len(entries))
-    c2.metric("Pairs (both sides)", complete_pairs)
-    c3.metric("Settled", len(settlements))
+    c1.metric("Total Fills", len(entries))
+    c2.metric("Both-Filled Pairs", both_filled)
+    c3.metric("One-Sided Fills", one_sided)
     c4.metric("Realized P&L", f"${total_pnl:,.2f}")
 
-    if open_cids:
-        open_entries = [r for r in entries if r.get("condition_id") in open_cids]
-        open_exposure = sum(r["size_usd"] for r in open_entries)
-        c5, c6 = st.columns(2)
-        c5.metric("Open Positions", len(open_cids))
-        c6.metric("Open Exposure", f"${open_exposure:,.2f}")
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Settled", len(settlements))
+    c6.metric("Win Rate", f"{sell_wins / len(settlements):.1%}" if settlements else "N/A")
 
-    # Edge stats from entries
-    edges = [r.get("edge_theoretical", 0) for r in entries if r.get("edge_theoretical")]
-    if edges:
-        avg_edge = sum(edges) / len(edges)
-        c7, c8 = st.columns(2)
-        c7.metric("Avg Edge", f"{avg_edge:.2%}")
-        c8.metric("Win Rate", "100% (structural)")
+    settled_cids = {r.get("condition_id") for r in settlements}
+    open_entries = [r for r in entries if r.get("condition_id") not in settled_cids]
+    if open_entries:
+        open_exposure = sum(r["size_usd"] for r in open_entries)
+        c7.metric("Open Positions", len({r.get("condition_id") for r in open_entries}))
+        c8.metric("Open Exposure", f"${open_exposure:,.2f}")
 
     st.divider()
 
@@ -1547,7 +1540,7 @@ def _render_crypto_two_sided_tab(
         fig.add_trace(go.Scatter(
             x=pnl_df["timestamp"], y=pnl_df["cumulative_pnl"],
             mode="lines+markers", name="Cumulative P&L",
-            line=dict(color="#2ecc71", width=2), marker=dict(size=5),
+            line=dict(color="#e74c3c", width=2), marker=dict(size=5),
         ))
         fig.update_layout(
             xaxis_title="Time", yaxis_title="Cumulative P&L ($)",
@@ -1555,28 +1548,6 @@ def _render_crypto_two_sided_tab(
             margin=dict(l=50, r=50, t=30, b=50),
         )
         st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
-    # By symbol
-    st.subheader("By Symbol")
-    sym_data: list[dict[str, Any]] = []
-    for sym in ["BTC", "ETH"]:
-        sym_entries = [r for r in entries if sym.lower() in str(r.get("title", "")).lower()]
-        sym_settles = [r for r in settlements if sym.lower() in str(r.get("title", "")).lower()]
-        sym_pnls = [r["pnl"] for r in sym_settles if r.get("pnl")]
-        if not sym_entries:
-            continue
-        sym_edges = [r.get("edge_theoretical", 0) for r in sym_entries if r.get("edge_theoretical")]
-        sym_data.append({
-            "Symbol": sym,
-            "Entries": len(sym_entries),
-            "Settled": len(sym_settles),
-            "Avg Edge": f"{sum(sym_edges) / len(sym_edges):.2%}" if sym_edges else "N/A",
-            "Total P&L": f"${sum(sym_pnls):,.2f}",
-        })
-    if sym_data:
-        st.dataframe(pd.DataFrame(sym_data), use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -1591,7 +1562,6 @@ def _render_crypto_two_sided_tab(
             "Side": r.get("side", ""),
             "Price": f"{r['fill_price']:.3f}",
             "Size": f"${r['size_usd']:.2f}",
-            "Edge": f"{r.get('edge_theoretical', 0):.2%}" if r.get("edge_theoretical") else "",
             "P&L": f"${r['pnl']:.2f}" if r.get("pnl") else "",
         } for r in recent])
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -1812,13 +1782,13 @@ def main():
         fear_positions = []
 
     # --- Tabs ---
-    tab_td_maker, tab_two_sided, tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear = st.tabs(
-        ["TD Maker", "Crypto 2-Sided", "Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling"]
+    tab_td_maker, tab_2s_maker, tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear = st.tabs(
+        ["TD Maker", "2S Maker", "Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling"]
     )
 
-    # ===== CRYPTO TWO-SIDED TAB =====
-    with tab_two_sided:
-        _render_crypto_two_sided_tab(observations, trades)
+    # ===== TWO-SIDED MAKER TAB =====
+    with tab_2s_maker:
+        _render_two_sided_maker_tab(observations, trades)
 
     # ===== SNIPER TAB =====
     with tab_sniper:
