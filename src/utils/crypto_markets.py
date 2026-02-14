@@ -26,6 +26,15 @@ CRYPTO_SYMBOL_TO_SLUG: dict[str, str] = {
     "XRPUSDT": "xrp",
 }
 
+# Chainlink symbol ↔ Polymarket slug prefix.
+CHAINLINK_TO_SLUG: dict[str, str] = {
+    "btc/usd": "btc",
+    "eth/usd": "eth",
+    "sol/usd": "sol",
+    "xrp/usd": "xrp",
+}
+SLUG_TO_CHAINLINK: dict[str, str] = {v: k for k, v in CHAINLINK_TO_SLUG.items()}
+
 
 async def fetch_crypto_markets(
     client: httpx.AsyncClient,
@@ -44,7 +53,10 @@ async def fetch_crypto_markets(
     seen_conditions: set[str] = set()
 
     for symbol in symbols:
-        slug_prefix = CRYPTO_SYMBOL_TO_SLUG.get(symbol.upper())
+        slug_prefix = (
+            CRYPTO_SYMBOL_TO_SLUG.get(symbol.upper())
+            or CHAINLINK_TO_SLUG.get(symbol.lower())
+        )
         if not slug_prefix:
             continue
 

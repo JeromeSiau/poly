@@ -51,7 +51,8 @@ from src.arb.polymarket_executor import PolymarketExecutor
 from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEvent
 
 # Crypto market discovery and parsing utilities.
-from src.utils.crypto_markets import CRYPTO_SYMBOL_TO_SLUG, fetch_crypto_markets
+from src.feeds.chainlink import ChainlinkFeed
+from src.utils.crypto_markets import SLUG_TO_CHAINLINK, fetch_crypto_markets
 from src.utils.parsing import parse_json_list, _to_float, _first_event_slug
 from src.execution import TradeManager, TradeIntent, FillResult
 from src.risk.guard import RiskGuard
@@ -137,11 +138,13 @@ class CryptoTDMaker:
         db_url: str = "",
         ladder_rungs: int = 1,
         min_move_pct: float = 0.0,
+        chainlink_feed: Optional[ChainlinkFeed] = None,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
         self.user_feed = user_feed
         self.manager = manager
+        self.chainlink_feed = chainlink_feed
         self.symbols = symbols
         self.target_bid = target_bid
         self.max_bid = max_bid
@@ -179,10 +182,9 @@ class CryptoTDMaker:
         # Rung-level dedup: (cid, outcome, price_cents) of placed/active rungs.
         self._rung_placed: set[tuple[str, str, int]] = set()
 
-        # Binance reference prices for min-move filter.
-        self._ref_prices: dict[str, float] = {}  # cid -> open price at slot start
-        self._cid_binance_symbol: dict[str, str] = {}  # cid -> "BTCUSDT"
-        self._spot_cache: dict[str, tuple[float, float]] = {}  # symbol -> (price, fetch_ts)
+        # Chainlink reference prices for min-move filter.
+        self._ref_prices: dict[str, float] = {}  # cid -> chainlink price at slot start
+        self._cid_chainlink_symbol: dict[str, str] = {}  # cid -> "btc/usd"
 
         # Stats
         self.total_fills: int = 0
@@ -298,63 +300,8 @@ class CryptoTDMaker:
         )
 
     # ------------------------------------------------------------------
-    # Binance price helpers (min-move filter)
+    # Chainlink price helpers (min-move filter)
     # ------------------------------------------------------------------
-
-    _SPOT_CACHE_TTL: float = 2.0
-
-    async def _fetch_ref_price(self, binance_symbol: str, slot_ts: int) -> Optional[float]:
-        """Fetch Binance open price at the start of a 15-min slot."""
-        if not self._http_client:
-            return None
-        try:
-            resp = await self._http_client.get(
-                "https://api.binance.com/api/v3/klines",
-                params={
-                    "symbol": binance_symbol,
-                    "interval": "1m",
-                    "startTime": slot_ts * 1000,
-                    "limit": 1,
-                },
-                timeout=5.0,
-            )
-            if resp.status_code == 200:
-                klines = resp.json()
-                if klines:
-                    return float(klines[0][1])  # open price
-        except Exception as exc:
-            logger.warning("binance_ref_price_failed", symbol=binance_symbol, error=str(exc)[:60])
-        return None
-
-    async def _get_spot_price(self, binance_symbol: str) -> Optional[float]:
-        """Get current Binance spot price (cached for _SPOT_CACHE_TTL)."""
-        now = time.time()
-        cached = self._spot_cache.get(binance_symbol)
-        if cached and now - cached[1] < self._SPOT_CACHE_TTL:
-            return cached[0]
-        if not self._http_client:
-            return None
-        try:
-            resp = await self._http_client.get(
-                "https://api.binance.com/api/v3/ticker/price",
-                params={"symbol": binance_symbol},
-                timeout=5.0,
-            )
-            if resp.status_code == 200:
-                price = float(resp.json()["price"])
-                self._spot_cache[binance_symbol] = (price, now)
-                return price
-        except Exception as exc:
-            logger.warning("binance_spot_failed", symbol=binance_symbol, error=str(exc)[:60])
-        return None
-
-    async def _refresh_spot_prices(self) -> None:
-        """Pre-fetch current Binance prices for all tracked symbols."""
-        now = time.time()
-        for sym in set(self._cid_binance_symbol.values()):
-            cached = self._spot_cache.get(sym)
-            if not cached or now - cached[1] >= self._SPOT_CACHE_TTL:
-                await self._get_spot_price(sym)
 
     def _get_dir_move(self, cid: str, outcome: str) -> Optional[float]:
         """Directional move of underlying vs slot open (%), positive = in bet direction.
@@ -362,13 +309,13 @@ class CryptoTDMaker:
         Returns None when data is unavailable.
         """
         ref = self._ref_prices.get(cid)
-        sym = self._cid_binance_symbol.get(cid)
-        if not ref or not sym:
+        sym = self._cid_chainlink_symbol.get(cid)
+        if not ref or not sym or not self.chainlink_feed:
             return None
-        cached = self._spot_cache.get(sym)
-        if not cached:
+        current = self.chainlink_feed.get_price(sym)
+        if current is None:
             return None
-        move_pct = (cached[0] - ref) / ref * 100
+        move_pct = (current - ref) / ref * 100
         return -move_pct if outcome == "Down" else move_pct
 
     def _check_min_move(self, cid: str, outcome: str, price: float = 0.0) -> bool:
@@ -391,17 +338,26 @@ class CryptoTDMaker:
             threshold = self.min_move_pct * (rung_ratio / base_ratio)
         else:
             threshold = self.min_move_pct
-        return move >= threshold
+        allowed = move >= threshold
+        if not allowed:
+            logger.info(
+                "min_move_filtered",
+                cid=cid[:16],
+                outcome=outcome,
+                move_pct=round(move, 4),
+                threshold=round(threshold, 4),
+                price=price,
+            )
+        return allowed
 
     @staticmethod
     def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
-        """Parse slug like 'btc-updown-15m-1771079400' → ('BTCUSDT', slot_ts)."""
+        """Parse slug like 'btc-updown-15m-1771079400' → ('btc/usd', slot_ts)."""
         parts = slug.split("-")
         if len(parts) >= 4 and parts[-1].isdigit():
-            symbol_map = {v: k for k, v in CRYPTO_SYMBOL_TO_SLUG.items()}
-            binance_symbol = symbol_map.get(parts[0].lower())
-            if binance_symbol:
-                return binance_symbol, int(parts[-1])
+            chainlink_sym = SLUG_TO_CHAINLINK.get(parts[0].lower())
+            if chainlink_sym:
+                return chainlink_sym, int(parts[-1])
         return None
 
     # ------------------------------------------------------------------
@@ -469,21 +425,21 @@ class CryptoTDMaker:
                 except Exception:
                     pass
 
-            # Fetch Binance reference prices for min-move filter.
-            if self.min_move_pct > 0:
+            # Snapshot Chainlink prices as ref prices for min-move filter.
+            if self.min_move_pct > 0 and self.chainlink_feed:
                 for cid in new_user_markets:
                     slug = _first_event_slug(self.known_markets.get(cid, {}))
                     info = self._parse_slug_info(slug)
                     if info:
-                        binance_symbol, slot_ts = info
-                        self._cid_binance_symbol[cid] = binance_symbol
-                        ref = await self._fetch_ref_price(binance_symbol, slot_ts)
+                        chainlink_sym, slot_ts = info
+                        self._cid_chainlink_symbol[cid] = chainlink_sym
+                        ref = self.chainlink_feed.snapshot_price(chainlink_sym)
                         if ref:
                             self._ref_prices[cid] = ref
-                            logger.debug(
+                            logger.info(
                                 "td_ref_price_set",
                                 cid=cid[:16],
-                                symbol=binance_symbol,
+                                symbol=chainlink_sym,
                                 ref_price=ref,
                             )
 
@@ -560,10 +516,6 @@ class CryptoTDMaker:
         current_exposure = sum(p.size_usd for p in self.positions.values())
         pending_exposure = sum(o.size_usd for o in self.active_orders.values())
         budget_left = self.max_total_exposure_usd - current_exposure - pending_exposure
-
-        # Refresh Binance spot prices for min-move filter.
-        if self.min_move_pct > 0:
-            await self._refresh_spot_prices()
 
         cancel_ids: list[str] = []
         place_intents: list[tuple[str, str, str, float]] = []  # (cid, outcome, token_id, price)
@@ -899,8 +851,8 @@ class CryptoTDMaker:
         # Underlying move at fill time (reuses shared helper).
         dir_move = self._get_dir_move(order.condition_id, order.outcome)
         ref = self._ref_prices.get(order.condition_id)
-        sym = self._cid_binance_symbol.get(order.condition_id)
-        spot_cached = self._spot_cache.get(sym) if sym else None
+        sym = self._cid_chainlink_symbol.get(order.condition_id)
+        current = self.chainlink_feed.get_price(sym) if sym and self.chainlink_feed else None
 
         logger.info(
             "td_order_filled",
@@ -911,7 +863,7 @@ class CryptoTDMaker:
             total_fills=self.total_fills,
             paper=self.paper_mode,
             ref_price=ref,
-            spot_price=spot_cached[0] if spot_cached else None,
+            chainlink_price=current,
             dir_move_pct=round(dir_move, 3) if dir_move is not None else None,
         )
 
@@ -1170,7 +1122,7 @@ class CryptoTDMaker:
 
             self.known_markets.pop(cid, None)
             self._ref_prices.pop(cid, None)
-            self._cid_binance_symbol.pop(cid, None)
+            self._cid_chainlink_symbol.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -1370,6 +1322,11 @@ class CryptoTDMaker:
         await self._load_db_state()
         await self.polymarket.connect()
 
+        if self.chainlink_feed and self.min_move_pct > 0:
+            await self.chainlink_feed.connect()
+            # Give WS a moment to receive initial prices.
+            await asyncio.sleep(2)
+
         if self.user_feed:
             try:
                 await self.user_feed.connect()
@@ -1395,6 +1352,7 @@ class CryptoTDMaker:
                 max_exposure=self.max_total_exposure_usd,
                 markets=len(self.known_markets),
                 user_ws=self.user_feed is not None,
+                chainlink_ws=self.chainlink_feed is not None and self.chainlink_feed.is_connected,
             )
 
             tasks: list[Any] = [
@@ -1408,6 +1366,8 @@ class CryptoTDMaker:
                 await asyncio.gather(*tasks)
             finally:
                 self._http_client = None
+                if self.chainlink_feed:
+                    await self.chainlink_feed.disconnect()
                 if self.user_feed:
                     await self.user_feed.disconnect()
                 await self.polymarket.disconnect()
@@ -1526,6 +1486,10 @@ async def main() -> None:
     order_size = args.order_size if args.order_size > 0 else max(wallet * 0.025, 1.0)
     max_exposure = args.max_exposure if args.max_exposure > 0 else max(wallet * 0.50, 50.0)
 
+    chainlink_feed: Optional[ChainlinkFeed] = None
+    if args.min_move_pct > 0:
+        chainlink_feed = ChainlinkFeed()
+
     maker = CryptoTDMaker(
         executor=executor,
         polymarket=polymarket,
@@ -1544,6 +1508,7 @@ async def main() -> None:
         db_url=args.db_url,
         ladder_rungs=args.ladder_rungs,
         min_move_pct=args.min_move_pct,
+        chainlink_feed=chainlink_feed,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"
@@ -1557,7 +1522,7 @@ async def main() -> None:
     print(f"  Order size:  ${order_size:.2f}/rung")
     print(f"  Max exposure: ${max_exposure:.2f}")
     if args.min_move_pct > 0:
-        print(f"  Min move:    {args.min_move_pct}% (Binance directional filter)")
+        print(f"  Min move:    {args.min_move_pct}% (Chainlink directional filter)")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print()
 

@@ -37,6 +37,7 @@ RULES: list[tuple[str, list[str] | str]] = [
                                      "run_crypto_two_sided_maker"]),
     ("src/feeds/polymarket",        ["run_crypto_td_maker",
                                      "run_crypto_maker", "run_crypto_two_sided_maker"]),
+    ("src/feeds/chainlink",         ["run_crypto_td_maker"]),
     ("src/feeds/kalshi",            ["run_kalshi_td_maker"]),
     ("src/db/td_orders",            ["run_crypto_td_maker", "run_kalshi_td_maker",
                                      "run_crypto_two_sided_maker"]),
