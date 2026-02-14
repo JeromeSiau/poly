@@ -196,15 +196,30 @@ class CryptoTDMaker:
     # ------------------------------------------------------------------
 
     async def _load_db_state(self) -> None:
-        """Restore active orders and positions from DB on startup."""
+        """Restore active orders and positions from DB on startup.
+
+        Stale rows (older than 30 min) are cleaned up — their 15-min markets
+        have already resolved, so loading them would create orphan positions
+        that settle with unknown resolution.
+        """
         if not self._db_url:
             return
-        from src.db.td_orders import load_orders
+        from src.db.td_orders import load_orders, delete_order
         rows = await load_orders(
             db_url=self._db_url, platform="polymarket",
             strategy_tag=self.strategy_tag,
         )
+        now = time.time()
+        stale_cutoff = now - 1800  # 30 min
+        stale_count = 0
         for row in rows:
+            # Skip and clean up stale orders from previous sessions.
+            row_ts = row.filled_at or row.placed_at or 0.0
+            if row_ts > 0 and row_ts < stale_cutoff:
+                stale_count += 1
+                self._db_fire(delete_order(db_url=self._db_url, order_id=row.order_id))
+                continue
+
             side = (row.extra or {}).get("side", "BUY")
             if row.status == "pending":
                 order = PassiveOrder(
@@ -227,6 +242,8 @@ class CryptoTDMaker:
                 )
                 self.positions[row.condition_id] = pos
                 self._position_order_ids[row.condition_id] = row.order_id
+        if stale_count:
+            logger.info("td_stale_orders_cleaned", count=stale_count)
         if self.active_orders or self.positions:
             logger.info(
                 "td_db_state_loaded",
