@@ -34,7 +34,8 @@ RULES: list[tuple[str, list[str] | str]] = [
     # ── Shared components → subset of daemons ───────────────────────────
     ("src/arb/polymarket_executor", ["run_fear_selling", "run_crypto_td_maker",
                                      "run_crypto_maker",
-                                     "run_crypto_two_sided_maker"]),
+                                     "run_crypto_two_sided_maker",
+                                     "run_sniper"]),
     ("src/feeds/polymarket",        ["run_crypto_td_maker",
                                      "run_crypto_maker", "run_crypto_two_sided_maker",
                                      "run_sniper"]),

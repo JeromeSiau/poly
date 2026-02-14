@@ -42,6 +42,7 @@ class SniperPosition:
     entry_price: float
     shares: float
     size_usd: float
+    fee_cost: float
     entry_ts: float
     question: str
     category: str
@@ -254,7 +255,10 @@ class SniperEngine:
             )
 
             try:
-                await self.manager.place(intent)
+                pending = await self.manager.place(intent)
+                if not pending.order_id:
+                    logger.warning("sniper_order_rejected", condition_id=target.condition_id[:16])
+                    continue
 
                 logger.info(
                     "sniper_order_placed",
@@ -267,6 +271,7 @@ class SniperEngine:
                     question=target.question[:60],
                 )
 
+                fee_cost = shares * target.fee_pct
                 self._positions[target.condition_id] = SniperPosition(
                     condition_id=target.condition_id,
                     token_id=target.token_id,
@@ -274,6 +279,7 @@ class SniperEngine:
                     entry_price=ask,
                     shares=shares,
                     size_usd=order_usd,
+                    fee_cost=fee_cost,
                     entry_ts=time.time(),
                     question=target.question,
                     category=target.category,
@@ -316,7 +322,8 @@ class SniperEngine:
                     continue
 
                 won = resolved
-                pnl = pos.shares * (1.0 - pos.entry_price) if won else -pos.size_usd
+                pnl = (pos.shares * (1.0 - pos.entry_price) - pos.fee_cost
+                       if won else -(pos.size_usd + pos.fee_cost))
 
                 if won:
                     self._total_wins += 1
@@ -384,7 +391,7 @@ class SniperEngine:
     ) -> Optional[bool]:
         """Query Gamma API for market resolution. Returns True/False/None."""
         if not pos.slug:
-            return self._check_resolution_clob(client, pos)
+            return await self._check_resolution_clob(client, pos)
 
         try:
             resp = await client.get(
@@ -400,6 +407,8 @@ class SniperEngine:
 
             for mkt in events[0].get("markets", []):
                 if str(mkt.get("conditionId", "")) != pos.condition_id:
+                    continue
+                if not mkt.get("closed"):
                     continue
                 outcome_prices = parse_json_list(mkt.get("outcomePrices", []))
                 outcomes = parse_json_list(mkt.get("outcomes", []))
@@ -427,6 +436,8 @@ class SniperEngine:
             if resp.status_code != 200:
                 return None
             data = resp.json()
+            if not data.get("closed"):
+                return None
             tokens = data.get("tokens", [])
             for tok in tokens:
                 if tok.get("outcome") == pos.outcome:

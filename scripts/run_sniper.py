@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Circuit breaker: max consecutive losses (default: 3)")
     p.add_argument("--cb-max-drawdown", type=float, default=-50.0,
                     help="Circuit breaker: max session drawdown USD (default: -50)")
+    p.add_argument("--cb-stale-seconds", type=float, default=60.0,
+                    help="Circuit breaker: book staleness threshold (default: 60)")
     p.add_argument("--cb-daily-limit", type=float, default=-100.0,
                     help="Global daily loss limit USD (default: -100)")
     return p
@@ -120,7 +122,7 @@ async def main() -> None:
         db_path=args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", ""),
         max_consecutive_losses=args.cb_max_losses,
         max_drawdown_usd=args.cb_max_drawdown,
-        stale_seconds=60.0,
+        stale_seconds=args.cb_stale_seconds,
         stale_cancel_seconds=180.0,
         stale_exit_seconds=600.0,
         daily_loss_limit_usd=args.cb_daily_limit,
