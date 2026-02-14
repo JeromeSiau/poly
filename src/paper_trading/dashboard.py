@@ -575,8 +575,8 @@ with tab_live:
                 "Strategy": df["strategy_tag"],
                 "Market": df["title"],
                 "Side": df["outcome"],
-                "Entry": df["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
-                "Exit": df["exit_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+                "Entry": df["entry_price"].apply(lambda x: f"{x:.3f}" if x is not None else ""),
+                "Exit": df["exit_price"].apply(lambda x: f"{x:.3f}" if x is not None else ""),
                 "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
                 "Result": df.apply(
                     lambda r: "WIN" if r.get("pnl") and r["pnl"] > 0

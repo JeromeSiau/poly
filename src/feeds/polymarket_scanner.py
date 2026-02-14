@@ -90,6 +90,7 @@ class MarketScanner:
         self,
         *,
         min_price: float = 0.99,
+        watch_threshold: float = 0.90,
         scan_interval: float = 15.0,
         max_markets: int = 2000,
         book_concurrency: int = 20,
@@ -97,6 +98,7 @@ class MarketScanner:
         max_end_hours: float = 1.0,
     ) -> None:
         self.min_price = min_price
+        self.watch_threshold = watch_threshold
         self.scan_interval = scan_interval
         self.max_markets = max_markets
         self.book_concurrency = book_concurrency
@@ -104,6 +106,7 @@ class MarketScanner:
         self.max_end_hours = max_end_hours
 
         self._targets: list[SniperTarget] = []
+        self._watchlist: list[SniperTarget] = []
         self._last_scan_ts: float = 0.0
         self._seen_conditions: set[str] = set()
 
@@ -111,23 +114,30 @@ class MarketScanner:
     def targets(self) -> list[SniperTarget]:
         return list(self._targets)
 
+    @property
+    def watchlist(self) -> list[SniperTarget]:
+        """Markets approaching threshold — pre-subscribe WS."""
+        return list(self._watchlist)
+
     def mark_traded(self, condition_id: str) -> None:
         """Mark a market as already traded (skip in future scans)."""
         self._seen_conditions.add(condition_id)
 
     async def scan(self, client: httpx.AsyncClient) -> list[SniperTarget]:
-        """Run one full scan cycle. Returns actionable targets."""
+        """Run one full scan cycle. Returns actionable targets + watchlist."""
         t0 = time.time()
 
         candidates = await self._fetch_candidates(client)
 
         if not candidates:
             self._targets = []
+            self._watchlist = []
             return []
 
-        targets = await self._fetch_books(client, candidates)
+        targets, watchlist = await self._fetch_books(client, candidates)
 
         self._targets = targets
+        self._watchlist = watchlist
         self._last_scan_ts = time.time()
 
         elapsed = time.time() - t0
@@ -135,6 +145,7 @@ class MarketScanner:
             "scanner_complete",
             candidates=len(candidates),
             targets=len(targets),
+            watchlist=len(watchlist),
             elapsed_s=round(elapsed, 1),
         )
 
@@ -147,7 +158,7 @@ class MarketScanner:
         candidates: list[dict[str, Any]] = []
         offset = 0
         batch_size = 100
-        soft_threshold = self.min_price - 0.05
+        soft_threshold = self.watch_threshold - 0.05
 
         while len(candidates) < self.max_markets:
             try:
@@ -230,10 +241,13 @@ class MarketScanner:
         self,
         client: httpx.AsyncClient,
         candidates: list[dict[str, Any]],
-    ) -> list[SniperTarget]:
-        """Fetch CLOB orderbooks and filter by actual ask price."""
+    ) -> tuple[list[SniperTarget], list[SniperTarget]]:
+        """Fetch CLOB orderbooks. Returns (targets, watchlist).
+
+        targets: ask >= min_price (ready to snipe now)
+        watchlist: ask >= watch_threshold (pre-subscribe WS for early entry)
+        """
         semaphore = asyncio.Semaphore(self.book_concurrency)
-        targets: list[SniperTarget] = []
 
         async def check_outcome(
             raw: dict[str, Any], idx: int,
@@ -283,7 +297,7 @@ class MarketScanner:
                         best_ask = price
                         best_ask_size = size
 
-            if best_ask is None or best_ask < self.min_price:
+            if best_ask is None or best_ask < self.watch_threshold:
                 return None
 
             fee_pct = best_ask * (1 - best_ask) * fee_rate if has_fee else 0.0
@@ -310,14 +324,20 @@ class MarketScanner:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        targets: list[SniperTarget] = []
+        watchlist: list[SniperTarget] = []
         for r in results:
             if isinstance(r, SniperTarget):
-                targets.append(r)
+                if r.ask_price >= self.min_price:
+                    targets.append(r)
+                else:
+                    watchlist.append(r)
 
         # Sort by price descending (highest certainty first)
         targets.sort(key=lambda t: t.ask_price, reverse=True)
+        watchlist.sort(key=lambda t: t.ask_price, reverse=True)
 
-        return targets
+        return targets, watchlist
 
     def _max_hours_for_category(self, category: str) -> float:
         """Category-specific time-to-resolution limits.

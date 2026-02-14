@@ -149,9 +149,9 @@ class SniperEngine:
             try:
                 targets = await self.scanner.scan(client)
 
-                # Subscribe WebSocket for new targets
+                # Subscribe WebSocket for targets + watchlist (early entry)
                 new_count = 0
-                for t in targets:
+                for t in list(targets) + self.scanner.watchlist:
                     if t.condition_id not in self._subscribed_markets:
                         token_map = {t.outcome: t.token_id}
                         await self.polymarket.subscribe_market(
@@ -167,6 +167,7 @@ class SniperEngine:
                 logger.info(
                     "sniper_scan_summary",
                     targets=len(targets),
+                    watching=len(self.scanner.watchlist),
                     subscribed=len(self._subscribed_markets),
                     positions=len(self._positions),
                     exposure=round(self._total_exposure, 2),
@@ -209,7 +210,10 @@ class SniperEngine:
         ):
             return
 
-        for target in self.scanner.targets:
+        # Check all watched markets (targets + watchlist) — WS may show
+        # a watchlist market crossing min_price between REST scans.
+        all_watched = list(self.scanner.targets) + self.scanner.watchlist
+        for target in all_watched:
             if target.condition_id in self._positions:
                 continue
 
