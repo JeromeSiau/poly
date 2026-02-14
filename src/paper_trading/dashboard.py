@@ -4,6 +4,7 @@ All data comes from the REST API at localhost:8788.
 No direct DB access — pure API consumer.
 """
 
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -107,6 +108,24 @@ def _plotly_layout(**overrides) -> dict:
     return base
 
 
+def _parse_slot_ts(title: str) -> int | None:
+    """Extract slot unix timestamp from slug like 'btc-updown-15m-1771079400'."""
+    if not title:
+        return None
+    m = re.search(r"-(\d{10})$", title)
+    return int(m.group(1)) if m else None
+
+
+def _parse_asset(title: str) -> str | None:
+    """Extract asset from slug like 'btc-updown-15m-1771079400' -> 'BTC'."""
+    if not title:
+        return None
+    parts = title.split("-")
+    if len(parts) >= 2:
+        return parts[0].upper()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -179,6 +198,27 @@ section[data-testid="stSidebar"] .stMultiSelect > label {
 [data-testid="stMetricDelta"] {
     font-family: 'JetBrains Mono', monospace !important;
     font-size: 0.7rem !important;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0;
+    border-bottom: 1px solid #1e2a3a;
+}
+.stTabs [data-baseweb="tab"] {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #64748b;
+    padding: 8px 24px;
+    border: none;
+    background: transparent;
+}
+.stTabs [aria-selected="true"] {
+    color: #38bdf8 !important;
+    border-bottom: 2px solid #38bdf8 !important;
+    background: transparent !important;
 }
 
 /* Divider */
@@ -269,7 +309,7 @@ hr {
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Header
+# Header & Sidebar
 # ---------------------------------------------------------------------------
 
 mode = st.sidebar.radio("Mode", ["Live", "Paper"], index=0, key="mode")
@@ -293,386 +333,507 @@ st.markdown(
 )
 
 
-# ---------------------------------------------------------------------------
-# KPIs
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════════════════
 
-@st.fragment(run_every="15s")
-def kpi_section():
-    m = st.session_state.get("mode", "Live").lower()
-    h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
-
-    balance_data = _api("/balance", {"mode": m})
-    winrate_data = _api("/winrate", {"mode": m, "hours": h})
-
-    bal = balance_data.get("balance", 0.0)
-    pnl = winrate_data.get("total_pnl", 0.0)
-    wr = winrate_data.get("winrate", 0.0)
-    pf = winrate_data.get("profit_factor")
-    wins = winrate_data.get("wins", 0)
-    losses = winrate_data.get("losses", 0)
-    roi = winrate_data.get("roi_pct", 0.0)
-
-    pos_data = _api("/positions", {"mode": m})
-    n_positions = pos_data.get("count", 0)
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Balance", f"${bal:,.2f}")
-    c2.metric("PnL", f"${pnl:+,.2f}", delta=f"{pnl:+.2f}" if pnl else None)
-    c3.metric("Win Rate", f"{wr:.1f}%", delta=f"{wins}W {losses}L")
-    c4.metric("Profit Factor", f"{pf:.2f}" if pf else "--")
-    c5.metric("ROI", f"{roi:+.1f}%")
-    c6.metric("Positions", str(n_positions))
+tab_live, tab_analysis = st.tabs(["Live", "Strategy Analysis"])
 
 
-kpi_section()
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 1: LIVE
+# ═══════════════════════════════════════════════════════════════════════════
 
-st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
+with tab_live:
 
+    # -- KPIs --
+    @st.fragment(run_every="15s")
+    def kpi_section():
+        m = st.session_state.get("mode", "Live").lower()
+        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
 
-# ---------------------------------------------------------------------------
-# Cumulative PnL
-# ---------------------------------------------------------------------------
+        balance_data = _api("/balance", {"mode": m})
+        winrate_data = _api("/winrate", {"mode": m, "hours": h})
 
-@st.fragment(run_every="15s")
-def pnl_chart_section():
-    m = st.session_state.get("mode", "Live").lower()
-    h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+        bal = balance_data.get("balance", 0.0)
+        pnl = winrate_data.get("total_pnl", 0.0)
+        wr = winrate_data.get("winrate", 0.0)
+        pf = winrate_data.get("profit_factor")
+        wins = winrate_data.get("wins", 0)
+        losses = winrate_data.get("losses", 0)
+        roi = winrate_data.get("roi_pct", 0.0)
 
-    st.markdown('<p class="section-label">Cumulative PnL</p>', unsafe_allow_html=True)
+        pos_data = _api("/positions", {"mode": m})
+        n_positions = pos_data.get("count", 0)
 
-    winrate_data = _api("/winrate", {"mode": m, "hours": h})
-    markets = winrate_data.get("markets", [])
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Balance", f"${bal:,.2f}")
+        c2.metric("PnL", f"${pnl:+,.2f}", delta=f"{pnl:+.2f}" if pnl else None)
+        c3.metric("Win Rate", f"{wr:.1f}%", delta=f"{wins}W {losses}L")
+        c4.metric("Profit Factor", f"{pf:.2f}" if pf else "--")
+        c5.metric("ROI", f"{roi:+.1f}%")
+        c6.metric("Positions", str(n_positions))
 
-    if not markets:
-        st.caption("No resolved trades yet")
-        return
+    kpi_section()
+    st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
 
-    rows = []
-    for mk in markets:
-        ts_val = mk.get("timestamp")
-        if ts_val is None:
-            continue
-        if isinstance(ts_val, (int, float)):
-            dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
-        else:
-            dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
-        rows.append({"time": dt, "pnl": mk["pnl"], "status": mk.get("status", "")})
+    # -- Cumulative PnL --
+    @st.fragment(run_every="15s")
+    def pnl_chart_section():
+        m = st.session_state.get("mode", "Live").lower()
+        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
 
-    if not rows:
-        return
+        st.markdown('<p class="section-label">Cumulative PnL</p>', unsafe_allow_html=True)
 
-    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
-    df["cum_pnl"] = df["pnl"].cumsum()
-
-    final_pnl = df["cum_pnl"].iloc[-1]
-    color = C_GREEN if final_pnl >= 0 else C_RED
-    fill = "rgba(52,211,153,0.08)" if final_pnl >= 0 else "rgba(248,113,113,0.08)"
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df["time"], y=df["cum_pnl"],
-        mode="lines",
-        line=dict(color=color, width=1.5),
-        fill="tozeroy", fillcolor=fill,
-        hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<extra></extra>",
-    ))
-    fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
-    fig.update_layout(**_plotly_layout(height=300))
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-pnl_chart_section()
-
-
-# ---------------------------------------------------------------------------
-# Hourly PnL
-# ---------------------------------------------------------------------------
-
-@st.fragment(run_every="15s")
-def hourly_pnl_section():
-    m = st.session_state.get("mode", "Live").lower()
-    h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
-
-    st.markdown('<p class="section-label">PnL by Hour</p>', unsafe_allow_html=True)
-
-    winrate_data = _api("/winrate", {"mode": m, "hours": h})
-    markets = winrate_data.get("markets", [])
-
-    if not markets:
-        st.caption("No data")
-        return
-
-    rows = []
-    for mk in markets:
-        ts_val = mk.get("timestamp")
-        if ts_val is None:
-            continue
-        if isinstance(ts_val, (int, float)):
-            dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
-        else:
-            dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
-        rows.append({"time": dt, "pnl": mk["pnl"]})
-
-    if not rows:
-        return
-
-    df = pd.DataFrame(rows)
-    df["hour"] = df["time"].dt.floor("h")
-    hourly = df.groupby("hour").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
-
-    colors = [C_GREEN if p >= 0 else C_RED for p in hourly["pnl"]]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=hourly["hour"], y=hourly["pnl"],
-        marker_color=colors, marker_line_width=0,
-        opacity=0.85,
-        hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<br>%{customdata} trades<extra></extra>",
-        customdata=hourly["trades"],
-    ))
-    fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
-    fig.update_layout(**_plotly_layout(height=220))
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-hourly_pnl_section()
-
-
-# ---------------------------------------------------------------------------
-# Open Positions
-# ---------------------------------------------------------------------------
-
-@st.fragment(run_every="15s")
-def open_positions_section():
-    m = st.session_state.get("mode", "Live").lower()
-
-    st.markdown('<p class="section-label">Open Positions</p>', unsafe_allow_html=True)
-
-    pos_data = _api("/positions", {"mode": m})
-    items = pos_data.get("positions", [])
-
-    if not items:
-        st.caption("No open positions")
-        return
-
-    df = pd.DataFrame(items)
-
-    display = pd.DataFrame({
-        "Market": df["title"],
-        "Side": df["outcome"],
-        "Shares": df["size"].apply(lambda x: f"{x:.1f}"),
-        "Entry": df["avg_price"].apply(lambda x: f"{x:.2f}" if x else ""),
-        "Price": df["cur_price"].apply(lambda x: f"{x:.2f}" if x else ""),
-        "Value": df["value"].apply(lambda x: f"${x:.2f}" if x else ""),
-        "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
-    })
-
-    styled = display.style.map(_style_pnl, subset=["PnL"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-
-open_positions_section()
-
-
-# ---------------------------------------------------------------------------
-# Recent Trades
-# ---------------------------------------------------------------------------
-
-@st.fragment(run_every="15s")
-def recent_trades_section():
-    m = st.session_state.get("mode", "Live").lower()
-    h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
-
-    st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
-
-    if m == "live":
-        # Live: use on-chain data from /winrate
-        winrate_data = _api("/winrate", {"mode": "live", "hours": h})
+        winrate_data = _api("/winrate", {"mode": m, "hours": h})
         markets = winrate_data.get("markets", [])
+
         if not markets:
-            st.caption("No trades in this period")
+            st.caption("No resolved trades yet")
             return
+
         rows = []
         for mk in markets:
             ts_val = mk.get("timestamp")
+            if ts_val is None:
+                continue
             if isinstance(ts_val, (int, float)):
                 dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
             else:
-                continue
-            rows.append({
-                "Time": dt.strftime("%H:%M"),
-                "Market": mk.get("title", ""),
-                "Side": mk.get("outcome", ""),
-                "Entry": f"{mk['avg_entry']:.2f}" if mk.get("avg_entry") else "",
-                "Cost": f"${mk['cost']:.2f}" if mk.get("cost") else "",
-                "PnL": f"${mk['pnl']:+.2f}",
-                "Result": mk.get("status", ""),
-            })
-        display = pd.DataFrame(rows)
-        styled = display.style.map(_style_pnl, subset=["PnL"]).map(
-            _style_result, subset=["Result"]
-        )
-        st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
-        pnls = [mk["pnl"] for mk in markets]
-        w = sum(1 for p in pnls if p > 0)
-        l = sum(1 for p in pnls if p <= 0)
-        st.caption(f"{len(markets)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
-    else:
-        # Paper: use internal DB
-        data = _api("/trades", {"mode": "paper", "hours": h, "is_open": "false", "limit": 200})
-        trades = data.get("trades", [])
-        if not trades:
-            st.caption("No trades in this period")
-            return
-        df = pd.DataFrame(trades)
-        if df.empty:
+                dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
+            rows.append({"time": dt, "pnl": mk["pnl"], "status": mk.get("status", "")})
+
+        if not rows:
             return
 
-        def _fmt_time(ts_str):
-            try:
-                return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).strftime("%H:%M")
-            except Exception:
-                return ""
+        df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+        df["cum_pnl"] = df["pnl"].cumsum()
+
+        final_pnl = df["cum_pnl"].iloc[-1]
+        color = C_GREEN if final_pnl >= 0 else C_RED
+        fill = "rgba(52,211,153,0.08)" if final_pnl >= 0 else "rgba(248,113,113,0.08)"
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df["time"], y=df["cum_pnl"],
+            mode="lines",
+            line=dict(color=color, width=1.5),
+            fill="tozeroy", fillcolor=fill,
+            hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<extra></extra>",
+        ))
+        fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+        fig.update_layout(**_plotly_layout(height=300))
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    pnl_chart_section()
+
+    # -- Hourly PnL --
+    @st.fragment(run_every="15s")
+    def hourly_pnl_section():
+        m = st.session_state.get("mode", "Live").lower()
+        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+
+        st.markdown('<p class="section-label">PnL by Hour</p>', unsafe_allow_html=True)
+
+        winrate_data = _api("/winrate", {"mode": m, "hours": h})
+        markets = winrate_data.get("markets", [])
+
+        if not markets:
+            st.caption("No data")
+            return
+
+        rows = []
+        for mk in markets:
+            ts_val = mk.get("timestamp")
+            if ts_val is None:
+                continue
+            if isinstance(ts_val, (int, float)):
+                dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+            else:
+                dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
+            rows.append({"time": dt, "pnl": mk["pnl"]})
+
+        if not rows:
+            return
+
+        df = pd.DataFrame(rows)
+        df["hour"] = df["time"].dt.floor("h")
+        hourly = df.groupby("hour").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
+
+        colors = [C_GREEN if p >= 0 else C_RED for p in hourly["pnl"]]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=hourly["hour"], y=hourly["pnl"],
+            marker_color=colors, marker_line_width=0,
+            opacity=0.85,
+            hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<br>%{customdata} trades<extra></extra>",
+            customdata=hourly["trades"],
+        ))
+        fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+        fig.update_layout(**_plotly_layout(height=220))
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    hourly_pnl_section()
+
+    # -- Open Positions --
+    @st.fragment(run_every="15s")
+    def open_positions_section():
+        m = st.session_state.get("mode", "Live").lower()
+
+        st.markdown('<p class="section-label">Open Positions</p>', unsafe_allow_html=True)
+
+        pos_data = _api("/positions", {"mode": m})
+        items = pos_data.get("positions", [])
+
+        if not items:
+            st.caption("No open positions")
+            return
+
+        df = pd.DataFrame(items)
 
         display = pd.DataFrame({
-            "Time": df["timestamp"].apply(_fmt_time),
-            "Strategy": df["strategy_tag"],
             "Market": df["title"],
             "Side": df["outcome"],
-            "Entry": df["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
-            "Exit": df["exit_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+            "Shares": df["size"].apply(lambda x: f"{x:.1f}"),
+            "Entry": df["avg_price"].apply(lambda x: f"{x:.2f}" if x else ""),
+            "Price": df["cur_price"].apply(lambda x: f"{x:.2f}" if x else ""),
+            "Value": df["value"].apply(lambda x: f"${x:.2f}" if x else ""),
             "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
-            "Result": df.apply(
-                lambda r: "WIN" if r.get("pnl") and r["pnl"] > 0
-                else ("LOSS" if r.get("pnl") is not None else "--"), axis=1
-            ),
         })
-        styled = display.style.map(_style_pnl, subset=["PnL"]).map(
-            _style_result, subset=["Result"]
-        )
-        st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
-        pnls = [t["pnl"] for t in trades if t.get("pnl") is not None]
-        if pnls:
+
+        styled = display.style.map(_style_pnl, subset=["PnL"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    open_positions_section()
+
+    # -- Recent Trades --
+    @st.fragment(run_every="15s")
+    def recent_trades_section():
+        m = st.session_state.get("mode", "Live").lower()
+        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+
+        st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
+
+        if m == "live":
+            winrate_data = _api("/winrate", {"mode": "live", "hours": h})
+            markets = winrate_data.get("markets", [])
+            if not markets:
+                st.caption("No trades in this period")
+                return
+            rows = []
+            for mk in markets:
+                ts_val = mk.get("timestamp")
+                if isinstance(ts_val, (int, float)):
+                    dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                else:
+                    continue
+                rows.append({
+                    "Time": dt.strftime("%H:%M"),
+                    "Market": mk.get("title", ""),
+                    "Side": mk.get("outcome", ""),
+                    "Entry": f"{mk['avg_entry']:.2f}" if mk.get("avg_entry") else "",
+                    "Cost": f"${mk['cost']:.2f}" if mk.get("cost") else "",
+                    "PnL": f"${mk['pnl']:+.2f}",
+                    "Result": mk.get("status", ""),
+                })
+            display = pd.DataFrame(rows)
+            styled = display.style.map(_style_pnl, subset=["PnL"]).map(
+                _style_result, subset=["Result"]
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+            pnls = [mk["pnl"] for mk in markets]
             w = sum(1 for p in pnls if p > 0)
             l = sum(1 for p in pnls if p <= 0)
-            st.caption(f"{len(display)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
+            st.caption(f"{len(markets)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
+        else:
+            data = _api("/trades", {"mode": "paper", "hours": h, "is_open": "false", "limit": 200})
+            trades = data.get("trades", [])
+            if not trades:
+                st.caption("No trades in this period")
+                return
+            df = pd.DataFrame(trades)
+            if df.empty:
+                return
 
+            def _fmt_time(ts_str):
+                try:
+                    return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).strftime("%H:%M")
+                except Exception:
+                    return ""
 
-recent_trades_section()
-
-
-# ---------------------------------------------------------------------------
-# Analytics: Move % & Timing
-# ---------------------------------------------------------------------------
-
-@st.fragment(run_every="30s")
-def analytics_section():
-    m = st.session_state.get("mode", "Live").lower()
-    h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
-    selected_tags = st.session_state.get("strategies", [])
-
-    data = _api("/trades", {"mode": m, "hours": h, "limit": 2000})
-    trades = data.get("trades", [])
-
-    # Filter to resolved trades with analytics fields
-    has_move = [t for t in trades if t.get("dir_move_pct") is not None and t.get("pnl") is not None]
-    has_timing = [t for t in trades if t.get("minutes_into_slot") is not None and t.get("pnl") is not None]
-
-    # Apply strategy tag filter
-    if selected_tags:
-        has_move = [t for t in has_move if t.get("strategy_tag") in selected_tags]
-        has_timing = [t for t in has_timing if t.get("strategy_tag") in selected_tags]
-
-    if not has_move and not has_timing:
-        return
-
-    st.markdown('<p class="section-label">Strategy Analytics</p>', unsafe_allow_html=True)
-
-    col_left, col_right = st.columns(2)
-
-    # -- Win Rate by Move % --
-    if has_move:
-        with col_left:
-            st.markdown(
-                '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
-                'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
-                'Win Rate by Underlying Move %</p>',
-                unsafe_allow_html=True,
-            )
-            df_m = pd.DataFrame(has_move)
-            bins = [-float("inf"), -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, float("inf")]
-            labels = ["<-1%", "-1~-0.5", "-0.5~-0.2", "-0.2~0", "0~0.2", "0.2~0.5", "0.5~1%", ">1%"]
-            df_m["bucket"] = pd.cut(df_m["dir_move_pct"], bins=bins, labels=labels)
-            grouped = df_m.groupby("bucket", observed=True).agg(
-                wins=("pnl", lambda x: (x > 0).sum()),
-                total=("pnl", "count"),
-            ).reset_index()
-            grouped["wr"] = (grouped["wins"] / grouped["total"] * 100).round(1)
-
-            colors = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped["wr"]]
-
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=grouped["bucket"], y=grouped["wr"],
-                marker_color=colors, marker_line_width=0,
-                opacity=0.85,
-                text=grouped.apply(
-                    lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+            display = pd.DataFrame({
+                "Time": df["timestamp"].apply(_fmt_time),
+                "Strategy": df["strategy_tag"],
+                "Market": df["title"],
+                "Side": df["outcome"],
+                "Entry": df["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+                "Exit": df["exit_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+                "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
+                "Result": df.apply(
+                    lambda r: "WIN" if r.get("pnl") and r["pnl"] > 0
+                    else ("LOSS" if r.get("pnl") is not None else "--"), axis=1
                 ),
-                textposition="outside",
-                textfont=dict(size=10),
-                hovertemplate="%{x}<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
-                customdata=grouped[["wins", "total"]].values,
-            ))
-            layout = _plotly_layout(height=260)
-            layout["yaxis"]["tickprefix"] = ""
-            layout["yaxis"]["ticksuffix"] = "%"
-            layout["yaxis"]["range"] = [0, min(grouped["wr"].max() + 20, 110)]
-            fig.update_layout(**layout)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-    # -- Win Rate by Minutes Into Slot --
-    if has_timing:
-        with col_right:
-            st.markdown(
-                '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
-                'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
-                'Win Rate by Entry Timing (min)</p>',
-                unsafe_allow_html=True,
+            })
+            styled = display.style.map(_style_pnl, subset=["PnL"]).map(
+                _style_result, subset=["Result"]
             )
-            df_t = pd.DataFrame(has_timing)
-            bins_t = [0, 2, 4, 6, 8, 10, 12, 15]
-            labels_t = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12", "12-15"]
-            df_t["bucket"] = pd.cut(df_t["minutes_into_slot"], bins=bins_t, labels=labels_t, include_lowest=True)
-            grouped_t = df_t.groupby("bucket", observed=True).agg(
-                wins=("pnl", lambda x: (x > 0).sum()),
-                total=("pnl", "count"),
-            ).reset_index()
-            grouped_t["wr"] = (grouped_t["wins"] / grouped_t["total"] * 100).round(1)
+            st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+            pnls = [t["pnl"] for t in trades if t.get("pnl") is not None]
+            if pnls:
+                w = sum(1 for p in pnls if p > 0)
+                l = sum(1 for p in pnls if p <= 0)
+                st.caption(f"{len(display)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
 
-            colors_t = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped_t["wr"]]
-
-            fig_t = go.Figure()
-            fig_t.add_trace(go.Bar(
-                x=grouped_t["bucket"], y=grouped_t["wr"],
-                marker_color=colors_t, marker_line_width=0,
-                opacity=0.85,
-                text=grouped_t.apply(
-                    lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
-                ),
-                textposition="outside",
-                textfont=dict(size=10),
-                hovertemplate="%{x} min<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
-                customdata=grouped_t[["wins", "total"]].values,
-            ))
-            layout_t = _plotly_layout(height=260)
-            layout_t["yaxis"]["tickprefix"] = ""
-            layout_t["yaxis"]["ticksuffix"] = "%"
-            layout_t["yaxis"]["range"] = [0, min(grouped_t["wr"].max() + 20, 110)]
-            layout_t["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
-            fig_t.update_layout(**layout_t)
-            st.plotly_chart(fig_t, use_container_width=True, config={"displayModeBar": False})
+    recent_trades_section()
 
 
-analytics_section()
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 2: STRATEGY ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tab_analysis:
+
+    @st.fragment(run_every="30s")
+    def analysis_tab_content():
+        m = st.session_state.get("mode", "Live").lower()
+        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+        selected_tags = st.session_state.get("strategies", [])
+
+        data = _api("/trades", {"mode": m, "hours": h, "limit": 2000})
+        trades = data.get("trades", [])
+
+        # Apply strategy tag filter
+        if selected_tags:
+            trades = [t for t in trades if t.get("strategy_tag") in selected_tags]
+
+        resolved = [t for t in trades if t.get("pnl") is not None]
+
+        if not resolved:
+            st.caption("No resolved trades in this period")
+            return
+
+        # ---------------------------------------------------------------
+        # Market Correlation — do markets win/lose together per slot?
+        # ---------------------------------------------------------------
+
+        st.markdown('<p class="section-label">Market Correlation per Slot</p>', unsafe_allow_html=True)
+
+        # Group trades by slot timestamp
+        slot_trades: dict[int, list] = {}
+        for t in resolved:
+            title = t.get("title", "")
+            slot_ts = _parse_slot_ts(title)
+            if slot_ts is None:
+                continue
+            slot_trades.setdefault(slot_ts, []).append(t)
+
+        if slot_trades:
+            # For each slot, compute: how many markets, how many won
+            slot_rows = []
+            for slot_ts, st_trades in sorted(slot_trades.items()):
+                n_markets = len(st_trades)
+                n_wins = sum(1 for t in st_trades if t["pnl"] > 0)
+                n_losses = n_markets - n_wins
+                total_pnl = sum(t["pnl"] for t in st_trades)
+                assets = sorted(set(_parse_asset(t.get("title", "")) or "?" for t in st_trades))
+                slot_rows.append({
+                    "slot_ts": slot_ts,
+                    "n_markets": n_markets,
+                    "n_wins": n_wins,
+                    "n_losses": n_losses,
+                    "total_pnl": total_pnl,
+                    "pattern": f"{n_wins}W {n_losses}L",
+                    "assets": ", ".join(assets),
+                })
+
+            df_slots = pd.DataFrame(slot_rows)
+
+            # Only analyze slots with 2+ markets (actual correlation)
+            multi = df_slots[df_slots["n_markets"] >= 2]
+
+            if not multi.empty:
+                col_corr1, col_corr2 = st.columns(2)
+
+                with col_corr1:
+                    # Distribution of outcomes per slot
+                    st.markdown(
+                        '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
+                        'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
+                        'Slot Outcome Patterns</p>',
+                        unsafe_allow_html=True,
+                    )
+
+                    pattern_counts = multi["pattern"].value_counts().reset_index()
+                    pattern_counts.columns = ["pattern", "count"]
+                    pattern_counts = pattern_counts.sort_values("pattern")
+
+                    # Color: all-win = green, all-loss = red, mixed = accent
+                    def _pattern_color(p):
+                        if "0L" in p:
+                            return C_GREEN
+                        if "0W" in p:
+                            return C_RED
+                        return C_ACCENT
+
+                    colors_p = [_pattern_color(p) for p in pattern_counts["pattern"]]
+                    total_slots = pattern_counts["count"].sum()
+
+                    fig_p = go.Figure()
+                    fig_p.add_trace(go.Bar(
+                        x=pattern_counts["pattern"], y=pattern_counts["count"],
+                        marker_color=colors_p, marker_line_width=0,
+                        opacity=0.85,
+                        text=pattern_counts.apply(
+                            lambda r: f"{int(r['count'])} ({r['count']/total_slots*100:.0f}%)", axis=1
+                        ),
+                        textposition="outside",
+                        textfont=dict(size=10),
+                        hovertemplate="%{x}<br>%{y} slots<extra></extra>",
+                    ))
+                    layout_p = _plotly_layout(height=260)
+                    layout_p["yaxis"]["tickprefix"] = ""
+                    layout_p["xaxis"]["title"] = dict(text="outcome pattern", font=dict(size=10, color=C_MUTED))
+                    fig_p.update_layout(**layout_p)
+                    st.plotly_chart(fig_p, use_container_width=True, config={"displayModeBar": False})
+
+                with col_corr2:
+                    # PnL distribution by pattern
+                    st.markdown(
+                        '<p style="font-family: JetBrains Mono, monospace; font-size: 0.7rem; '
+                        'color: #64748b; letter-spacing: 1px; text-transform: uppercase; margin: 0 0 4px;">'
+                        'Avg Slot PnL by Pattern</p>',
+                        unsafe_allow_html=True,
+                    )
+
+                    pnl_by_pattern = multi.groupby("pattern").agg(
+                        avg_pnl=("total_pnl", "mean"),
+                        total_pnl=("total_pnl", "sum"),
+                        count=("total_pnl", "count"),
+                    ).reset_index().sort_values("pattern")
+
+                    colors_pnl = [C_GREEN if p >= 0 else C_RED for p in pnl_by_pattern["avg_pnl"]]
+
+                    fig_pnl = go.Figure()
+                    fig_pnl.add_trace(go.Bar(
+                        x=pnl_by_pattern["pattern"], y=pnl_by_pattern["avg_pnl"],
+                        marker_color=colors_pnl, marker_line_width=0,
+                        opacity=0.85,
+                        text=pnl_by_pattern.apply(
+                            lambda r: f"${r['avg_pnl']:+.2f}", axis=1
+                        ),
+                        textposition="outside",
+                        textfont=dict(size=10),
+                        hovertemplate="%{x}<br>Avg: $%{y:+.2f}<br>Total: $%{customdata[0]:+.2f}<br>%{customdata[1]} slots<extra></extra>",
+                        customdata=pnl_by_pattern[["total_pnl", "count"]].values,
+                    ))
+                    fig_pnl.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+                    layout_pnl = _plotly_layout(height=260)
+                    layout_pnl["xaxis"]["title"] = dict(text="outcome pattern", font=dict(size=10, color=C_MUTED))
+                    fig_pnl.update_layout(**layout_pnl)
+                    st.plotly_chart(fig_pnl, use_container_width=True, config={"displayModeBar": False})
+
+                # Summary stats
+                all_win = multi[multi["n_losses"] == 0]
+                all_loss = multi[multi["n_wins"] == 0]
+                mixed = multi[(multi["n_wins"] > 0) & (multi["n_losses"] > 0)]
+                st.caption(
+                    f"{len(multi)} slots with 2+ markets  |  "
+                    f"All win: {len(all_win)} ({len(all_win)/len(multi)*100:.0f}%)  |  "
+                    f"All loss: {len(all_loss)} ({len(all_loss)/len(multi)*100:.0f}%)  |  "
+                    f"Mixed: {len(mixed)} ({len(mixed)/len(multi)*100:.0f}%)"
+                )
+
+            else:
+                st.caption("No slots with multiple markets found")
+
+        st.markdown('<div style="height: 16px"></div>', unsafe_allow_html=True)
+
+        # ---------------------------------------------------------------
+        # Win Rate by Move % and Timing
+        # ---------------------------------------------------------------
+
+        has_move = [t for t in resolved if t.get("dir_move_pct") is not None]
+        has_timing = [t for t in resolved if t.get("minutes_into_slot") is not None]
+
+        if has_move or has_timing:
+            col_left, col_right = st.columns(2)
+
+            if has_move:
+                with col_left:
+                    st.markdown(
+                        '<p class="section-label">Win Rate by Underlying Move %</p>',
+                        unsafe_allow_html=True,
+                    )
+                    df_m = pd.DataFrame(has_move)
+                    bins = [-float("inf"), -1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0, float("inf")]
+                    labels = ["<-1%", "-1~-0.5", "-0.5~-0.2", "-0.2~0", "0~0.2", "0.2~0.5", "0.5~1%", ">1%"]
+                    df_m["bucket"] = pd.cut(df_m["dir_move_pct"], bins=bins, labels=labels)
+                    grouped = df_m.groupby("bucket", observed=True).agg(
+                        wins=("pnl", lambda x: (x > 0).sum()),
+                        total=("pnl", "count"),
+                    ).reset_index()
+                    grouped["wr"] = (grouped["wins"] / grouped["total"] * 100).round(1)
+
+                    colors = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped["wr"]]
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=grouped["bucket"], y=grouped["wr"],
+                        marker_color=colors, marker_line_width=0,
+                        opacity=0.85,
+                        text=grouped.apply(
+                            lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                        ),
+                        textposition="outside",
+                        textfont=dict(size=10),
+                        hovertemplate="%{x}<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
+                        customdata=grouped[["wins", "total"]].values,
+                    ))
+                    layout_mv = _plotly_layout(height=260)
+                    layout_mv["yaxis"]["tickprefix"] = ""
+                    layout_mv["yaxis"]["ticksuffix"] = "%"
+                    layout_mv["yaxis"]["range"] = [0, min(grouped["wr"].max() + 20, 110)]
+                    fig.update_layout(**layout_mv)
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+            if has_timing:
+                with col_right:
+                    st.markdown(
+                        '<p class="section-label">Win Rate by Entry Timing (min)</p>',
+                        unsafe_allow_html=True,
+                    )
+                    df_t = pd.DataFrame(has_timing)
+                    bins_t = [0, 2, 4, 6, 8, 10, 12, 15]
+                    labels_t = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12", "12-15"]
+                    df_t["bucket"] = pd.cut(df_t["minutes_into_slot"], bins=bins_t, labels=labels_t, include_lowest=True)
+                    grouped_t = df_t.groupby("bucket", observed=True).agg(
+                        wins=("pnl", lambda x: (x > 0).sum()),
+                        total=("pnl", "count"),
+                    ).reset_index()
+                    grouped_t["wr"] = (grouped_t["wins"] / grouped_t["total"] * 100).round(1)
+
+                    colors_t = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped_t["wr"]]
+
+                    fig_t = go.Figure()
+                    fig_t.add_trace(go.Bar(
+                        x=grouped_t["bucket"], y=grouped_t["wr"],
+                        marker_color=colors_t, marker_line_width=0,
+                        opacity=0.85,
+                        text=grouped_t.apply(
+                            lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                        ),
+                        textposition="outside",
+                        textfont=dict(size=10),
+                        hovertemplate="%{x} min<br>Win Rate: %{y:.1f}%<br>%{customdata[0]}W / %{customdata[1]} total<extra></extra>",
+                        customdata=grouped_t[["wins", "total"]].values,
+                    ))
+                    layout_t = _plotly_layout(height=260)
+                    layout_t["yaxis"]["tickprefix"] = ""
+                    layout_t["yaxis"]["ticksuffix"] = "%"
+                    layout_t["yaxis"]["range"] = [0, min(grouped_t["wr"].max() + 20, 110)]
+                    layout_t["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
+                    fig_t.update_layout(**layout_t)
+                    st.plotly_chart(fig_t, use_container_width=True, config={"displayModeBar": False})
+
+    analysis_tab_content()
