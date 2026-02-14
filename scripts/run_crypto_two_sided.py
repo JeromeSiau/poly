@@ -156,31 +156,10 @@ async def slot_loop(
                     logger.debug("slot_not_found", slug=slug)
                 continue
 
-            # Risk check
-            if not await guard.is_trading_allowed(
-                last_book_update=feed.last_update_ts or time.time()
-            ):
-                logger.info("trading_blocked_by_guard", slug=slug)
-                continue
-
-            # Subscribe WebSocket
-            await feed.subscribe_market(
-                market.condition_id,
-                token_map=market.token_ids,
-            )
-
-            # Wait for book snapshot
-            await asyncio.sleep(0.5)
-
-            # Get best ask levels
-            now = time.time()
-            market_age_s = now - market.event_start
-
-            # Determine outcome labels
+            # Determine outcome labels early (before subscribe)
             outcomes = list(market.token_ids.keys())
             if len(outcomes) < 2:
                 logger.warning("insufficient_outcomes", slug=slug)
-                await feed.unsubscribe_market(market.condition_id)
                 continue
 
             # Identify Up/Down sides
@@ -193,46 +172,77 @@ async def slot_loop(
                 elif "down" in ol or "no" in ol:
                     down_outcome = o
             if not up_outcome or not down_outcome:
-                # Fall back to positional assignment
                 up_outcome, down_outcome = outcomes[0], outcomes[1]
 
-            # Get asks from feed
-            _, _, ask_up, _ = feed.get_best_levels(market.condition_id, up_outcome)
-            _, _, ask_down, _ = feed.get_best_levels(market.condition_id, down_outcome)
-
-            if ask_up is None or ask_down is None:
-                logger.debug(
-                    "no_asks_available",
-                    slug=slug,
-                    ask_up=ask_up,
-                    ask_down=ask_down,
-                )
-                await feed.unsubscribe_market(market.condition_id)
-                continue
-
-            # Check edge
-            if not engine.should_enter(ask_up, ask_down, market_age_s):
-                edge = compute_edge(ask_up, ask_down, fee_rate)
-                logger.debug(
-                    "edge_insufficient",
-                    slug=slug,
-                    ask_up=ask_up,
-                    ask_down=ask_down,
-                    edge=round(edge, 4),
-                    market_age_s=round(market_age_s, 1),
-                )
-                await feed.unsubscribe_market(market.condition_id)
-                continue
-
-            # Compute sweep budget
-            up_asks = _get_asks_from_feed(feed, market.condition_id, up_outcome)
-            down_asks = _get_asks_from_feed(feed, market.condition_id, down_outcome)
-            up_budget, down_budget, best_edge = compute_sweep(
-                up_asks, down_asks, fee_rate, budget
+            # Subscribe WebSocket once (batched, like TD maker)
+            await feed.subscribe_market(
+                market.condition_id,
+                token_map=market.token_ids,
+                send=False,
             )
+            await feed.flush_subscriptions()
 
-            if up_budget <= 0 or down_budget <= 0:
-                logger.debug("sweep_budget_zero", slug=slug)
+            # Wait for book snapshot with event-driven approach
+            # (like TD maker's book_updated.wait())
+            entry_deadline = market.event_start + engine.entry_window_s
+            entered = False
+
+            while time.time() < entry_deadline and not shutdown_event.is_set():
+                # Wait for book update or timeout
+                feed.book_updated.clear()
+                try:
+                    await asyncio.wait_for(
+                        feed.book_updated.wait(),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                # Risk check
+                if not await guard.is_trading_allowed(
+                    last_book_update=feed.last_update_ts or time.time()
+                ):
+                    logger.info("trading_blocked_by_guard", slug=slug)
+                    break
+
+                # Get best ask levels
+                _, _, ask_up, _ = feed.get_best_levels(market.condition_id, up_outcome)
+                _, _, ask_down, _ = feed.get_best_levels(market.condition_id, down_outcome)
+
+                if ask_up is None or ask_down is None:
+                    continue  # keep waiting for book data
+
+                now = time.time()
+                market_age_s = now - market.event_start
+
+                # Check edge
+                if not engine.should_enter(ask_up, ask_down, market_age_s):
+                    edge = compute_edge(ask_up, ask_down, fee_rate)
+                    logger.debug(
+                        "edge_insufficient",
+                        slug=slug,
+                        ask_up=ask_up,
+                        ask_down=ask_down,
+                        edge=round(edge, 4),
+                        market_age_s=round(market_age_s, 1),
+                    )
+                    continue  # keep watching — edge may improve
+
+                # Compute sweep budget
+                up_asks = _get_asks_from_feed(feed, market.condition_id, up_outcome)
+                down_asks = _get_asks_from_feed(feed, market.condition_id, down_outcome)
+                up_budget, down_budget, best_edge = compute_sweep(
+                    up_asks, down_asks, fee_rate, budget
+                )
+
+                if up_budget <= 0 or down_budget <= 0:
+                    logger.debug("sweep_budget_zero", slug=slug)
+                    continue  # keep watching
+
+                entered = True
+                break
+
+            if not entered:
                 await feed.unsubscribe_market(market.condition_id)
                 continue
 
