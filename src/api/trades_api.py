@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Query
-from sqlalchemy import select
+from sqlalchemy import select, func as sa_func
 
 from config.settings import settings
 from src.api.winrate import fetch_activity, analyse, resolve_open_markets
@@ -16,6 +16,8 @@ from src.db.models import LiveObservation as LO, PaperTrade as PT
 app = FastAPI(title="Trades API", version="1.0.0")
 
 DB_URL = "sqlite:///data/arb.db"
+
+_LIVE_MODES = {"live", "live_fill", "live_settlement", "autopilot"}
 
 
 @app.on_event("startup")
@@ -32,6 +34,8 @@ def health() -> dict[str, bool]:
 def list_trades(
     tag: Optional[str] = Query(default=None, description="Filter by strategy_tag (substring match)."),
     event_type: Optional[str] = Query(default=None, description="Filter by event_type (exact match)."),
+    mode: Optional[str] = Query(default=None, description="'live' or 'paper'. Filters by game_state.mode."),
+    is_open: Optional[bool] = Query(default=None, description="true=open positions only, false=closed only."),
     hours: float = Query(default=24.0, ge=0.1, le=720.0, description="Lookback window in hours."),
     limit: int = Query(default=200, ge=1, le=2000, description="Max rows returned."),
 ) -> dict:
@@ -39,12 +43,22 @@ def list_trades(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     session = get_sync_session(DB_URL)
     try:
-        q = (
-            select(LO, PT)
-            .outerjoin(PT, PT.observation_id == LO.id)
-            .where(LO.timestamp >= cutoff)
-            .order_by(LO.timestamp.desc())
-        )
+        # Use INNER JOIN when is_open is set (we need PT.is_open to filter)
+        if is_open is not None:
+            q = (
+                select(LO, PT)
+                .join(PT, PT.observation_id == LO.id)
+                .where(LO.timestamp >= cutoff)
+                .where(PT.is_open == is_open)
+                .order_by(LO.timestamp.desc())
+            )
+        else:
+            q = (
+                select(LO, PT)
+                .outerjoin(PT, PT.observation_id == LO.id)
+                .where(LO.timestamp >= cutoff)
+                .order_by(LO.timestamp.desc())
+            )
 
         if event_type:
             q = q.where(LO.event_type == event_type)
@@ -58,6 +72,14 @@ def list_trades(
             # Substring match on strategy_tag inside game_state
             if tag and tag not in gs.get("strategy_tag", ""):
                 continue
+
+            # Mode filter: check game_state.mode
+            if mode is not None:
+                obs_mode = str(gs.get("mode", "paper")).lower()
+                if mode == "live" and obs_mode not in _LIVE_MODES:
+                    continue
+                if mode == "paper" and obs_mode in _LIVE_MODES:
+                    continue
 
             entry = {
                 "id": obs.id,
@@ -110,8 +132,109 @@ def list_trades(
             "losses": losses,
             "winrate": round(wins / len(pnls) * 100, 1) if pnls else 0,
             "still_open": still_open,
-            "filters": {"tag": tag, "event_type": event_type, "hours": hours},
+            "filters": {
+                "tag": tag,
+                "event_type": event_type,
+                "mode": mode,
+                "is_open": is_open,
+                "hours": hours,
+            },
             "trades": trades,
+        }
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# /balance — paper or live USDC balance
+# ---------------------------------------------------------------------------
+
+@app.get("/balance")
+def balance(
+    mode: str = Query(default="paper", description="'live' or 'paper'."),
+) -> dict:
+    """Return current balance for paper or live mode."""
+    if mode == "live":
+        from src.arb.polymarket_executor import PolymarketExecutor
+        bal = PolymarketExecutor()._get_balance_sync()
+        return {"balance": bal, "mode": "live"}
+
+    # Paper: starting capital + sum of closed paper-mode pnl
+    session = get_sync_session(DB_URL)
+    try:
+        q = (
+            select(sa_func.coalesce(sa_func.sum(PT.pnl), 0.0))
+            .join(LO, LO.id == PT.observation_id)
+            .where(PT.is_open == False)  # noqa: E712
+            .where(PT.pnl.isnot(None))
+        )
+        # Only count paper-mode trades (exclude live modes)
+        rows = session.execute(
+            select(PT.pnl, LO.game_state)
+            .join(LO, LO.id == PT.observation_id)
+            .where(PT.is_open == False)  # noqa: E712
+            .where(PT.pnl.isnot(None))
+        ).all()
+        paper_pnl = sum(
+            pnl for pnl, gs in rows
+            if str((gs or {}).get("mode", "paper")).lower() not in _LIVE_MODES
+        )
+        bal = settings.PAPER_STARTING_CAPITAL + paper_pnl
+        return {"balance": round(bal, 4), "mode": "paper"}
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# /winrate — on-chain (live) or DB-based (paper)
+# ---------------------------------------------------------------------------
+
+def _winrate_paper(hours: float) -> dict:
+    """Compute paper-mode win rate from the internal DB."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    session = get_sync_session(DB_URL)
+    try:
+        rows = session.execute(
+            select(LO, PT)
+            .join(PT, PT.observation_id == LO.id)
+            .where(LO.timestamp >= cutoff)
+        ).all()
+
+        # Filter to paper-mode observations only
+        paper_rows = []
+        for obs, trade in rows:
+            gs = obs.game_state or {}
+            obs_mode = str(gs.get("mode", "paper")).lower()
+            if obs_mode not in _LIVE_MODES:
+                paper_rows.append((obs, trade))
+
+        # Separate resolved vs open
+        resolved = [(o, t) for o, t in paper_rows if t.pnl is not None]
+        still_open = [(o, t) for o, t in paper_rows if t.pnl is None]
+
+        wins = [(o, t) for o, t in resolved if t.pnl > 0]
+        losses = [(o, t) for o, t in resolved if t.pnl <= 0]
+
+        total_pnl = sum(t.pnl for _, t in resolved)
+        total_cost = sum(t.size for _, t in paper_rows)
+        win_pnl = sum(t.pnl for _, t in wins)
+        loss_pnl = sum(t.pnl for _, t in losses)
+
+        return {
+            "mode": "paper",
+            "hours": hours,
+            "total_markets": len(paper_rows),
+            "resolved": len(resolved),
+            "still_open": len(still_open),
+            "wins": len(wins),
+            "losses": len(losses),
+            "winrate": round(len(wins) / len(resolved) * 100, 1) if resolved else 0,
+            "total_pnl": round(total_pnl, 2),
+            "total_invested": round(total_cost, 2),
+            "roi_pct": round(total_pnl / total_cost * 100, 1) if total_cost > 0 else 0,
+            "avg_win": round(win_pnl / len(wins), 2) if wins else 0,
+            "avg_loss": round(loss_pnl / len(losses), 2) if losses else 0,
+            "profit_factor": round(abs(win_pnl / loss_pnl), 2) if loss_pnl < 0 else None,
         }
     finally:
         session.close()
@@ -121,8 +244,12 @@ def list_trades(
 def winrate(
     hours: float = Query(default=24.0, ge=0.1, le=720.0, description="Lookback window in hours."),
     wallet: Optional[str] = Query(default=None, description="Wallet address (default: from settings)."),
+    mode: Optional[str] = Query(default="live", description="'live' (on-chain) or 'paper' (DB)."),
 ) -> dict:
-    """Win rate from on-chain Polymarket wallet activity."""
+    """Win rate from on-chain Polymarket wallet activity or paper DB."""
+    if mode == "paper":
+        return _winrate_paper(hours)
+
     addr = wallet or settings.POLYMARKET_WALLET_ADDRESS
     if not addr:
         return {"error": "No wallet configured"}
