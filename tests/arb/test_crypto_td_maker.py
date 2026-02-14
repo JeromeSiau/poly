@@ -365,8 +365,8 @@ class TestSequentialLadder:
 
     @pytest.mark.asyncio
     async def test_cancel_clears_rung_placed(self):
-        """When bid goes out of range and order is cancelled, _rung_placed is cleaned
-        so the rung can be re-placed when bid returns to range."""
+        """When bid drops below target_bid, orders are cancelled and _rung_placed
+        is cleaned so the rung can be re-placed when bid returns to range."""
         # Start with bid in range → rung[0] placed.
         feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
                                      bid_down=0.80, ask_down=0.82)
@@ -376,10 +376,10 @@ class TestSequentialLadder:
         assert len(_orders_for_outcome(maker, "Down")) == 1
         assert len(maker._rung_placed) == 1
 
-        # Bid goes ABOVE max_bid (0.85) → out of range → cancel.
-        # (Using bid > max_bid avoids triggering bid-through paper fill.)
-        feed._best_cache[TOK_DOWN] = (0.90, 100.0, 0.92, 100.0)
-        feed._best_cache[TOK_UP] = (0.10, 100.0, 0.12, 100.0)
+        # Book disappears (bid=None) → out of range → cancel.
+        # (Can't use bid < target_bid because that triggers paper bid-through fill.)
+        del feed._best_cache[TOK_DOWN]
+        del feed._best_cache[TOK_UP]
         feed.last_update_ts = time.monotonic()
 
         await maker._maker_tick()
@@ -397,6 +397,28 @@ class TestSequentialLadder:
         down_orders = _orders_for_outcome(maker, "Down")
         assert len(down_orders) == 1
         assert down_orders[0].price == 0.75
+
+    @pytest.mark.asyncio
+    async def test_ladder_not_cancelled_when_bid_above_max(self):
+        """When bid rises above max_bid, ladder orders stay — the upper rungs
+        may now be placeable as maker (bid > max_bid means ask > max_bid)."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=2)
+
+        await maker._maker_tick()
+        assert len(_orders_for_outcome(maker, "Down")) == 1
+        assert _orders_for_outcome(maker, "Down")[0].price == 0.75
+
+        # Bid rises above max_bid — order should NOT be cancelled.
+        feed._best_cache[TOK_DOWN] = (0.90, 100.0, 0.92, 100.0)
+        feed._best_cache[TOK_UP] = (0.10, 100.0, 0.12, 100.0)
+        feed.last_update_ts = time.monotonic()
+
+        await maker._maker_tick()
+        # Order at 0.75 still on book.
+        assert len(_orders_for_outcome(maker, "Down")) == 1
+        assert _orders_for_outcome(maker, "Down")[0].price == 0.75
 
 
 # ---------------------------------------------------------------------------

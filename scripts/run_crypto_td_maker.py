@@ -458,7 +458,7 @@ class CryptoTDMaker:
                     and self.target_bid <= bid <= self.max_bid
                 )
 
-                if self.ladder_rungs > 1 and bid_in_range:
+                if self.ladder_rungs > 1 and bid is not None and bid >= self.target_bid:
                     # ---- Sequential ladder: place only the next rung ----
                     next_idx = self._cid_fill_count.get(cid, 0)
                     if next_idx < len(self.rung_prices):
@@ -821,9 +821,11 @@ class CryptoTDMaker:
     async def _async_cancel(self, order_id: str) -> None:
         try:
             await self.executor.cancel_order(order_id)
-            # Cancel confirmed — clean up.
-            self._pending_cancels.pop(order_id, None)
-            self._db_fire(self._db_delete_order(order_id))
+            # Don't pop from _pending_cancels immediately — the CLOB may
+            # return success even for orders that were already filled.
+            # The stale-cancel expiry (30s) will clean up; meanwhile the
+            # fill listener can still match late WS events.
+            logger.debug("td_cancel_api_ok", order_id=order_id[:16])
         except Exception:
             # Keep in _pending_cancels; _fill_listener or expiry will handle it.
             pass
