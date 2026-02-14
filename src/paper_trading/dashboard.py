@@ -1788,7 +1788,7 @@ def main():
     # Sidebar
     st.sidebar.header("Settings")
     db_path = st.sidebar.text_input("Database Path", "data/arb.db")
-    mode_filter = st.sidebar.radio("Execution Mode", ["All", "Paper", "Live"], index=2, horizontal=True)
+    mode_filter = st.sidebar.radio("Execution Mode", ["All", "Paper", "Live"], index=0, horizontal=True)
     refresh = st.sidebar.button("Refresh Data")
 
     # Load data
