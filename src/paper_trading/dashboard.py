@@ -87,7 +87,7 @@ def _plotly_layout(**overrides) -> dict:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="JetBrains Mono, SF Mono, Menlo, monospace", color=C_TEXT, size=11),
-        margin=dict(l=0, r=0, t=28, b=0),
+        margin=dict(l=0, r=0, t=36, b=0),
         xaxis=dict(
             gridcolor=C_GRID, zerolinecolor=C_GRID,
             tickfont=dict(color=C_MUTED, size=10),
@@ -263,8 +263,7 @@ hr {
     align-items: center;
     gap: 12px;
     padding: 0 0 12px;
-    border-bottom: 1px solid #1e2a3a;
-    margin-bottom: 16px;
+    margin-bottom: 4px;
 }
 .dash-header .logo {
     font-family: 'JetBrains Mono', monospace;
