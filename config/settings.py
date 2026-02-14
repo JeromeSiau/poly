@@ -194,6 +194,10 @@ class Settings(BaseSettings):
     KALSHI_API_KEY_ID: str = ""
     KALSHI_PRIVATE_KEY_PATH: str = ""  # path to RSA PEM file
 
+    # === Ploi (deploy daemon restart) ===
+    PLOI_API_TOKEN: str = ""
+    PLOI_SERVER_ID: str = ""
+
     # === Combinatorial Arbitrage ===
     COMBO_ARB_SCAN_INTERVAL: float = 60.0
     COMBO_ARB_MIN_PROFIT: float = 0.05
