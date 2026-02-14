@@ -230,10 +230,13 @@ class Settings(BaseSettings):
     WEATHER_ORACLE_NO_MAX_YES_PRICE: float = 0.05  # YES must be ≤5¢ (NO ≥95¢)
 
     # === Last-Penny Sniper ===
-    SNIPER_MIN_PRICE: float = 0.95
+    SNIPER_MIN_PRICE: float = 0.99
     SNIPER_RISK_PCT: float = 0.01
     SNIPER_MAX_PER_MARKET_PCT: float = 0.05
     SNIPER_SCAN_INTERVAL: float = 15.0
+
+    # === Paper Trading ===
+    PAPER_STARTING_CAPITAL: float = 1000.0
 
     model_config = {"env_file": ".env"}
 
