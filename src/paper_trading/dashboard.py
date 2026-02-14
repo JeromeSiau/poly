@@ -147,10 +147,12 @@ section[data-testid="stSidebar"] .stMultiSelect > label {
     border: 1px solid #1e2a3a;
     border-radius: 8px;
     padding: 14px 18px 12px;
-    min-height: 100px;
+    height: 110px;
+    box-sizing: border-box;
     display: flex;
     flex-direction: column;
     justify-content: center;
+    overflow: hidden;
 }
 /* Force equal-width columns */
 [data-testid="stHorizontalBlock"] > [data-testid="column"] {
