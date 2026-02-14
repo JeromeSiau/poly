@@ -5,7 +5,6 @@ No direct DB access — pure API consumer.
 """
 
 from datetime import datetime, timezone
-import time
 
 import httpx
 import pandas as pd
@@ -15,8 +14,6 @@ import streamlit as st
 API_BASE = "http://localhost:8788"
 
 LOOKBACK_MAP = {"1h": 1, "4h": 4, "12h": 12, "24h": 24, "48h": 48, "7d": 168}
-
-_STALE_THRESHOLD_S = 30 * 60
 
 # -- Colors --
 C_BG = "#0b0e17"
@@ -59,25 +56,28 @@ def _humanize_age(ts_str: str) -> str:
         return "?"
 
 
-def _is_stale_position(trade: dict) -> bool:
-    match_id = trade.get("match_id", "")
-    parts = str(match_id).split("-")
-    for part in reversed(parts):
-        if part.isdigit() and len(part) >= 10:
-            market_ts = int(part)
-            if time.time() > market_ts + _STALE_THRESHOLD_S:
-                return True
-            break
-    ts_str = trade.get("timestamp", "")
+def _style_pnl(val):
+    """Color PnL values green/red."""
+    if not val:
+        return ""
     try:
-        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        if (datetime.now(timezone.utc) - ts).total_seconds() > _STALE_THRESHOLD_S:
-            return True
-    except Exception:
+        n = float(val.replace("$", "").replace("+", ""))
+        if n > 0:
+            return f"color: {C_GREEN}; font-weight: 600"
+        if n < 0:
+            return f"color: {C_RED}; font-weight: 600"
+    except ValueError:
         pass
-    return False
+    return ""
+
+
+def _style_result(val):
+    """Color WIN/LOSS labels."""
+    if val == "WIN":
+        return f"color: {C_GREEN}"
+    if val == "LOSS":
+        return f"color: {C_RED}"
+    return f"color: {C_MUTED}"
 
 
 def _plotly_layout(**overrides) -> dict:
@@ -313,8 +313,8 @@ def kpi_section():
     losses = winrate_data.get("losses", 0)
     roi = winrate_data.get("roi_pct", 0.0)
 
-    open_data = _api("/trades", {"mode": m, "is_open": "true", "hours": 2})
-    active = [t for t in open_data.get("trades", []) if not _is_stale_position(t)]
+    pos_data = _api("/positions", {"mode": m})
+    n_positions = pos_data.get("count", 0)
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Balance", f"${bal:,.2f}")
@@ -322,7 +322,7 @@ def kpi_section():
     c3.metric("Win Rate", f"{wr:.1f}%", delta=f"{wins}W {losses}L")
     c4.metric("Profit Factor", f"{pf:.2f}" if pf else "--")
     c5.metric("ROI", f"{roi:+.1f}%")
-    c6.metric("Active", str(len(active)))
+    c6.metric("Positions", str(n_positions))
 
 
 kpi_section()
@@ -447,26 +447,29 @@ hourly_pnl_section()
 def open_positions_section():
     m = st.session_state.get("mode", "Live").lower()
 
-    open_data = _api("/trades", {"mode": m, "is_open": "true", "hours": 2})
-    trades = [t for t in open_data.get("trades", []) if not _is_stale_position(t)]
-
     st.markdown('<p class="section-label">Open Positions</p>', unsafe_allow_html=True)
 
-    if not trades:
-        st.caption("No active positions")
+    pos_data = _api("/positions", {"mode": m})
+    items = pos_data.get("positions", [])
+
+    if not items:
+        st.caption("No open positions")
         return
 
-    odf = pd.DataFrame(trades)
-    for tag, group in odf.groupby("strategy_tag", sort=True):
-        st.caption(tag)
-        display = pd.DataFrame({
-            "Market": group["title"],
-            "Side": group["outcome"],
-            "Entry": group["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
-            "Size": group["size"].apply(lambda x: f"${x:.2f}" if x is not None else ""),
-            "Age": group["timestamp"].apply(_humanize_age),
-        })
-        st.dataframe(display, use_container_width=True, hide_index=True)
+    df = pd.DataFrame(items)
+
+    display = pd.DataFrame({
+        "Market": df["title"],
+        "Side": df["outcome"],
+        "Shares": df["size"].apply(lambda x: f"{x:.1f}"),
+        "Entry": df["avg_price"].apply(lambda x: f"{x:.2f}" if x else ""),
+        "Price": df["cur_price"].apply(lambda x: f"{x:.2f}" if x else ""),
+        "Value": df["value"].apply(lambda x: f"${x:.2f}" if x else ""),
+        "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
+    })
+
+    styled = display.style.map(_style_pnl, subset=["PnL"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 open_positions_section()
@@ -480,76 +483,80 @@ open_positions_section()
 def recent_trades_section():
     m = st.session_state.get("mode", "Live").lower()
     h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
-    strats = st.session_state.get("strategies", [])
 
     st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
 
-    data = _api("/trades", {"mode": m, "hours": h, "is_open": "false", "limit": 200})
-    trades = data.get("trades", [])
-
-    if not trades:
-        st.caption("No trades in this period")
-        return
-
-    df = pd.DataFrame(trades)
-    if strats:
-        df = df[df["strategy_tag"].isin(strats)]
-    if df.empty:
-        st.caption("No trades matching filters")
-        return
-
-    def _fmt_time(ts_str):
-        try:
-            return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).strftime("%H:%M")
-        except Exception:
-            return ""
-
-    def _result(row):
-        if row.get("pnl") is not None and row["pnl"] > 0:
-            return "WIN"
-        if row.get("pnl") is not None:
-            return "LOSS"
-        return "--"
-
-    display = pd.DataFrame({
-        "Time": df["timestamp"].apply(_fmt_time),
-        "Strategy": df["strategy_tag"],
-        "Market": df["title"],
-        "Side": df["outcome"],
-        "Entry": df["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
-        "Exit": df["exit_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
-        "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
-        "Result": df.apply(_result, axis=1),
-    })
-
-    def _style_pnl(val):
-        if not val:
-            return ""
-        try:
-            n = float(val.replace("$", "").replace("+", ""))
-            if n > 0:
-                return f"color: {C_GREEN}; font-weight: 600"
-            if n < 0:
-                return f"color: {C_RED}; font-weight: 600"
-        except ValueError:
-            pass
-        return ""
-
-    def _style_result(val):
-        if val == "WIN":
-            return f"color: {C_GREEN}"
-        if val == "LOSS":
-            return f"color: {C_RED}"
-        return f"color: {C_MUTED}"
-
-    styled = display.style.map(_style_pnl, subset=["PnL"]).map(_style_result, subset=["Result"])
-    st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
-
-    pnls = [t["pnl"] for t in trades if t.get("pnl") is not None]
-    if pnls:
+    if m == "live":
+        # Live: use on-chain data from /winrate
+        winrate_data = _api("/winrate", {"mode": "live", "hours": h})
+        markets = winrate_data.get("markets", [])
+        if not markets:
+            st.caption("No trades in this period")
+            return
+        rows = []
+        for mk in markets:
+            ts_val = mk.get("timestamp")
+            if isinstance(ts_val, (int, float)):
+                dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+            else:
+                continue
+            rows.append({
+                "Time": dt.strftime("%H:%M"),
+                "Market": mk.get("title", ""),
+                "Side": mk.get("outcome", ""),
+                "Entry": f"{mk['avg_entry']:.2f}" if mk.get("avg_entry") else "",
+                "Cost": f"${mk['cost']:.2f}" if mk.get("cost") else "",
+                "PnL": f"${mk['pnl']:+.2f}",
+                "Result": mk.get("status", ""),
+            })
+        display = pd.DataFrame(rows)
+        styled = display.style.map(_style_pnl, subset=["PnL"]).map(
+            _style_result, subset=["Result"]
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+        pnls = [mk["pnl"] for mk in markets]
         w = sum(1 for p in pnls if p > 0)
         l = sum(1 for p in pnls if p <= 0)
-        st.caption(f"{len(display)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
+        st.caption(f"{len(markets)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
+    else:
+        # Paper: use internal DB
+        data = _api("/trades", {"mode": "paper", "hours": h, "is_open": "false", "limit": 200})
+        trades = data.get("trades", [])
+        if not trades:
+            st.caption("No trades in this period")
+            return
+        df = pd.DataFrame(trades)
+        if df.empty:
+            return
+
+        def _fmt_time(ts_str):
+            try:
+                return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).strftime("%H:%M")
+            except Exception:
+                return ""
+
+        display = pd.DataFrame({
+            "Time": df["timestamp"].apply(_fmt_time),
+            "Strategy": df["strategy_tag"],
+            "Market": df["title"],
+            "Side": df["outcome"],
+            "Entry": df["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+            "Exit": df["exit_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+            "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
+            "Result": df.apply(
+                lambda r: "WIN" if r.get("pnl") and r["pnl"] > 0
+                else ("LOSS" if r.get("pnl") is not None else "--"), axis=1
+            ),
+        })
+        styled = display.style.map(_style_pnl, subset=["PnL"]).map(
+            _style_result, subset=["Result"]
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+        pnls = [t["pnl"] for t in trades if t.get("pnl") is not None]
+        if pnls:
+            w = sum(1 for p in pnls if p > 0)
+            l = sum(1 for p in pnls if p <= 0)
+            st.caption(f"{len(display)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
 
 
 recent_trades_section()

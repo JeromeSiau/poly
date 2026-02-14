@@ -251,6 +251,69 @@ def balance(
 
 
 # ---------------------------------------------------------------------------
+# /positions — live positions from Polymarket Data API
+# ---------------------------------------------------------------------------
+
+@app.get("/positions")
+def positions(
+    mode: str = Query(default="live", description="'live' or 'paper'."),
+) -> dict:
+    """Return open positions. Live: Polymarket Data API. Paper: internal DB."""
+    if mode == "live":
+        wallet = settings.POLYMARKET_WALLET_ADDRESS
+        if not wallet:
+            return {"positions": [], "error": "No wallet configured"}
+        try:
+            raw = _fetch_positions(wallet)
+            items = [
+                {
+                    "title": p.get("title", ""),
+                    "slug": p.get("slug", ""),
+                    "outcome": p.get("outcome", ""),
+                    "size": round(float(p.get("size", 0)), 2),
+                    "avg_price": round(float(p.get("avgPrice", 0)), 4),
+                    "cur_price": round(float(p.get("curPrice", 0)), 4),
+                    "value": round(float(p.get("currentValue", 0)), 2),
+                    "pnl": round(float(p.get("cashPnl", 0)), 2),
+                    "pnl_pct": round(float(p.get("percentPnl", 0)), 1),
+                }
+                for p in raw
+            ]
+            return {"mode": "live", "count": len(items), "positions": items}
+        except Exception as exc:
+            return {"positions": [], "error": str(exc)}
+
+    # Paper: open positions from internal DB
+    session = get_sync_session(DB_URL)
+    try:
+        rows = session.execute(
+            select(LO, PT)
+            .join(PT, PT.observation_id == LO.id)
+            .where(PT.is_open == True)  # noqa: E712
+        ).all()
+        items = []
+        for obs, trade in rows:
+            gs = obs.game_state or {}
+            obs_mode = str(gs.get("mode", "paper")).lower()
+            if obs_mode in _LIVE_MODES:
+                continue
+            items.append({
+                "title": gs.get("title", ""),
+                "slug": gs.get("slug", ""),
+                "outcome": gs.get("outcome", ""),
+                "size": round(trade.size, 2) if trade.size else 0,
+                "avg_price": round(trade.entry_price, 4) if trade.entry_price else 0,
+                "cur_price": None,
+                "value": None,
+                "pnl": None,
+                "pnl_pct": None,
+            })
+        return {"mode": "paper", "count": len(items), "positions": items}
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # /winrate — on-chain (live) or DB-based (paper)
 # ---------------------------------------------------------------------------
 
