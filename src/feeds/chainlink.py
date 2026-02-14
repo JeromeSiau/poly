@@ -23,6 +23,7 @@ logger = structlog.get_logger()
 
 WS_URL = "wss://ws-live-data.polymarket.com"
 PING_INTERVAL = 10.0
+STALE_THRESHOLD = 60.0  # force reconnect if no price update for this long
 RECONNECT_BASE = 1.0
 RECONNECT_MAX = 30.0
 
@@ -139,8 +140,22 @@ class ChainlinkFeed:
         while self._connected and self._ws:
             try:
                 await asyncio.sleep(PING_INTERVAL)
-                if self._ws:
-                    await self._ws.ping()
+                if not self._ws:
+                    return
+                # Detect zombie connection: WS responds to pings but
+                # Polymarket stopped pushing price updates.
+                if (
+                    self._last_update_ts > 0
+                    and time.time() - self._last_update_ts > STALE_THRESHOLD
+                ):
+                    logger.warning(
+                        "chainlink_ws_stale",
+                        seconds_since_update=round(
+                            time.time() - self._last_update_ts, 1
+                        ),
+                    )
+                    return  # exit to trigger reconnect
+                await self._ws.ping()
             except asyncio.CancelledError:
                 raise
             except Exception:
