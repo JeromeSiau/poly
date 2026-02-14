@@ -8,11 +8,12 @@ source "$(dirname "$0")/_common.sh"
 #   run_sniper.sh --live --capital 1000     # live, custom capital
 
 MODE="paper"
-MIN_PRICE="${MIN_PRICE:-0.95}"
+MIN_PRICE="${MIN_PRICE:-0.99}"
 CAPITAL="${CAPITAL:-500}"
 RISK_PCT="${RISK_PCT:-0.01}"
 MAX_PER_MARKET="${MAX_PER_MARKET:-0.05}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-15}"
+MAX_END_HOURS="${MAX_END_HOURS:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
     --risk-pct)       RISK_PCT="$2"; shift 2 ;;
     --max-per-market) MAX_PER_MARKET="$2"; shift 2 ;;
     --scan-interval)  SCAN_INTERVAL="$2"; shift 2 ;;
+    --max-end-hours)  MAX_END_HOURS="$2"; shift 2 ;;
     *)                shift ;;
   esac
 done
@@ -39,6 +41,7 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start tag=$TAG mode=$MODE min_price=$MIN_
 exec "$PYTHON" "$BASE/scripts/run_sniper.py" \
   $MODE_FLAG \
   --min-price "$MIN_PRICE" \
+  --max-end-hours "$MAX_END_HOURS" \
   --capital "$CAPITAL" \
   --risk-pct "$RISK_PCT" \
   --max-per-market "$MAX_PER_MARKET" \

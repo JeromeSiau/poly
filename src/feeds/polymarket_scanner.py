@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -88,17 +89,19 @@ class MarketScanner:
     def __init__(
         self,
         *,
-        min_price: float = 0.95,
+        min_price: float = 0.99,
         scan_interval: float = 15.0,
         max_markets: int = 2000,
         book_concurrency: int = 20,
         fee_ok_above: float = 0.99,
+        max_end_hours: float = 1.0,
     ) -> None:
         self.min_price = min_price
         self.scan_interval = scan_interval
         self.max_markets = max_markets
         self.book_concurrency = book_concurrency
         self.fee_ok_above = fee_ok_above
+        self.max_end_hours = max_end_hours
 
         self._targets: list[SniperTarget] = []
         self._last_scan_ts: float = 0.0
@@ -201,6 +204,14 @@ class MarketScanner:
 
                 # Fee markets only accepted if price > fee_ok_above
                 if has_fee and max(prices) < self.fee_ok_above:
+                    continue
+
+                # Filter by time to resolution — category-specific
+                # Crypto: price is the signal, just exclude long-dated (24h)
+                # Sports: tight filter to ensure in-play near end (1h)
+                end_date_str = str(raw.get("endDate", ""))
+                cat_max_hours = self._max_hours_for_category(cat)
+                if not self._ends_within(end_date_str, cat_max_hours):
                     continue
 
                 raw["_category"] = cat
@@ -307,3 +318,31 @@ class MarketScanner:
         targets.sort(key=lambda t: t.ask_price, reverse=True)
 
         return targets
+
+    def _max_hours_for_category(self, category: str) -> float:
+        """Category-specific time-to-resolution limits.
+
+        Crypto: price at 0.99+ IS the timing signal. Just exclude long-dated.
+        Sports: tight filter ensures we only see in-play games near the end.
+        """
+        if category in ("crypto_15min", "crypto_hourly"):
+            return 1.0
+        if category == "crypto_bracket":
+            return 24.0
+        if category == "sports":
+            return self.max_end_hours  # default 1h — in-play near end
+        # politics, weather, other
+        return self.max_end_hours
+
+    def _ends_within(self, end_date_str: str, max_hours: float) -> bool:
+        """Return True if the market resolves within max_hours."""
+        if not end_date_str:
+            return False
+        try:
+            # Gamma returns ISO 8601: "2026-02-14T21:00:00Z"
+            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            hours_left = (end_dt - now).total_seconds() / 3600
+            return 0 < hours_left <= max_hours
+        except (ValueError, TypeError):
+            return False

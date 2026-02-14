@@ -77,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=settings.SNIPER_SCAN_INTERVAL,
         help=f"Seconds between REST scans (default: {settings.SNIPER_SCAN_INTERVAL})",
     )
+    p.add_argument(
+        "--max-end-hours", type=float, default=1.0,
+        help="Max hours to resolution for sports/other (default: 1). Crypto uses fixed limits.",
+    )
     p.add_argument("--strategy-tag", type=str, default="sniper_engine")
     p.add_argument("--db-url", type=str, default=settings.DATABASE_URL)
     p.add_argument("--cb-max-losses", type=int, default=3,
@@ -150,6 +154,7 @@ async def main() -> None:
         min_price=args.min_price,
         scan_interval=args.scan_interval,
         fee_ok_above=0.99,
+        max_end_hours=args.max_end_hours,
     )
 
     # Engine
@@ -169,6 +174,7 @@ async def main() -> None:
     mode = "PAPER" if paper_mode else "LIVE"
     print(f"=== Last-Penny Sniper ({mode}) ===")
     print(f"  Min price:    {args.min_price}")
+    print(f"  Max end:      {args.max_end_hours}h")
     print(f"  Capital:      ${args.capital:.0f}")
     print(f"  Risk/trade:   {args.risk_pct * 100:.1f}%")
     print(f"  Max/market:   {args.max_per_market * 100:.1f}%")
