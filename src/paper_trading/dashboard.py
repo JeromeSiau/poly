@@ -55,7 +55,7 @@ def _humanize_age(ts_str: str) -> str:
 st.set_page_config(page_title="Poly Dashboard", layout="wide")
 st.title("Portfolio Dashboard")
 
-mode = st.sidebar.radio("Mode", ["Live", "Paper"], index=1, key="mode")
+mode = st.sidebar.radio("Mode", ["Live", "Paper"], index=0, key="mode")
 mode_param = mode.lower()
 
 lookback_label = st.sidebar.selectbox(
