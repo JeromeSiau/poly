@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
-"""Smart deploy restart: only restart Ploi daemons affected by code changes.
+"""Smart deploy restart: only restart supervisor daemons affected by code changes.
 
-Usage: python bin/smart_restart.py <old_head_sha>
+Usage: python3 bin/smart_restart.py <old_head_sha>
 
-Reads PLOI_API_TOKEN and PLOI_SERVER_ID from config/settings.py (.env).
+Reads supervisor configs from /etc/supervisor/conf.d/worker-*.conf to discover
+daemons, then maps git-changed files to affected daemons and restarts only those.
 """
 
-import json
+import glob
 import subprocess
 import sys
-import urllib.request
 
-sys.path.insert(0, ".")
-from config.settings import settings
-
-PLOI_API = "https://ploi.io/api"
+SITE_DIR = "/home/ploi/orb.lvlup-dev.com"
 
 # ---------------------------------------------------------------------------
-# Dependency map: file-path prefix  →  affected daemon keys
+# Dependency map: file-path prefix → affected daemon keys
 #
-# A daemon "key" is a substring matched against the daemon command reported by
-# the Ploi API (e.g. "run_fear_selling" matches a command containing
+# A daemon "key" is a substring matched against the daemon's command in its
+# supervisor config (e.g. "run_fear_selling" matches a command containing
 # "run_fear_selling.sh" or "run_fear_selling.py").
 #
 # The special key "ALL" means every daemon must be restarted.
@@ -101,46 +98,41 @@ def resolve_affected_keys(changed_files: list[str]) -> set[str]:
     return keys
 
 
-def ploi_request(method: str, endpoint: str, body: dict | None = None) -> dict:
-    """Make an authenticated request to the Ploi API."""
-    url = f"{PLOI_API}{endpoint}"
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {settings.PLOI_API_TOKEN}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
-
-
-def list_daemons() -> list[dict]:
-    """Fetch all daemons from Ploi, handling pagination."""
+def discover_daemons() -> list[dict]:
+    """Read supervisor configs to find our site's daemons."""
     daemons = []
-    page = 1
-    while True:
-        resp = ploi_request("GET", f"/servers/{settings.PLOI_SERVER_ID}/daemons?page={page}")
-        daemons.extend(resp.get("data", []))
-        meta = resp.get("meta", {})
-        if page >= meta.get("last_page", 1):
-            break
-        page += 1
+    for conf_path in sorted(glob.glob("/etc/supervisor/conf.d/worker-*.conf")):
+        name = conf_path.rsplit("/", 1)[-1].replace(".conf", "")
+        command = ""
+        with open(conf_path) as f:
+            for line in f:
+                if line.strip().startswith("command="):
+                    command = line.strip().split("=", 1)[1]
+                    break
+        # Only include daemons that belong to our site
+        if SITE_DIR in command:
+            daemons.append({"name": name, "command": command})
     return daemons
-
-
-def restart_daemon(daemon_id: int) -> None:
-    """Restart a single daemon via Ploi API."""
-    ploi_request("POST", f"/servers/{settings.PLOI_SERVER_ID}/daemons/{daemon_id}/restart")
 
 
 def match_daemon(daemon: dict, keys: set[str]) -> bool:
     """Check if a daemon's command matches any of the affected keys."""
-    cmd = daemon.get("command", "")
+    cmd = daemon["command"]
     return any(key in cmd for key in keys)
+
+
+def restart(name: str) -> bool:
+    """Restart a supervisor daemon. Returns True on success."""
+    result = subprocess.run(
+        ["sudo", "supervisorctl", "restart", name],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python bin/smart_restart.py <old_head_sha>")
+        print("Usage: python3 bin/smart_restart.py <old_head_sha>")
         sys.exit(1)
 
     old_head = sys.argv[1]
@@ -165,32 +157,25 @@ def main() -> None:
 
     restart_all = "ALL" in keys
     if restart_all:
-        print("[smart_restart] Shared code changed → restarting ALL daemons.")
+        print("[smart_restart] Shared code changed -> restarting ALL daemons.")
     else:
-        print(f"[smart_restart] Affected daemons: {', '.join(sorted(keys))}")
+        print(f"[smart_restart] Affected keys: {', '.join(sorted(keys))}")
 
-    # 3. Validate Ploi credentials
-    if not settings.PLOI_API_TOKEN or not settings.PLOI_SERVER_ID:
-        print("[smart_restart] ERROR: PLOI_API_TOKEN and PLOI_SERVER_ID must be set in .env")
-        sys.exit(1)
+    # 3. Discover daemons from supervisor configs
+    daemons = discover_daemons()
+    print(f"[smart_restart] Found {len(daemons)} daemon(s) for {SITE_DIR}:")
+    for d in daemons:
+        print(f"  {d['name']}: {d['command'][:80]}")
 
-    # 4. Fetch daemons from Ploi
-    daemons = list_daemons()
-    print(f"[smart_restart] Found {len(daemons)} daemon(s) on Ploi.")
-
-    # 5. Restart matching daemons
+    # 4. Restart matching daemons
     restarted = 0
     for d in daemons:
-        if d.get("status") != "active":
-            continue
         if restart_all or match_daemon(d, keys):
-            name = d.get("command", "?")[:80]
-            print(f"  ↻ Restarting daemon {d['id']}: {name}")
-            try:
-                restart_daemon(d["id"])
+            ok = restart(d["name"])
+            status = "ok" if ok else "FAILED"
+            print(f"  -> restart {d['name']}: {status}")
+            if ok:
                 restarted += 1
-            except Exception as e:
-                print(f"  ✗ Failed to restart daemon {d['id']}: {e}")
 
     print(f"[smart_restart] Done. Restarted {restarted}/{len(daemons)} daemon(s).")
 
