@@ -9,22 +9,30 @@ import time
 
 import httpx
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 API_BASE = "http://localhost:8788"
 
 LOOKBACK_MAP = {"1h": 1, "4h": 4, "12h": 12, "24h": 24, "48h": 48, "7d": 168}
 
-# 15-min markets older than this (seconds) are considered stale / resolved
-_STALE_THRESHOLD_S = 30 * 60  # 30 minutes
+_STALE_THRESHOLD_S = 30 * 60
+
+# -- Colors --
+C_BG = "#0b0e17"
+C_CARD = "#111827"
+C_CARD_BORDER = "#1e2a3a"
+C_GREEN = "#34d399"
+C_RED = "#f87171"
+C_MUTED = "#64748b"
+C_TEXT = "#e2e8f0"
+C_ACCENT = "#38bdf8"
+C_GRID = "rgba(148,163,184,0.06)"
 
 
 def _api(endpoint: str, params: dict | None = None) -> dict:
-    """Call the trades API and return JSON. Returns {} on any error."""
     try:
-        resp = httpx.get(
-            API_BASE + endpoint, params=params or {}, timeout=10
-        )
+        resp = httpx.get(API_BASE + endpoint, params=params or {}, timeout=10)
         return resp.json()
     except Exception as exc:
         st.warning(f"API error on {endpoint}: {exc}")
@@ -32,7 +40,6 @@ def _api(endpoint: str, params: dict | None = None) -> dict:
 
 
 def _humanize_age(ts_str: str) -> str:
-    """Convert an ISO timestamp string to a human-readable age like '2h 15m'."""
     try:
         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         if ts.tzinfo is None:
@@ -53,119 +60,248 @@ def _humanize_age(ts_str: str) -> str:
 
 
 def _is_stale_position(trade: dict) -> bool:
-    """Return True if this open position is stale (15-min market already resolved)."""
     match_id = trade.get("match_id", "")
-    # CryptoTD match_ids contain a unix timestamp: e.g. "btc-updown-15m-1771082100"
     parts = str(match_id).split("-")
     for part in reversed(parts):
         if part.isdigit() and len(part) >= 10:
             market_ts = int(part)
-            # Market resolves at ts + 15min (900s)
             if time.time() > market_ts + _STALE_THRESHOLD_S:
                 return True
             break
-    # Fallback: if the trade timestamp is older than 30 min, consider stale
     ts_str = trade.get("timestamp", "")
     try:
         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        age_s = (datetime.now(timezone.utc) - ts).total_seconds()
-        if age_s > _STALE_THRESHOLD_S:
+        if (datetime.now(timezone.utc) - ts).total_seconds() > _STALE_THRESHOLD_S:
             return True
     except Exception:
         pass
     return False
 
 
+def _plotly_layout(**overrides) -> dict:
+    """Base Plotly layout — clean dark terminal aesthetic."""
+    base = dict(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="JetBrains Mono, SF Mono, Menlo, monospace", color=C_TEXT, size=11),
+        margin=dict(l=0, r=0, t=28, b=0),
+        xaxis=dict(
+            gridcolor=C_GRID, zerolinecolor=C_GRID,
+            tickfont=dict(color=C_MUTED, size=10),
+        ),
+        yaxis=dict(
+            gridcolor=C_GRID, zerolinecolor=C_GRID,
+            tickfont=dict(color=C_MUTED, size=10),
+            tickprefix="$", side="right",
+        ),
+        hoverlabel=dict(
+            bgcolor="#1e293b", bordercolor="#334155",
+            font=dict(color=C_TEXT, family="JetBrains Mono, monospace", size=12),
+        ),
+        dragmode=False,
+        hovermode="x unified",
+    )
+    base.update(overrides)
+    return base
+
+
 # ---------------------------------------------------------------------------
-# Page config & custom styling
+# Page config
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Poly Dashboard", layout="wide")
+st.set_page_config(page_title="Poly", page_icon="P", layout="wide")
 
 st.markdown("""
 <style>
-/* Dark modern feel */
-[data-testid="stMetric"] {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-    border: 1px solid #0f3460;
-    border-radius: 12px;
-    padding: 16px 20px;
-    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
-}
-[data-testid="stMetricLabel"] {
-    color: #8892b0 !important;
-    font-size: 0.85rem !important;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-[data-testid="stMetricValue"] {
-    font-size: 1.6rem !important;
-    font-weight: 700 !important;
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+/* Root */
+.stApp {
+    background: #0b0e17;
+    font-family: 'DM Sans', sans-serif;
 }
 
-/* Section headers */
-h2 {
-    color: #ccd6f6 !important;
-    border-bottom: 2px solid #0f3460;
-    padding-bottom: 8px;
-    margin-top: 1rem !important;
-}
+/* Hide Streamlit chrome */
+#MainMenu, footer, header {visibility: hidden;}
 
 /* Sidebar */
-[data-testid="stSidebar"] {
-    background: #0a0a1a;
+section[data-testid="stSidebar"] {
+    background: #070a12;
+    border-right: 1px solid #1e2a3a;
+}
+section[data-testid="stSidebar"] .stRadio > label,
+section[data-testid="stSidebar"] .stSelectbox > label,
+section[data-testid="stSidebar"] .stMultiSelect > label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #64748b;
 }
 
-/* Dataframe styling */
-[data-testid="stDataFrame"] {
+/* KPI cards */
+[data-testid="stMetric"] {
+    background: #111827;
+    border: 1px solid #1e2a3a;
     border-radius: 8px;
-    overflow: hidden;
+    padding: 14px 18px 12px;
+}
+[data-testid="stMetricLabel"] {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.65rem !important;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #64748b !important;
+}
+[data-testid="stMetricValue"] {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 1.5rem !important;
+    font-weight: 600 !important;
+    color: #e2e8f0 !important;
+}
+[data-testid="stMetricDelta"] {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.7rem !important;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0;
+    border-bottom: 1px solid #1e2a3a;
+}
+.stTabs [data-baseweb="tab"] {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #64748b;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 10px 24px;
+    background: transparent;
+}
+.stTabs [aria-selected="true"] {
+    color: #38bdf8 !important;
+    border-bottom: 2px solid #38bdf8 !important;
+    background: transparent !important;
 }
 
 /* Divider */
 hr {
-    border-color: #1a1a3e !important;
-    margin: 1rem 0 !important;
+    border-color: #1e2a3a !important;
+    margin: 0.5rem 0 !important;
 }
 
-/* Chart container */
-[data-testid="stVegaLiteChart"] {
-    background: #0d1117;
-    border-radius: 12px;
-    padding: 10px;
-    border: 1px solid #1a1a3e;
+/* Dataframes */
+[data-testid="stDataFrame"] {
+    border: 1px solid #1e2a3a;
+    border-radius: 6px;
+    overflow: hidden;
+}
+[data-testid="stDataFrame"] * {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.8rem !important;
 }
 
-/* Tabs styling */
-[data-testid="stTabs"] [data-baseweb="tab-list"] {
-    gap: 8px;
+/* Plotly chart containers */
+[data-testid="stPlotlyChart"] {
+    border: 1px solid #1e2a3a;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #0f1219;
 }
-[data-testid="stTabs"] [data-baseweb="tab"] {
-    border-radius: 8px 8px 0 0;
-    padding: 8px 20px;
+
+/* Section labels */
+.section-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: #475569;
+    margin: 0;
+    padding: 8px 0 4px;
+}
+
+/* Header bar */
+.dash-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 0 12px;
+    border-bottom: 1px solid #1e2a3a;
+    margin-bottom: 16px;
+}
+.dash-header .logo {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 1.1rem;
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.1);
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    border-radius: 6px;
+    padding: 4px 10px;
+    letter-spacing: 2px;
+}
+.dash-header .title {
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 400;
+    font-size: 0.9rem;
+    color: #94a3b8;
+}
+.dash-header .live-dot {
+    width: 6px; height: 6px;
+    background: #34d399;
+    border-radius: 50%;
+    animation: pulse-dot 2s ease-in-out infinite;
+    margin-left: auto;
+}
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52,211,153,0.4); }
+    50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(52,211,153,0); }
+}
+
+/* Trade row highlight on hover */
+[data-testid="stDataFrame"] tbody tr:hover {
+    background: rgba(56, 189, 248, 0.04) !important;
+}
+
+/* Captions */
+.stCaption {
+    font-family: 'JetBrains Mono', monospace !important;
+    color: #475569 !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------------------------
 # Header
-st.markdown("## :chart_with_upward_trend: Portfolio Dashboard")
+# ---------------------------------------------------------------------------
 
 mode = st.sidebar.radio("Mode", ["Live", "Paper"], index=0, key="mode")
-
 lookback_label = st.sidebar.selectbox(
     "Lookback", list(LOOKBACK_MAP.keys()), index=3, key="lookback"
 )
 hours = LOOKBACK_MAP[lookback_label]
-
 tags_data = _api("/tags", {"hours": hours})
 available_tags = sorted(tags_data.get("strategy_tags", {}).keys())
 st.sidebar.multiselect("Strategies", available_tags, key="strategies")
 
+mode_lower = st.session_state.get("mode", "Live").lower()
+live_dot = '<div class="live-dot"></div>' if mode_lower == "live" else ""
+st.markdown(
+    f'<div class="dash-header">'
+    f'<span class="logo">POLY</span>'
+    f'<span class="title">Portfolio Dashboard</span>'
+    f'{live_dot}'
+    f'</div>',
+    unsafe_allow_html=True,
+)
+
 
 # ---------------------------------------------------------------------------
-# Section 1: KPIs
+# KPIs
 # ---------------------------------------------------------------------------
 
 @st.fragment(run_every="15s")
@@ -184,131 +320,147 @@ def kpi_section():
     losses = winrate_data.get("losses", 0)
     roi = winrate_data.get("roi_pct", 0.0)
 
-    # Count truly active open positions (not stale)
     open_data = _api("/trades", {"mode": m, "is_open": "true", "hours": 2})
     active = [t for t in open_data.get("trades", []) if not _is_stale_position(t)]
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Balance", f"${bal:,.2f}")
-    pnl_delta = f"{pnl:+.2f}" if pnl != 0 else None
-    c2.metric("PnL", f"${pnl:,.2f}", delta=pnl_delta)
-    c3.metric("Win Rate", f"{wr:.1f}%", delta=f"{wins}W / {losses}L")
-    c4.metric("Profit Factor", f"{pf:.2f}" if pf else "N/A")
+    c2.metric("PnL", f"${pnl:+,.2f}", delta=f"{pnl:+.2f}" if pnl else None)
+    c3.metric("Win Rate", f"{wr:.1f}%", delta=f"{wins}W {losses}L")
+    c4.metric("Profit Factor", f"{pf:.2f}" if pf else "--")
     c5.metric("ROI", f"{roi:+.1f}%")
-    c6.metric("Active", len(active))
+    c6.metric("Active", str(len(active)))
 
 
 kpi_section()
 
-st.divider()
+st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# Section 2: PnL Chart + Open Positions (tabs)
+# Charts + Positions
 # ---------------------------------------------------------------------------
 
 @st.fragment(run_every="15s")
 def charts_section():
     m = st.session_state.get("mode", "Live").lower()
     h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
-    strats = st.session_state.get("strategies", [])
 
-    tab_chart, tab_open = st.tabs(["PnL Chart", "Open Positions"])
+    tab_pnl, tab_dist, tab_open = st.tabs(["Cumulative PnL", "Trade Distribution", "Open Positions"])
 
-    # -- PnL Chart tab --
-    with tab_chart:
+    # -- Cumulative PnL --
+    with tab_pnl:
         winrate_data = _api("/winrate", {"mode": m, "hours": h})
         markets = winrate_data.get("markets", [])
 
         if not markets:
-            st.info("No resolved trades in this period")
-        else:
-            # Build cumulative PnL dataframe sorted by time
-            rows = []
-            for mk in markets:
-                ts_val = mk.get("timestamp")
-                if ts_val is None:
-                    continue
-                if isinstance(ts_val, (int, float)):
-                    dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
-                else:
-                    dt = datetime.fromisoformat(
-                        str(ts_val).replace("Z", "+00:00")
-                    )
-                rows.append({
-                    "time": dt,
-                    "pnl": mk["pnl"],
-                    "title": mk.get("title", ""),
-                    "status": mk.get("status", ""),
-                    "strategy": mk.get("title", "").split(" - ")[0][:20] if mk.get("title") else "",
-                })
+            st.caption("No resolved trades yet")
+            return
 
-            if rows:
-                df = pd.DataFrame(rows).sort_values("time")
-
-                # Strategy filter
-                if strats:
-                    # Fuzzy match on title since winrate doesn't return strategy_tag
-                    pass  # winrate endpoint doesn't have strategy_tag, skip filter
-
-                df["cumulative_pnl"] = df["pnl"].cumsum()
-
-                # Cumulative PnL line chart
-                chart_df = df[["time", "cumulative_pnl"]].copy()
-                chart_df.columns = ["Time", "Cumulative PnL ($)"]
-
-                st.line_chart(
-                    chart_df,
-                    x="Time",
-                    y="Cumulative PnL ($)",
-                    color="#00d4aa",
-                )
-
-                # Per-trade PnL bar chart
-                bar_df = df[["time", "pnl"]].copy()
-                bar_df.columns = ["Time", "PnL ($)"]
-                st.bar_chart(
-                    bar_df,
-                    x="Time",
-                    y="PnL ($)",
-                    color="#5e60ce",
-                )
+        rows = []
+        for mk in markets:
+            ts_val = mk.get("timestamp")
+            if ts_val is None:
+                continue
+            if isinstance(ts_val, (int, float)):
+                dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
             else:
-                st.info("No timestamped trade data available")
+                dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
+            rows.append({"time": dt, "pnl": mk["pnl"], "status": mk.get("status", "")})
 
-    # -- Open Positions tab --
+        if not rows:
+            st.caption("No timestamped data")
+            return
+
+        df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+        df["cum_pnl"] = df["pnl"].cumsum()
+
+        # Area chart with gradient fill
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df["time"], y=df["cum_pnl"],
+            mode="lines",
+            line=dict(color=C_GREEN if df["cum_pnl"].iloc[-1] >= 0 else C_RED, width=1.5),
+            fill="tozeroy",
+            fillcolor=f"rgba(52,211,153,0.08)" if df["cum_pnl"].iloc[-1] >= 0 else "rgba(248,113,113,0.08)",
+            hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<extra></extra>",
+        ))
+        # Zero line
+        fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+        fig.update_layout(**_plotly_layout(height=320))
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    # -- Trade Distribution --
+    with tab_dist:
+        if not rows:
+            st.caption("No data")
+            return
+
+        win_pnls = [r["pnl"] for r in rows if r["status"] == "WIN"]
+        loss_pnls = [r["pnl"] for r in rows if r["status"] == "LOSS"]
+
+        fig2 = go.Figure()
+        if win_pnls:
+            fig2.add_trace(go.Bar(
+                x=list(range(len(win_pnls))), y=win_pnls,
+                marker_color=C_GREEN, marker_line_width=0,
+                name="Win", opacity=0.85,
+                hovertemplate="$%{y:+.2f}<extra>Win</extra>",
+            ))
+        if loss_pnls:
+            fig2.add_trace(go.Bar(
+                x=list(range(len(win_pnls), len(win_pnls) + len(loss_pnls))), y=loss_pnls,
+                marker_color=C_RED, marker_line_width=0,
+                name="Loss", opacity=0.85,
+                hovertemplate="$%{y:+.2f}<extra>Loss</extra>",
+            ))
+
+        fig2.update_layout(**_plotly_layout(
+            height=220,
+            showlegend=False,
+            xaxis=dict(gridcolor=C_GRID, zerolinecolor=C_GRID, showticklabels=False),
+            bargap=0.15,
+        ))
+        fig2.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+        st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+
+        # Win/Loss summary
+        avg_w = sum(win_pnls) / len(win_pnls) if win_pnls else 0
+        avg_l = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0
+        st.caption(
+            f"{len(win_pnls)} wins (avg ${avg_w:+.2f})  /  "
+            f"{len(loss_pnls)} losses (avg ${avg_l:+.2f})"
+        )
+
+    # -- Open Positions --
     with tab_open:
         open_data = _api("/trades", {"mode": m, "is_open": "true", "hours": 2})
         trades = [t for t in open_data.get("trades", []) if not _is_stale_position(t)]
 
         if not trades:
-            st.info("No active positions")
-        else:
-            df = pd.DataFrame(trades)
+            st.caption("No active positions")
+            return
 
-            for tag, group in df.groupby("strategy_tag", sort=True):
-                st.markdown(f"**{tag}**")
-                display = pd.DataFrame({
-                    "Market": group["title"],
-                    "Side": group["outcome"],
-                    "Entry": group["entry_price"].apply(
-                        lambda x: f"{x:.2f}" if x is not None else ""
-                    ),
-                    "Size": group["size"].apply(
-                        lambda x: f"${x:.2f}" if x is not None else ""
-                    ),
-                    "Age": group["timestamp"].apply(_humanize_age),
-                })
-                st.dataframe(display, use_container_width=True, hide_index=True)
+        odf = pd.DataFrame(trades)
+        for tag, group in odf.groupby("strategy_tag", sort=True):
+            st.markdown(f'<p class="section-label">{tag}</p>', unsafe_allow_html=True)
+            display = pd.DataFrame({
+                "Market": group["title"],
+                "Side": group["outcome"],
+                "Entry": group["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+                "Size": group["size"].apply(lambda x: f"${x:.2f}" if x is not None else ""),
+                "Age": group["timestamp"].apply(_humanize_age),
+            })
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 charts_section()
 
-st.divider()
+st.markdown('<div style="height: 4px"></div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# Section 3: Recent Trades
+# Recent Trades
 # ---------------------------------------------------------------------------
 
 @st.fragment(run_every="15s")
@@ -317,91 +469,74 @@ def recent_trades_section():
     h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
     strats = st.session_state.get("strategies", [])
 
+    st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
+
     data = _api("/trades", {"mode": m, "hours": h, "is_open": "false", "limit": 200})
     trades = data.get("trades", [])
 
-    st.markdown("## Recent Trades")
-
     if not trades:
-        st.info("No trades in this period")
+        st.caption("No trades in this period")
         return
 
     df = pd.DataFrame(trades)
-
     if strats:
         df = df[df["strategy_tag"].isin(strats)]
-
     if df.empty:
-        st.info("No trades matching selected strategies")
+        st.caption("No trades matching filters")
         return
 
     def _fmt_time(ts_str):
         try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            return ts.strftime("%H:%M")
+            return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).strftime("%H:%M")
         except Exception:
             return ""
 
-    def _fmt_price(val):
-        return f"{val:.2f}" if val is not None else ""
-
-    def _fmt_pnl(val):
-        return f"${val:+.2f}" if val is not None else ""
-
-    def _status(row):
+    def _result(row):
         if row.get("pnl") is not None and row["pnl"] > 0:
             return "WIN"
-        if row.get("pnl") is not None and row["pnl"] <= 0:
+        if row.get("pnl") is not None:
             return "LOSS"
-        return "PENDING"
+        return "--"
 
     display = pd.DataFrame({
         "Time": df["timestamp"].apply(_fmt_time),
         "Strategy": df["strategy_tag"],
         "Market": df["title"],
         "Side": df["outcome"],
-        "Entry": df["entry_price"].apply(_fmt_price),
-        "Exit": df["exit_price"].apply(_fmt_price),
-        "PnL": df["pnl"].apply(_fmt_pnl),
-        "Result": df.apply(_status, axis=1),
+        "Entry": df["entry_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+        "Exit": df["exit_price"].apply(lambda x: f"{x:.2f}" if x is not None else ""),
+        "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
+        "Result": df.apply(_result, axis=1),
     })
 
-    def _color_pnl(val):
-        if not val or val == "":
+    def _style_pnl(val):
+        if not val:
             return ""
         try:
-            num = float(val.replace("$", "").replace("+", ""))
-            if num > 0:
-                return "color: #00d4aa; font-weight: 600"
-            if num < 0:
-                return "color: #ff6b6b; font-weight: 600"
+            n = float(val.replace("$", "").replace("+", ""))
+            if n > 0:
+                return f"color: {C_GREEN}; font-weight: 600"
+            if n < 0:
+                return f"color: {C_RED}; font-weight: 600"
         except ValueError:
             pass
         return ""
 
-    def _color_result(val):
+    def _style_result(val):
         if val == "WIN":
-            return "color: #00d4aa; font-weight: 600"
+            return f"color: {C_GREEN}"
         if val == "LOSS":
-            return "color: #ff6b6b; font-weight: 600"
-        return "color: #8892b0"
+            return f"color: {C_RED}"
+        return f"color: {C_MUTED}"
 
-    styled = display.style.map(_color_pnl, subset=["PnL"]).map(
-        _color_result, subset=["Result"]
-    )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    styled = display.style.map(_style_pnl, subset=["PnL"]).map(_style_result, subset=["Result"])
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
 
-    # Summary row
     pnls = [t["pnl"] for t in trades if t.get("pnl") is not None]
     if pnls:
         w = sum(1 for p in pnls if p > 0)
         l = sum(1 for p in pnls if p <= 0)
-        total = sum(pnls)
-        st.caption(
-            f"Showing {len(display)} trades | "
-            f"**{w}W {l}L** | "
-            f"Total PnL: **${total:+.2f}**"
-        )
+        st.caption(f"{len(display)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
 
 
 recent_trades_section()
