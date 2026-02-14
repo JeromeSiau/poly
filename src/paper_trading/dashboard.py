@@ -152,9 +152,14 @@ section[data-testid="stSidebar"] .stMultiSelect > label {
     flex-direction: column;
     justify-content: center;
 }
-[data-testid="column"] {
-    flex: 1 1 0 !important;
+/* Force equal-width columns */
+[data-testid="stHorizontalBlock"] > [data-testid="column"] {
+    flex: 1 1 0% !important;
+    width: 0 !important;
     min-width: 0 !important;
+}
+[data-testid="stHorizontalBlock"] {
+    gap: 12px !important;
 }
 [data-testid="stMetricLabel"] {
     font-family: 'JetBrains Mono', monospace !important;
