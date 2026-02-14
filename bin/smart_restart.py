@@ -80,6 +80,7 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("bin/run_trades_api.sh",        ["run_trades_api"]),
     ("bin/run_dashboard.sh",         ["run_dashboard", "streamlit"]),
     ("bin/run_rn1_compare_api.sh",   ["run_rn1_compare_api"]),
+    ("bin/run_sniper.sh",           ["run_sniper"]),
 ]
 
 
