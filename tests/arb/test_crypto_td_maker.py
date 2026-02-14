@@ -310,7 +310,7 @@ class TestSequentialLadder:
         maker.positions[CID] = OpenPosition(
             condition_id=CID, outcome="Down", token_id=TOK_DOWN,
             entry_price=0.75, size_usd=5.0, shares=6.67,
-            filled_at=time.time(), side="BUY",
+            filled_at=time.time(),
         )
 
         await maker._maker_tick()
@@ -330,7 +330,7 @@ class TestSequentialLadder:
         maker.positions[CID] = OpenPosition(
             condition_id=CID, outcome="Down", token_id=TOK_DOWN,
             entry_price=0.80, size_usd=10.0, shares=13.0,
-            filled_at=time.time(), side="BUY",
+            filled_at=time.time(),
         )
 
         await maker._maker_tick()
