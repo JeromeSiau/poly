@@ -8,6 +8,8 @@ from typing import Optional
 from fastapi import FastAPI, Query
 from sqlalchemy import select
 
+from config.settings import settings
+from src.api.winrate import fetch_activity, analyse, resolve_open_markets
 from src.db.database import get_sync_session, init_db
 from src.db.models import LiveObservation as LO, PaperTrade as PT
 
@@ -113,6 +115,62 @@ def list_trades(
         }
     finally:
         session.close()
+
+
+@app.get("/winrate")
+def winrate(
+    hours: float = Query(default=24.0, ge=0.1, le=720.0, description="Lookback window in hours."),
+    wallet: Optional[str] = Query(default=None, description="Wallet address (default: from settings)."),
+) -> dict:
+    """Win rate from on-chain Polymarket wallet activity."""
+    addr = wallet or settings.POLYMARKET_WALLET_ADDRESS
+    if not addr:
+        return {"error": "No wallet configured"}
+
+    rows = fetch_activity(addr, hours)
+    markets = analyse(rows)
+    resolve_open_markets(markets)
+
+    resolved = [m for m in markets if m["status"] in ("WIN", "LOSS")]
+    still_open = [m for m in markets if m["status"] == "OPEN"]
+    wins = [m for m in resolved if m["status"] == "WIN"]
+    losses = [m for m in resolved if m["status"] == "LOSS"]
+
+    total_pnl = sum(m["pnl"] for m in resolved)
+    total_cost = sum(m["cost"] for m in markets)
+    win_pnl = sum(m["pnl"] for m in wins)
+    loss_pnl = sum(m["pnl"] for m in losses)
+
+    return {
+        "hours": hours,
+        "wallet": addr,
+        "total_markets": len(markets),
+        "resolved": len(resolved),
+        "still_open": len(still_open),
+        "wins": len(wins),
+        "losses": len(losses),
+        "winrate": round(len(wins) / len(resolved) * 100, 1) if resolved else 0,
+        "total_pnl": round(total_pnl, 2),
+        "total_invested": round(total_cost, 2),
+        "roi_pct": round(total_pnl / total_cost * 100, 1) if total_cost > 0 else 0,
+        "avg_win": round(win_pnl / len(wins), 2) if wins else 0,
+        "avg_loss": round(loss_pnl / len(losses), 2) if losses else 0,
+        "profit_factor": round(abs(win_pnl / loss_pnl), 2) if loss_pnl < 0 else None,
+        "markets": [
+            {
+                "title": m["title"],
+                "status": m["status"],
+                "pnl": round(m["pnl"], 2),
+                "cost": round(m["cost"], 2),
+                "avg_entry": round(m["avg_entry"], 2),
+                "outcome": m["outcome"],
+                "n_fills": m["n_fills"],
+                "timestamp": m["first_ts"],
+            }
+            for m in markets
+            if m["status"] in ("WIN", "LOSS")
+        ],
+    }
 
 
 @app.get("/tags")

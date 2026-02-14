@@ -97,20 +97,35 @@ The trades API runs on the production server and provides access to live trading
 
 **Base URL:** `http://localhost:8788` (on local server, it works with ssh tunnel)
 
+### Data sources
+
+The API exposes two distinct data sources with different reliability:
+
+1. **Internal DB** (`/trades`, `/tags`) — reads from our local SQLite (`data/arb.db`). Only contains trades our bots recorded. Can miss trades if the bot crashed, didn't log properly, or if settlement wasn't tracked. Win/loss is based on `PaperTrade.pnl` which depends on our own settlement logic.
+
+2. **Polymarket on-chain** (`/winrate`) — fetches actual wallet activity directly from `https://data-api.polymarket.com/activity` (TRADE/REDEEM/MERGE events). More reliable because it reflects what actually happened on-chain. For markets without a REDEEM (losses = shares worth $0), it cross-checks resolution via the CLOB API (`https://clob.polymarket.com/markets/{condition_id}`). Core logic in `src/api/winrate.py`.
+
+**Use `/winrate` for accurate P&L reporting. Use `/trades` for strategy-level debugging (observations, edge, game_state).**
+
 ### Endpoints
 
 **`GET /health`** — Health check. Returns `{"ok": true}`.
 
-**`GET /trades`** — Trades with observations, newest first, plus performance summary (wins, losses, winrate, total PnL).
+**`GET /trades`** — Trades from internal DB with observations, newest first, plus performance summary. Source: internal DB.
 - `tag` (string, optional): filter by strategy_tag (substring match)
 - `event_type` (string, optional): filter by event_type (exact match)
 - `hours` (float, default=24, range 0.1–720): lookback window
 - `limit` (int, default=200, range 1–2000): max rows
 
-**`GET /tags`** — Distinct strategy_tags and event_types in the lookback window.
+**`GET /winrate`** — Win rate and PnL from on-chain Polymarket wallet activity. Source: Polymarket Data API + CLOB API.
+- `hours` (float, default=24, range 0.1–720): lookback window
+- `wallet` (string, optional): wallet address (default: from settings)
+- Returns: winrate, total_pnl, roi_pct, profit_factor, avg_win, avg_loss, per-market breakdown
+
+**`GET /tags`** — Distinct strategy_tags and event_types in the lookback window. Source: internal DB.
 - `hours` (float, default=24, range 0.1–720): lookback window
 
-There is also an RN1 comparison API on port 8787 (`src/api/rn1_compare_api.py`) for benchmarking against reference wallets.
+CLI: `./run scripts/winrate.py --hours 17` for terminal output of the same on-chain data.
 
 ## Production Logs
 
