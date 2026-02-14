@@ -9,13 +9,13 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
 import structlog
 
-from src.arb.two_sided_inventory import MarketSnapshot, OutcomeQuote
 from src.utils.parsing import (
     _to_float,
     _first_event_slug,
@@ -24,6 +24,48 @@ from src.utils.parsing import (
 )
 
 logger = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Shared data structures (originally in two_sided_inventory)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class OutcomeQuote:
+    """Best quote levels for one outcome."""
+
+    outcome: str
+    token_id: str
+    bid: Optional[float]
+    ask: Optional[float]
+    bid_size: Optional[float] = None  # shares
+    ask_size: Optional[float] = None  # shares
+
+    @property
+    def mid(self) -> Optional[float]:
+        if self.bid is None and self.ask is None:
+            return None
+        if self.bid is None:
+            return self.ask
+        if self.ask is None:
+            return self.bid
+        return (self.bid + self.ask) / 2.0
+
+
+@dataclass(slots=True)
+class MarketSnapshot:
+    """Current market state required for decisioning."""
+
+    condition_id: str
+    title: str
+    outcome_order: list[str]
+    outcomes: dict[str, OutcomeQuote]
+    timestamp: float
+    liquidity: float = 0.0
+    volume_24h: float = 0.0
+    slug: str = ""
+
 
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
 CLOB_API = "https://clob.polymarket.com"
