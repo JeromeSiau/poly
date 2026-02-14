@@ -73,11 +73,13 @@ def _style_pnl(val):
 
 
 def _style_result(val):
-    """Color WIN/LOSS labels."""
+    """Color WIN/LOSS/OPEN labels."""
     if val == "WIN":
         return f"color: {C_GREEN}"
     if val == "LOSS":
         return f"color: {C_RED}"
+    if val == "OPEN":
+        return f"color: {C_ACCENT}"
     return f"color: {C_MUTED}"
 
 
@@ -553,7 +555,7 @@ with tab_live:
             l = sum(1 for p in pnls if p <= 0)
             st.caption(f"{len(markets)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
         else:
-            data = _api("/trades", {"mode": "paper", "hours": h, "is_open": "false", "limit": 200})
+            data = _api("/trades", {"mode": "paper", "hours": h, "limit": 200})
             trades = data.get("trades", [])
             if not trades:
                 st.caption("No trades in this period")
@@ -578,7 +580,8 @@ with tab_live:
                 "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
                 "Result": df.apply(
                     lambda r: "WIN" if r.get("pnl") and r["pnl"] > 0
-                    else ("LOSS" if r.get("pnl") is not None else "--"), axis=1
+                    else ("LOSS" if r.get("pnl") is not None and r["pnl"] <= 0
+                          else ("OPEN" if r.get("is_open") else "--")), axis=1
                 ),
             })
             styled = display.style.map(_style_pnl, subset=["PnL"]).map(
