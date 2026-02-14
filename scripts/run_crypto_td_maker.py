@@ -186,6 +186,7 @@ class CryptoTDMaker:
         self._ref_prices: dict[str, float] = {}  # cid -> chainlink price at slot start
         self._cid_chainlink_symbol: dict[str, str] = {}  # cid -> "btc/usd"
         self._cid_slot_ts: dict[str, int] = {}  # cid -> slot start unix timestamp
+        self._cid_fill_analytics: dict[str, dict] = {}  # cid -> {dir_move_pct, minutes_into_slot}
 
         # Stats
         self.total_fills: int = 0
@@ -423,8 +424,8 @@ class CryptoTDMaker:
                 if info:
                     chainlink_sym, slot_ts = info
                     self._cid_slot_ts[cid] = slot_ts
-                    # Snapshot Chainlink prices as ref prices for min-move filter.
-                    if self.min_move_pct > 0 and self.chainlink_feed:
+                    # Snapshot Chainlink prices (used for min-move filter + dir_move analytics).
+                    if self.chainlink_feed:
                         self._cid_chainlink_symbol[cid] = chainlink_sym
                         ref = self.chainlink_feed.snapshot_price(chainlink_sym)
                         if ref:
@@ -880,17 +881,18 @@ class CryptoTDMaker:
                 shares=new_shares,
                 avg_price=order.price,
             )
+            analytics = {
+                "dir_move_pct": round(dir_move, 3) if dir_move is not None else None,
+                "minutes_into_slot": round((now - self._cid_slot_ts[order.condition_id]) / 60, 1)
+                    if order.condition_id in self._cid_slot_ts else None,
+            }
+            self._cid_fill_analytics[order.condition_id] = analytics
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self.manager.record_fill_direct(
                     intent, fill_result,
                     execution_mode="paper_fill" if self.paper_mode else "live_fill",
-                    extra_state={
-                        "condition_id": order.condition_id,
-                        "dir_move_pct": round(dir_move, 3) if dir_move is not None else None,
-                        "minutes_into_slot": round((now - self._cid_slot_ts[order.condition_id]) / 60, 1)
-                            if order.condition_id in self._cid_slot_ts else None,
-                    },
+                    extra_state={"condition_id": order.condition_id, **analytics},
                 ))
             except RuntimeError:
                 pass
@@ -1122,6 +1124,7 @@ class CryptoTDMaker:
             self._ref_prices.pop(cid, None)
             self._cid_chainlink_symbol.pop(cid, None)
             self._cid_slot_ts.pop(cid, None)
+            self._cid_fill_analytics.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -1307,6 +1310,7 @@ class CryptoTDMaker:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self.manager.record_settle_direct(
                     settle_intent, settle_fill,
+                    extra_state=self._cid_fill_analytics.pop(pos.condition_id, None),
                 ))
             except RuntimeError:
                 pass
