@@ -229,6 +229,12 @@ class Settings(BaseSettings):
     WEATHER_ORACLE_NO_MAX_CONFIDENCE: float = 0.10  # outcome must be unlikely
     WEATHER_ORACLE_NO_MAX_YES_PRICE: float = 0.05  # YES must be ≤5¢ (NO ≥95¢)
 
+    # === Last-Penny Sniper ===
+    SNIPER_MIN_PRICE: float = 0.95
+    SNIPER_RISK_PCT: float = 0.01
+    SNIPER_MAX_PER_MARKET_PCT: float = 0.05
+    SNIPER_SCAN_INTERVAL: float = 15.0
+
     model_config = {"env_file": ".env"}
 
 

@@ -36,7 +36,8 @@ RULES: list[tuple[str, list[str] | str]] = [
                                      "run_crypto_maker",
                                      "run_crypto_two_sided_maker"]),
     ("src/feeds/polymarket",        ["run_crypto_td_maker",
-                                     "run_crypto_maker", "run_crypto_two_sided_maker"]),
+                                     "run_crypto_maker", "run_crypto_two_sided_maker",
+                                     "run_sniper"]),
     ("src/feeds/chainlink",         ["run_crypto_td_maker"]),
     ("src/feeds/kalshi",            ["run_kalshi_td_maker"]),
     ("src/db/td_orders",            ["run_crypto_td_maker", "run_kalshi_td_maker",
@@ -49,6 +50,8 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("src/arb/weather_oracle",      ["run_weather_oracle"]),
     ("src/arb/crypto_minute",       ["run_crypto_minute", "run_crypto_maker"]),
     ("src/arb/crypto_td",           ["run_crypto_td_maker"]),
+    ("src/arb/sniper_engine",       ["run_sniper"]),
+    ("src/feeds/polymarket_scanner", ["run_sniper"]),
 
     # ── API / dashboard ─────────────────────────────────────────────────
     ("src/api/trades_api",          ["run_trades_api"]),
@@ -65,6 +68,7 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("scripts/run_auto_redeem.py",       ["run_auto_redeem"]),
     ("scripts/run_kalshi_td_maker.py",   ["run_kalshi_td_maker"]),
     ("scripts/run_crypto_two_sided_maker.py", ["run_crypto_two_sided_maker"]),
+    ("scripts/run_sniper.py",           ["run_sniper"]),
 
     # ── Shell wrappers ──────────────────────────────────────────────────
     ("bin/run_fear_selling.sh",      ["run_fear_selling"]),

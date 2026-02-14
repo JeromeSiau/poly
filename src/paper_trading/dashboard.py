@@ -25,6 +25,7 @@ WEATHER_ORACLE_EVENT_TYPE = "weather_oracle"
 CRYPTO_MAKER_EVENT_TYPE = "crypto_maker"
 TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 TWO_SIDED_MAKER_EVENT_TYPE = "crypto_2s_maker"
+LAST_PENNY_EVENT_TYPE = "last_penny_sniper"
 CONSERVATIVE_BID_MAX_AGE_MINUTES = 20.0
 
 _LIVE_MODES = {"live", "live_fill", "live_settlement", "autopilot"}
@@ -1745,6 +1746,108 @@ def _render_fear_selling_tab(positions: list) -> None:
         st.info("No closed positions yet.")
 
 
+def _render_last_penny_tab(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> None:
+    """Render the Last Penny Sniper tab — buy quasi-certain outcomes, hold to resolution."""
+    # Filter trades by event type
+    lp_trades = [t for t in trades if t.event_type == LAST_PENNY_EVENT_TYPE]
+    lp_obs = [o for o in observations if o.event_type == LAST_PENNY_EVENT_TYPE]
+
+    if not lp_trades:
+        st.info("No Last Penny Sniper trades found. Start with: ./run scripts/run_sniper.py")
+        return
+
+    # Separate fills and settlements
+    fills = [t for t in lp_trades if t.side == "BUY"]
+    settlements = [t for t in lp_trades if t.side == "SELL"]
+
+    # Compute stats
+    wins = sum(1 for s in settlements if s.pnl and s.pnl > 0)
+    losses = sum(1 for s in settlements if s.pnl is not None and s.pnl <= 0)
+    total_pnl = sum(s.pnl for s in settlements if s.pnl is not None)
+    open_positions = len(fills) - len(settlements)
+
+    # Exposure: sum of fill sizes for unsettled positions
+    settled_cids = {s.condition_id for s in settlements}
+    open_fills = [f for f in fills if f.condition_id not in settled_cids]
+    exposure = sum(f.size_usd for f in open_fills if f.size_usd)
+
+    # Metrics row
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Fills", len(fills))
+    c2.metric("Settled", len(settlements))
+    win_rate = f"{wins / (wins + losses):.1%}" if (wins + losses) > 0 else "N/A"
+    c3.metric("Win Rate", win_rate)
+    c4.metric("Realized P&L", f"${total_pnl:,.2f}")
+    c5.metric("Open Exposure", f"${exposure:,.2f}")
+
+    st.divider()
+
+    # P&L over time chart
+    if settlements:
+        pnl_data = []
+        cumulative = 0.0
+        for s in sorted(settlements, key=lambda t: t.timestamp or 0):
+            if s.pnl is not None:
+                cumulative += s.pnl
+                pnl_data.append({
+                    "time": datetime.fromtimestamp(s.timestamp) if s.timestamp else None,
+                    "pnl": s.pnl,
+                    "cumulative": cumulative,
+                })
+
+        if pnl_data:
+            df_pnl = pd.DataFrame(pnl_data)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df_pnl["time"], y=df_pnl["cumulative"],
+                mode="lines+markers", name="Cumulative P&L",
+                line=dict(color="green" if cumulative >= 0 else "red"),
+            ))
+            fig.update_layout(
+                title="Cumulative P&L",
+                xaxis_title="Time",
+                yaxis_title="P&L ($)",
+                height=350,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Entry price histogram
+    if fills:
+        prices = [f.price for f in fills if f.price]
+        if prices:
+            fig_hist = go.Figure(data=[go.Histogram(
+                x=prices, nbinsx=20,
+                marker_color="steelblue",
+            )])
+            fig_hist.update_layout(
+                title="Entry Price Distribution",
+                xaxis_title="Entry Price",
+                yaxis_title="Count",
+                height=300,
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+    # Recent trades table
+    st.subheader("Recent Trades")
+    table_data = []
+    for t in sorted(lp_trades, key=lambda x: x.timestamp or 0, reverse=True)[:50]:
+        table_data.append({
+            "Time": datetime.fromtimestamp(t.timestamp).strftime("%Y-%m-%d %H:%M") if t.timestamp else "",
+            "Side": t.side,
+            "Outcome": t.outcome or "",
+            "Price": f"{t.price:.4f}" if t.price else "",
+            "Size": f"${t.size_usd:.2f}" if t.size_usd else "",
+            "P&L": f"${t.pnl:+.4f}" if t.pnl is not None else "",
+            "Title": (t.title or "")[:50],
+        })
+
+    if table_data:
+        st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+
 def main():
     """Main dashboard entry point."""
     st.set_page_config(
@@ -1782,8 +1885,8 @@ def main():
         fear_positions = []
 
     # --- Tabs ---
-    tab_td_maker, tab_2s_maker, tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear = st.tabs(
-        ["TD Maker", "2S Maker", "Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling"]
+    tab_td_maker, tab_2s_maker, tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear, tab_last_penny = st.tabs(
+        ["TD Maker", "2S Maker", "Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling", "Last Penny"]
     )
 
     # ===== TWO-SIDED MAKER TAB =====
@@ -1813,6 +1916,10 @@ def main():
     # ===== FEAR SELLING TAB =====
     with tab_fear:
         _render_fear_selling_tab(fear_positions)
+
+    # ===== LAST PENNY SNIPER TAB =====
+    with tab_last_penny:
+        _render_last_penny_tab(observations, trades)
 
     # Footer
     st.divider()
