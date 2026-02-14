@@ -50,3 +50,47 @@ def next_slots(
 def compute_edge(ask_up: float, ask_down: float, fee_rate: float) -> float:
     """Compute structural edge: 1.0 - (ask_up + ask_down) - 2 * fee_rate."""
     return 1.0 - ask_up - ask_down - 2 * fee_rate
+
+
+def compute_sweep(
+    up_asks: list[tuple[float, float]],
+    down_asks: list[tuple[float, float]],
+    fee_rate: float,
+    max_budget: float,
+) -> tuple[float, float, float]:
+    """Compute how much to spend on each side while maintaining edge.
+
+    Returns (up_budget_usd, down_budget_usd, best_edge).
+    """
+    if not up_asks or not down_asks:
+        return 0.0, 0.0, 0.0
+
+    best_up = up_asks[0][0]
+    best_down = down_asks[0][0]
+    edge = compute_edge(best_up, best_down, fee_rate)
+
+    if edge <= 0:
+        return 0.0, 0.0, edge
+
+    up_depth_usd = 0.0
+    for price, shares in up_asks:
+        if compute_edge(price, best_down, fee_rate) <= 0:
+            break
+        up_depth_usd += price * shares
+
+    down_depth_usd = 0.0
+    for price, shares in down_asks:
+        if compute_edge(best_up, price, fee_rate) <= 0:
+            break
+        down_depth_usd += price * shares
+
+    total_depth = up_depth_usd + down_depth_usd
+    if total_depth <= 0:
+        return 0.0, 0.0, 0.0
+
+    budget = min(max_budget, total_depth)
+    up_ratio = up_depth_usd / total_depth
+    up_budget = budget * up_ratio
+    down_budget = budget * (1 - up_ratio)
+
+    return up_budget, down_budget, edge
