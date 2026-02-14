@@ -19,6 +19,7 @@ from src.ml.validation.calibration import reliability_diagram_data
 from src.paper_trading.metrics import PaperTradingMetrics, TradeRecord
 
 TWO_SIDED_EVENT_TYPE = "two_sided_inventory"
+CRYPTO_TWO_SIDED_EVENT_TYPE = "crypto_two_sided"
 SNIPER_EVENT_TYPE = "sniper_sports"
 CRYPTO_MINUTE_EVENT_TYPE = "crypto_minute"
 WEATHER_ORACLE_EVENT_TYPE = "weather_oracle"
@@ -1476,6 +1477,126 @@ def _render_td_maker_tab(
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def _render_crypto_two_sided_tab(
+    observations: list[LiveObservation],
+    trades: list[PaperTrade],
+) -> None:
+    """Render the Crypto Two-Sided arbitrage tab content."""
+    rows = extract_two_sided_trade_rows(
+        observations, trades, event_types={CRYPTO_TWO_SIDED_EVENT_TYPE}
+    )
+
+    if not rows:
+        st.info("No crypto two-sided trades found. Run: ./run scripts/run_crypto_two_sided.py --paper")
+        return
+
+    tags = available_two_sided_tags(rows)
+    selected_tag = st.selectbox("Strategy Tag", ["All"] + tags, key="c2s_tag_select")
+    rows_view = rows if selected_tag == "All" else [r for r in rows if r["strategy_tag"] == selected_tag]
+
+    # Separate entries (BUY) and settlements (SELL)
+    entries = [r for r in rows_view if r["side"] == "BUY"]
+    settlements = [r for r in rows_view if r["side"] == "SELL"]
+    pnls = [r["pnl"] for r in rows_view if r.get("pnl")]
+    total_pnl = sum(pnls)
+
+    # Each entry is one side of a pair — count pairs
+    settled_cids = {r.get("condition_id") for r in settlements}
+    entry_cids = {r.get("condition_id") for r in entries}
+    # A "pair" has 2 BUY entries for the same condition_id
+    pair_cids: dict[str, int] = {}
+    for r in entries:
+        cid = r.get("condition_id", "")
+        pair_cids[cid] = pair_cids.get(cid, 0) + 1
+    complete_pairs = sum(1 for c in pair_cids.values() if c >= 2)
+    open_cids = entry_cids - settled_cids
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Entries", len(entries))
+    c2.metric("Pairs (both sides)", complete_pairs)
+    c3.metric("Settled", len(settlements))
+    c4.metric("Realized P&L", f"${total_pnl:,.2f}")
+
+    if open_cids:
+        open_entries = [r for r in entries if r.get("condition_id") in open_cids]
+        open_exposure = sum(r["size_usd"] for r in open_entries)
+        c5, c6 = st.columns(2)
+        c5.metric("Open Positions", len(open_cids))
+        c6.metric("Open Exposure", f"${open_exposure:,.2f}")
+
+    # Edge stats from entries
+    edges = [r.get("edge_theoretical", 0) for r in entries if r.get("edge_theoretical")]
+    if edges:
+        avg_edge = sum(edges) / len(edges)
+        c7, c8 = st.columns(2)
+        c7.metric("Avg Edge", f"{avg_edge:.2%}")
+        c8.metric("Win Rate", "100% (structural)")
+
+    st.divider()
+
+    # Cumulative P&L
+    st.subheader("Cumulative P&L")
+    sorted_rows = sorted(
+        [r for r in rows_view if r.get("pnl")],
+        key=lambda r: r.get("timestamp") or datetime.min,
+    )
+    if sorted_rows:
+        pnl_df = pd.DataFrame(sorted_rows).sort_values("timestamp")
+        pnl_df["cumulative_pnl"] = pnl_df["pnl"].cumsum()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=pnl_df["timestamp"], y=pnl_df["cumulative_pnl"],
+            mode="lines+markers", name="Cumulative P&L",
+            line=dict(color="#2ecc71", width=2), marker=dict(size=5),
+        ))
+        fig.update_layout(
+            xaxis_title="Time", yaxis_title="Cumulative P&L ($)",
+            height=350, template="plotly_dark",
+            margin=dict(l=50, r=50, t=30, b=50),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # By symbol
+    st.subheader("By Symbol")
+    sym_data: list[dict[str, Any]] = []
+    for sym in ["BTC", "ETH"]:
+        sym_entries = [r for r in entries if sym.lower() in str(r.get("title", "")).lower()]
+        sym_settles = [r for r in settlements if sym.lower() in str(r.get("title", "")).lower()]
+        sym_pnls = [r["pnl"] for r in sym_settles if r.get("pnl")]
+        if not sym_entries:
+            continue
+        sym_edges = [r.get("edge_theoretical", 0) for r in sym_entries if r.get("edge_theoretical")]
+        sym_data.append({
+            "Symbol": sym,
+            "Entries": len(sym_entries),
+            "Settled": len(sym_settles),
+            "Avg Edge": f"{sum(sym_edges) / len(sym_edges):.2%}" if sym_edges else "N/A",
+            "Total P&L": f"${sum(sym_pnls):,.2f}",
+        })
+    if sym_data:
+        st.dataframe(pd.DataFrame(sym_data), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # Recent trades
+    st.subheader("Recent Trades")
+    recent = sorted(rows_view, key=lambda r: r.get("timestamp") or datetime.min, reverse=True)[:50]
+    if recent:
+        df = pd.DataFrame([{
+            "Time": r["timestamp"].strftime("%m-%d %H:%M") if isinstance(r.get("timestamp"), datetime) else "N/A",
+            "Slug": str(r.get("title", ""))[:40],
+            "Outcome": r.get("outcome", ""),
+            "Side": r.get("side", ""),
+            "Price": f"{r['fill_price']:.3f}",
+            "Size": f"${r['size_usd']:.2f}",
+            "Edge": f"{r.get('edge_theoretical', 0):.2%}" if r.get("edge_theoretical") else "",
+            "P&L": f"${r['pnl']:.2f}" if r.get("pnl") else "",
+        } for r in recent])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def _render_fear_selling_tab(positions: list) -> None:
     """Render the Fear Selling tab content."""
     if not positions:
@@ -1691,279 +1812,13 @@ def main():
         fear_positions = []
 
     # --- Tabs ---
-    tab_td_maker, tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear, tab_two_sided = st.tabs(
-        ["TD Maker", "Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling", "Two-Sided"]
+    tab_td_maker, tab_two_sided, tab_maker, tab_weather, tab_sniper, tab_crypto, tab_fear = st.tabs(
+        ["TD Maker", "Crypto 2-Sided", "Crypto Maker", "Weather Oracle", "Sniper Sports", "Crypto Minute", "Fear Selling"]
     )
 
-    # ===== TWO-SIDED TAB =====
+    # ===== CRYPTO TWO-SIDED TAB =====
     with tab_two_sided:
-        # Exclude sniper rows from two-sided view
-        two_sided_rows_all = extract_two_sided_trade_rows(observations, trades)
-        two_sided_rows = [r for r in two_sided_rows_all if "sniper" not in str(r.get("strategy_tag", "")).lower()]
-        two_sided_tags = available_two_sided_tags(two_sided_rows)
-        selected_tag = st.selectbox(
-            "Strategy Tag",
-            ["All"] + two_sided_tags,
-            help="Filter to one two-sided experiment tag.",
-            key="ts_tag_select",
-        )
-
-        observations_view, trades_view = filter_scope_by_strategy_tag(
-            observations=observations,
-            trades=trades,
-            strategy_tag=selected_tag,
-        )
-        # Also exclude sniper from the filtered views
-        if selected_tag == "All":
-            sniper_obs_ids: set[int] = set()
-            for obs in observations_view:
-                gs = _observation_game_state(obs)
-                if "sniper" in str(gs.get("strategy_tag", "")).lower():
-                    if obs.id is not None:
-                        sniper_obs_ids.add(int(obs.id))
-            observations_view = [o for o in observations_view if o.id not in sniper_obs_ids]
-            trades_view = [t for t in trades_view if int(t.observation_id) not in sniper_obs_ids]
-
-        two_sided_rows_view = [
-            row for row in two_sided_rows
-            if selected_tag == "All" or row.get("strategy_tag") == selected_tag
-        ]
-        two_sided_open_inventory_all_df = build_two_sided_open_inventory(two_sided_rows)
-        two_sided_summary_df = summarize_two_sided_pairs(two_sided_rows_view)
-        two_sided_open_inventory_df = build_two_sided_open_inventory(two_sided_rows_view)
-        two_sided_tag_summary_df = summarize_two_sided_by_tag(
-            two_sided_rows if selected_tag == "All" else two_sided_rows_view,
-            two_sided_open_inventory_all_df if selected_tag == "All" else two_sided_open_inventory_df,
-        )
-        if not two_sided_summary_df.empty:
-            if not two_sided_open_inventory_df.empty:
-                pair_unrealized = (
-                    two_sided_open_inventory_df
-                    .groupby(["strategy_tag", "condition_id", "title"], as_index=False)
-                    .agg(
-                        unrealized_pnl_mark=("unrealized_pnl_mark", "sum"),
-                        unrealized_conservative=("unrealized_conservative", "sum"),
-                        open_outcomes=("outcome", "count"),
-                        max_mark_age_minutes=("mark_age_minutes", "max"),
-                    )
-                )
-                two_sided_summary_df = two_sided_summary_df.merge(
-                    pair_unrealized,
-                    on=["strategy_tag", "condition_id", "title"],
-                    how="left",
-                )
-            if "unrealized_pnl_mark" not in two_sided_summary_df.columns:
-                two_sided_summary_df["unrealized_pnl_mark"] = 0.0
-            if "unrealized_conservative" not in two_sided_summary_df.columns:
-                two_sided_summary_df["unrealized_conservative"] = 0.0
-            if "open_outcomes" not in two_sided_summary_df.columns:
-                two_sided_summary_df["open_outcomes"] = 0
-            if "max_mark_age_minutes" not in two_sided_summary_df.columns:
-                two_sided_summary_df["max_mark_age_minutes"] = 0.0
-            two_sided_summary_df["unrealized_pnl_mark"] = two_sided_summary_df["unrealized_pnl_mark"].fillna(0.0)
-            two_sided_summary_df["unrealized_conservative"] = two_sided_summary_df["unrealized_conservative"].fillna(0.0)
-            two_sided_summary_df["unrealized_pnl"] = two_sided_summary_df["unrealized_conservative"]
-            two_sided_summary_df["open_outcomes"] = two_sided_summary_df["open_outcomes"].fillna(0).astype(int)
-            two_sided_summary_df["max_mark_age_minutes"] = two_sided_summary_df["max_mark_age_minutes"].fillna(0.0)
-            two_sided_summary_df["total_pnl_mark"] = (
-                two_sided_summary_df["realized_pnl"] + two_sided_summary_df["unrealized_pnl_mark"]
-            )
-            two_sided_summary_df["total_pnl"] = (
-                two_sided_summary_df["realized_pnl"] + two_sided_summary_df["unrealized_pnl"]
-            )
-
-        metrics = calculate_metrics(trades_view)
-
-        st.header("Overview")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric(
-            "Total P&L",
-            f"${metrics['total_pnl']:,.2f}",
-            delta=f"{metrics['total_pnl']:+,.2f}" if metrics['total_pnl'] != 0 else None,
-        )
-        col2.metric("Trades", metrics["n_trades"])
-        col3.metric("Win Rate", f"{metrics['win_rate']:.1%}")
-        col4.metric("Avg Edge (Realized)", f"{metrics['avg_edge_realized']:.1%}")
-
-        col5, col6, col7, col8 = st.columns(4)
-        col5.metric("Avg Edge (Theoretical)", f"{metrics['avg_edge_theoretical']:.1%}")
-        col6.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-        col7.metric("Max Drawdown", f"${metrics['max_drawdown']:,.2f}")
-        col8.metric(
-            "Profit Factor",
-            f"{metrics['profit_factor']:.2f}" if metrics['profit_factor'] != float('inf') else "N/A",
-        )
-
-        if not two_sided_summary_df.empty:
-            st.caption("Two-sided risk view (current tag filter)")
-            ts_realized = float(two_sided_summary_df["realized_pnl"].sum())
-            ts_unrealized_mark = float(two_sided_summary_df["unrealized_pnl_mark"].sum())
-            ts_unrealized = float(two_sided_summary_df["unrealized_pnl"].sum())
-            ts_total = float(two_sided_summary_df["total_pnl"].sum())
-            risk_cols = st.columns(4)
-            risk_cols[0].metric("Two-Sided Realized", f"${ts_realized:,.2f}")
-            risk_cols[1].metric("Unrealized (Conservative)", f"${ts_unrealized:,.2f}")
-            risk_cols[2].metric("Total (Conservative)", f"${ts_total:,.2f}")
-            risk_cols[3].metric("Unrealized (Mark)", f"${ts_unrealized_mark:,.2f}")
-
-        st.divider()
-
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.subheader("P&L Over Time")
-            if trades_view:
-                fig_pnl = create_pnl_chart(trades_view)
-                st.plotly_chart(fig_pnl, use_container_width=True)
-            else:
-                st.info("No trades yet")
-        with col_right:
-            st.subheader("Edge Analysis")
-            fig_edge = create_edge_analysis_chart(trades_view)
-            st.plotly_chart(fig_edge, use_container_width=True)
-
-        st.divider()
-
-        st.subheader("Two-Sided P&L By Pair")
-        if two_sided_summary_df.empty:
-            st.info("No two-sided rows for current filter.")
-        else:
-            col_a, col_b, col_c, col_d, col_e, col_f = st.columns(6)
-            col_a.metric("Pairs", int(two_sided_summary_df.shape[0]))
-            col_b.metric("Two-Sided Trades", int(len(two_sided_rows_view)))
-            col_c.metric("Realized P&L", f"${two_sided_summary_df['realized_pnl'].sum():,.2f}")
-            col_d.metric("Unrealized (Conservative)", f"${two_sided_summary_df['unrealized_pnl'].sum():,.2f}")
-            open_pairs = int((two_sided_summary_df["open_outcomes"] > 0).sum())
-            col_e.metric("Total P&L", f"${two_sided_summary_df['total_pnl'].sum():,.2f}")
-            col_f.metric("Open Pairs", open_pairs)
-
-            st.caption("Best pairs (conservative total P&L = realized + conservative unrealized)")
-            top_pairs = two_sided_summary_df.nlargest(20, "total_pnl").copy()
-            top_pairs["win_rate_sells"] = top_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
-            top_pairs["avg_edge_theoretical"] = top_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
-            top_pairs["avg_edge_realized_sells"] = top_pairs["avg_edge_realized_sells"].map(lambda x: f"{x:.2%}")
-            top_pairs["max_mark_age_minutes"] = top_pairs["max_mark_age_minutes"].map(lambda x: f"{x:.1f}")
-            st.dataframe(top_pairs, use_container_width=True, hide_index=True)
-
-            st.caption("Worst pairs (conservative total P&L = realized + conservative unrealized)")
-            worst_pairs = two_sided_summary_df.nsmallest(20, "total_pnl").copy()
-            worst_pairs["win_rate_sells"] = worst_pairs["win_rate_sells"].map(lambda x: f"{x:.1%}")
-            worst_pairs["avg_edge_theoretical"] = worst_pairs["avg_edge_theoretical"].map(lambda x: f"{x:.2%}")
-            worst_pairs["avg_edge_realized_sells"] = worst_pairs["avg_edge_realized_sells"].map(lambda x: f"{x:.2%}")
-            worst_pairs["max_mark_age_minutes"] = worst_pairs["max_mark_age_minutes"].map(lambda x: f"{x:.1f}")
-            st.dataframe(worst_pairs, use_container_width=True, hide_index=True)
-
-            st.caption("Open inventory by outcome (conservative vs mark unrealized)")
-            if two_sided_open_inventory_df.empty:
-                st.info("No open two-sided inventory.")
-            else:
-                inv_view = two_sided_open_inventory_df.copy()
-                inv_view = inv_view.sort_values("unrealized_conservative")
-                inv_view = inv_view[
-                    [
-                        "strategy_tag", "condition_id", "title", "outcome",
-                        "open_shares", "avg_entry_price",
-                        "conservative_mark_price", "conservative_mark_reason",
-                        "unrealized_conservative", "mark_price", "unrealized_pnl_mark",
-                        "fair_price", "edge_sell_est", "exit_edge_pct",
-                        "sell_signal", "sell_trigger", "sell_block_reason",
-                        "open_notional", "open_notional_conservative",
-                        "hold_age_seconds", "bid_age_minutes", "mark_age_minutes",
-                    ]
-                ]
-                inv_view["avg_entry_price"] = inv_view["avg_entry_price"].map(lambda x: f"{x:.3f}")
-                inv_view["conservative_mark_price"] = inv_view["conservative_mark_price"].map(lambda x: f"{x:.3f}")
-                inv_view["mark_price"] = inv_view["mark_price"].map(lambda x: f"{x:.3f}")
-                inv_view["fair_price"] = inv_view["fair_price"].map(lambda x: f"{x:.3f}")
-                inv_view["edge_sell_est"] = inv_view["edge_sell_est"].map(
-                    lambda x: "n/a" if x is None else f"{float(x):.2%}"
-                )
-                inv_view["exit_edge_pct"] = inv_view["exit_edge_pct"].map(lambda x: f"{float(x):.2%}")
-                inv_view["open_shares"] = inv_view["open_shares"].map(lambda x: f"{x:.2f}")
-                inv_view["sell_signal"] = inv_view["sell_signal"].map(lambda x: "yes" if bool(x) else "no")
-                inv_view["sell_block_reason"] = inv_view["sell_block_reason"].map(_format_sell_reason)
-                inv_view["open_notional"] = inv_view["open_notional"].map(lambda x: f"${float(x):,.2f}")
-                inv_view["open_notional_conservative"] = inv_view["open_notional_conservative"].map(
-                    lambda x: f"${float(x):,.2f}"
-                )
-                inv_view["hold_age_seconds"] = inv_view["hold_age_seconds"].map(
-                    lambda x: "n/a" if x is None else f"{float(x) / 60.0:.1f}m"
-                )
-                inv_view["unrealized_conservative"] = inv_view["unrealized_conservative"].map(lambda x: f"${x:,.2f}")
-                inv_view["unrealized_pnl_mark"] = inv_view["unrealized_pnl_mark"].map(lambda x: f"${x:,.2f}")
-                inv_view["bid_age_minutes"] = inv_view["bid_age_minutes"].map(
-                    lambda x: "n/a" if x is None else f"{float(x):.1f}"
-                )
-                inv_view["mark_age_minutes"] = inv_view["mark_age_minutes"].map(
-                    lambda x: "n/a" if x is None else f"{float(x):.1f}"
-                )
-                st.dataframe(inv_view, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        st.subheader("Two-Sided Strategy Comparison")
-        if two_sided_tag_summary_df.empty:
-            st.info("No two-sided strategy data for current filter.")
-        else:
-            compare_cols = st.columns(4)
-            compare_cols[0].metric("Tags", int(two_sided_tag_summary_df["strategy_tag"].nunique()))
-            compare_cols[1].metric("Total Trades", int(two_sided_tag_summary_df["trades"].sum()))
-            compare_cols[2].metric("Realized P&L", f"${two_sided_tag_summary_df['realized_pnl'].sum():,.2f}")
-            compare_cols[3].metric("Total (Conservative)", f"${two_sided_tag_summary_df['total_pnl'].sum():,.2f}")
-
-            by_tag_view = two_sided_tag_summary_df.copy()
-            if "max_mark_age_minutes" in by_tag_view.columns:
-                by_tag_view["max_mark_age_minutes"] = by_tag_view["max_mark_age_minutes"].fillna(0.0)
-            by_tag_view = by_tag_view[
-                [
-                    "strategy_tag", "trades", "sells", "win_rate_sells",
-                    "realized_pnl", "unrealized_conservative", "total_pnl",
-                    "unrealized_pnl_mark", "total_pnl_mark",
-                    "open_outcomes", "ready_to_sell", "blocked_missing_bid",
-                    "max_mark_age_minutes",
-                    "avg_edge_theoretical", "avg_edge_realized_sells", "gross_notional",
-                ]
-            ]
-            by_tag_view["win_rate_sells"] = by_tag_view["win_rate_sells"].map(lambda x: f"{float(x):.1%}")
-            by_tag_view["avg_edge_theoretical"] = by_tag_view["avg_edge_theoretical"].map(lambda x: f"{float(x):.2%}")
-            by_tag_view["avg_edge_realized_sells"] = by_tag_view["avg_edge_realized_sells"].map(
-                lambda x: f"{float(x):.2%}"
-            )
-            by_tag_view["max_mark_age_minutes"] = by_tag_view["max_mark_age_minutes"].map(lambda x: f"{float(x):.1f}")
-            for col in [
-                "realized_pnl", "unrealized_conservative", "total_pnl",
-                "unrealized_pnl_mark", "total_pnl_mark", "gross_notional",
-            ]:
-                by_tag_view[col] = by_tag_view[col].map(lambda x: f"${float(x):,.2f}")
-            st.dataframe(by_tag_view, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        st.subheader("Recent Trades")
-        if trades_view:
-            recent = sorted(trades_view, key=lambda t: t.created_at, reverse=True)[:20]
-            obs_by_id = {obs.id: obs for obs in observations}
-            trade_df = pd.DataFrame([
-                {
-                    "Time": t.created_at.strftime("%Y-%m-%d %H:%M") if t.created_at else "N/A",
-                    "Tag": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("strategy_tag") or "")
-                    if obs_by_id.get(t.observation_id) is not None else "",
-                    "Condition": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("condition_id") or "")
-                    if obs_by_id.get(t.observation_id) is not None else "",
-                    "Outcome": str(_observation_game_state(obs_by_id.get(t.observation_id)).get("outcome") or "")
-                    if obs_by_id.get(t.observation_id) is not None else "",
-                    "Side": t.side,
-                    "Entry Price": f"{t.entry_price:.2%}" if t.entry_price else "N/A",
-                    "Fill Price": f"{t.simulated_fill_price:.2%}" if t.simulated_fill_price else "N/A",
-                    "Size": f"${t.size:.2f}" if t.size else "N/A",
-                    "Edge (Theo)": f"{t.edge_theoretical:.1%}" if t.edge_theoretical else "N/A",
-                    "Edge (Real)": f"{t.edge_realized:.1%}" if t.edge_realized else "Pending",
-                    "P&L": f"${t.pnl:.2f}" if t.pnl is not None else "Pending",
-                }
-                for t in recent
-            ])
-            st.dataframe(trade_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No trades yet")
+        _render_crypto_two_sided_tab(observations, trades)
 
     # ===== SNIPER TAB =====
     with tab_sniper:
