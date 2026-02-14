@@ -199,6 +199,11 @@ class SniperEngine:
 
     async def _snipe_tick(self) -> None:
         """Check all targets for snipeable asks."""
+        # Skip staleness check before any WS subscriptions exist —
+        # last_update_ts is 0.0 until the first message arrives.
+        if not self._subscribed_markets:
+            return
+
         if not await self.guard.is_trading_allowed(
             last_book_update=self.polymarket.last_update_ts
         ):

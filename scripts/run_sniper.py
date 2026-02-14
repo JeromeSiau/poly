@@ -126,7 +126,7 @@ async def main() -> None:
         stale_cancel_seconds=180.0,
         stale_exit_seconds=600.0,
         daily_loss_limit_usd=args.cb_daily_limit,
-        telegram_alerter=manager._alerter,
+        telegram_alerter=manager._alerter if not paper_mode else None,
     )
     await guard.initialize()
 
