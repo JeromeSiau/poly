@@ -2,10 +2,11 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from src.feeds.polymarket import PolymarketFeed
+from src.feeds.polymarket import PolymarketFeed, UserTradeEvent
 from src.execution.trade_manager import TradeManager
 from scripts.run_crypto_td_maker import CryptoTDMaker, PassiveOrder, OpenPosition
 
@@ -396,3 +397,161 @@ class TestSequentialLadder:
         down_orders = _orders_for_outcome(maker, "Down")
         assert len(down_orders) == 1
         assert down_orders[0].price == 0.75
+
+
+# ---------------------------------------------------------------------------
+# Phantom fill prevention: partial fills must not spill to next rung
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_user_feed() -> SimpleNamespace:
+    """Create a minimal user_feed with an asyncio.Queue for fills."""
+    return SimpleNamespace(
+        fills=asyncio.Queue(),
+        fill_received=asyncio.Event(),
+    )
+
+
+class TestPartialFillPhantom:
+    """Partial fills on a CLOB order must NOT be attributed to a different rung.
+
+    Scenario: order A (0.75) fills in two partials. After the first partial
+    consumes order A from active_orders, the second partial must NOT match
+    order B (0.85) just because it shares the same condition_id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_partial_does_not_match_next_rung(self):
+        """Two partials with same maker_order_id: only first matches; second is unmatched."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        user_feed = _make_fake_user_feed()
+        maker = _make_ladder_maker(feed, ladder_rungs=2, user_feed=user_feed)
+        maker.paper_mode = False  # live mode to use _fill_listener
+
+        # Inject two rung orders for the same market.
+        order_a_id = "real_order_75"
+        order_b_id = "real_order_85"
+        now = time.time()
+        order_a = PassiveOrder(
+            order_id=order_a_id, condition_id=CID, outcome="Down",
+            token_id=TOK_DOWN, price=0.75, size_usd=5.0, placed_at=now,
+        )
+        order_b = PassiveOrder(
+            order_id=order_b_id, condition_id=CID, outcome="Down",
+            token_id=TOK_DOWN, price=0.85, size_usd=5.0, placed_at=now,
+        )
+        maker.active_orders[order_a_id] = order_a
+        maker.active_orders[order_b_id] = order_b
+        maker._orders_by_cid_outcome[(CID, "Down")] = order_a_id
+
+        # First partial fill — should match order_a.
+        evt1 = UserTradeEvent(
+            order_id="taker_xyz", market=CID, asset_id=TOK_DOWN,
+            side="SELL", price=0.75, size=3.0, status="MATCHED",
+            timestamp=now, maker_order_id=order_a_id,
+        )
+        # Second partial fill — same maker_order_id, arrives after order_a removed.
+        evt2 = UserTradeEvent(
+            order_id="taker_xyz", market=CID, asset_id=TOK_DOWN,
+            side="SELL", price=0.75, size=3.5, status="MATCHED",
+            timestamp=now + 0.1, maker_order_id=order_a_id,
+        )
+
+        # Enqueue both fills and a sentinel to stop the loop.
+        await user_feed.fills.put(evt1)
+        await user_feed.fills.put(evt2)
+
+        # Run _fill_listener with a timeout — it loops forever, so we cancel it.
+        task = asyncio.create_task(maker._fill_listener())
+        # Let events be processed.
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # order_a should be consumed (removed from active_orders).
+        assert order_a_id not in maker.active_orders
+        # order_b must STILL be in active_orders — not phantom-filled.
+        assert order_b_id in maker.active_orders
+        assert maker.active_orders[order_b_id].price == 0.85
+        # fill_count should be 2 (both partials counted).
+        assert maker._cid_fill_count.get(CID, 0) == 2
+
+    @pytest.mark.asyncio
+    async def test_placeholder_matched_by_condition_id(self):
+        """A fill during placement (placeholder order) should still match by condition_id."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        user_feed = _make_fake_user_feed()
+        maker = _make_ladder_maker(feed, ladder_rungs=2, user_feed=user_feed)
+        maker.paper_mode = False
+
+        # Inject a placeholder (API call in-flight, real order_id unknown).
+        placeholder_id = f"_placing_{CID}_Down_75"
+        now = time.time()
+        placeholder = PassiveOrder(
+            order_id=placeholder_id, condition_id=CID, outcome="Down",
+            token_id=TOK_DOWN, price=0.75, size_usd=5.0, placed_at=now,
+        )
+        maker.active_orders[placeholder_id] = placeholder
+
+        # Fill arrives with a maker_order_id we don't know yet.
+        evt = UserTradeEvent(
+            order_id="taker_abc", market=CID, asset_id=TOK_DOWN,
+            side="SELL", price=0.75, size=6.7, status="MATCHED",
+            timestamp=now, maker_order_id="unknown_real_order_id",
+        )
+        await user_feed.fills.put(evt)
+
+        task = asyncio.create_task(maker._fill_listener())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Placeholder should be consumed.
+        assert placeholder_id not in maker.active_orders
+        assert CID in maker.positions
+        assert maker._cid_fill_count.get(CID, 0) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_maker_order_id_falls_back_to_condition_id(self):
+        """When maker_order_id is empty, fall back to broad condition_id match."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        user_feed = _make_fake_user_feed()
+        maker = _make_ladder_maker(feed, ladder_rungs=1, user_feed=user_feed)
+        maker.paper_mode = False
+
+        order_id = "real_order_75"
+        now = time.time()
+        order = PassiveOrder(
+            order_id=order_id, condition_id=CID, outcome="Down",
+            token_id=TOK_DOWN, price=0.75, size_usd=5.0, placed_at=now,
+        )
+        maker.active_orders[order_id] = order
+
+        # Fill with no maker_order_id (edge case).
+        evt = UserTradeEvent(
+            order_id="taker_xyz", market=CID, asset_id=TOK_DOWN,
+            side="SELL", price=0.75, size=6.7, status="MATCHED",
+            timestamp=now, maker_order_id="",
+        )
+        await user_feed.fills.put(evt)
+
+        task = asyncio.create_task(maker._fill_listener())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Should match via condition_id fallback.
+        assert order_id not in maker.active_orders
+        assert CID in maker.positions

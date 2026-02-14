@@ -524,6 +524,7 @@ class UserTradeEvent:
     size: float
     status: str  # MATCHED / MINED / CONFIRMED / FAILED
     timestamp: float
+    maker_order_id: str = ""  # our order id when we are the maker
 
     @classmethod
     def from_raw(cls, data: dict[str, Any]) -> "UserTradeEvent":
@@ -531,6 +532,9 @@ class UserTradeEvent:
         order_id = data.get("taker_order_id", "")
         if not order_id and maker_orders:
             order_id = maker_orders[0].get("order_id", "")
+        maker_order_id = ""
+        if maker_orders:
+            maker_order_id = maker_orders[0].get("order_id", "")
         return cls(
             order_id=order_id,
             market=str(data.get("market", "")),
@@ -540,6 +544,7 @@ class UserTradeEvent:
             size=float(data.get("size", 0)),
             status=str(data.get("status", "")),
             timestamp=float(data.get("timestamp", 0)),
+            maker_order_id=maker_order_id,
         )
 
 

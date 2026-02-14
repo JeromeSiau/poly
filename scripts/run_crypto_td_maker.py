@@ -934,18 +934,39 @@ class CryptoTDMaker:
             matched_id: Optional[str] = None
             source = "active"
 
-            # Match by condition_id only (not token_id) — on binary markets
-            # the fill can arrive with the complementary token's asset_id.
-            for oid, order in self.active_orders.items():
-                if order.condition_id == evt.market:
-                    matched_order = order
-                    matched_id = oid
-                    break
+            # --- Priority 1: exact maker_order_id match (prevents phantom fills
+            # from partial fills being mis-attributed to the next rung order) ---
+            if evt.maker_order_id:
+                if evt.maker_order_id in self.active_orders:
+                    matched_id = evt.maker_order_id
+                    matched_order = self.active_orders[matched_id]
+                elif evt.maker_order_id in self._pending_cancels:
+                    matched_id = evt.maker_order_id
+                    matched_order = self._pending_cancels[matched_id]
+                    source = "pending_cancel"
+                    logger.warning(
+                        "td_late_fill_from_cancelled_order",
+                        order_id=matched_id[:16],
+                        condition_id=matched_order.condition_id[:16],
+                        outcome=matched_order.outcome,
+                        price=matched_order.price,
+                    )
 
-            # Then check pending cancels — late fill for an order we tried to cancel.
+            # --- Priority 2: condition_id match for PLACEHOLDER orders only ---
+            # Placeholders (id starts with "_placing_") exist while the API call
+            # is in-flight; we don't yet know the real order_id, so fall back to
+            # condition_id matching restricted to placeholders.
+            if not matched_order:
+                for oid, order in self.active_orders.items():
+                    if oid.startswith("_placing_") and order.condition_id == evt.market:
+                        matched_order = order
+                        matched_id = oid
+                        break
+
+            # --- Priority 3: condition_id match in pending_cancels (placeholders) ---
             if not matched_order:
                 for oid, order in self._pending_cancels.items():
-                    if order.condition_id == evt.market:
+                    if oid.startswith("_placing_") and order.condition_id == evt.market:
                         matched_order = order
                         matched_id = oid
                         source = "pending_cancel"
@@ -957,6 +978,29 @@ class CryptoTDMaker:
                             price=order.price,
                         )
                         break
+
+            # --- Fallback: broad condition_id match (only when maker_order_id
+            # is missing, e.g. taker fills or WS edge cases) ---
+            if not matched_order and not evt.maker_order_id:
+                for oid, order in self.active_orders.items():
+                    if order.condition_id == evt.market:
+                        matched_order = order
+                        matched_id = oid
+                        break
+                if not matched_order:
+                    for oid, order in self._pending_cancels.items():
+                        if order.condition_id == evt.market:
+                            matched_order = order
+                            matched_id = oid
+                            source = "pending_cancel"
+                            logger.warning(
+                                "td_late_fill_from_cancelled_order",
+                                order_id=oid[:16],
+                                condition_id=order.condition_id[:16],
+                                outcome=order.outcome,
+                                price=order.price,
+                            )
+                            break
 
             if not matched_order or not matched_id:
                 logger.warning(
