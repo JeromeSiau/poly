@@ -136,6 +136,7 @@ class CryptoTDMaker:
         guard: Optional[RiskGuard] = None,
         db_url: str = "",
         ladder_rungs: int = 1,
+        min_move_pct: float = 0.0,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -153,6 +154,7 @@ class CryptoTDMaker:
         self.guard = guard
         self._db_url = db_url
         self.ladder_rungs = ladder_rungs
+        self.min_move_pct = min_move_pct
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -176,6 +178,11 @@ class CryptoTDMaker:
         self._cid_fill_count: dict[str, int] = {}  # cid -> number of fills
         # Rung-level dedup: (cid, outcome, price_cents) of placed/active rungs.
         self._rung_placed: set[tuple[str, str, int]] = set()
+
+        # Binance reference prices for min-move filter.
+        self._ref_prices: dict[str, float] = {}  # cid -> open price at slot start
+        self._cid_binance_symbol: dict[str, str] = {}  # cid -> "BTCUSDT"
+        self._spot_cache: dict[str, tuple[float, float]] = {}  # symbol -> (price, fetch_ts)
 
         # Stats
         self.total_fills: int = 0
@@ -291,6 +298,97 @@ class CryptoTDMaker:
         )
 
     # ------------------------------------------------------------------
+    # Binance price helpers (min-move filter)
+    # ------------------------------------------------------------------
+
+    _SPOT_CACHE_TTL: float = 2.0
+
+    async def _fetch_ref_price(self, binance_symbol: str, slot_ts: int) -> Optional[float]:
+        """Fetch Binance open price at the start of a 15-min slot."""
+        if not self._http_client:
+            return None
+        try:
+            resp = await self._http_client.get(
+                "https://api.binance.com/api/v3/klines",
+                params={
+                    "symbol": binance_symbol,
+                    "interval": "1m",
+                    "startTime": slot_ts * 1000,
+                    "limit": 1,
+                },
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                klines = resp.json()
+                if klines:
+                    return float(klines[0][1])  # open price
+        except Exception as exc:
+            logger.warning("binance_ref_price_failed", symbol=binance_symbol, error=str(exc)[:60])
+        return None
+
+    async def _get_spot_price(self, binance_symbol: str) -> Optional[float]:
+        """Get current Binance spot price (cached for _SPOT_CACHE_TTL)."""
+        now = time.time()
+        cached = self._spot_cache.get(binance_symbol)
+        if cached and now - cached[1] < self._SPOT_CACHE_TTL:
+            return cached[0]
+        if not self._http_client:
+            return None
+        try:
+            resp = await self._http_client.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": binance_symbol},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                price = float(resp.json()["price"])
+                self._spot_cache[binance_symbol] = (price, now)
+                return price
+        except Exception as exc:
+            logger.warning("binance_spot_failed", symbol=binance_symbol, error=str(exc)[:60])
+        return None
+
+    async def _refresh_spot_prices(self) -> None:
+        """Pre-fetch current Binance prices for all tracked symbols."""
+        now = time.time()
+        for sym in set(self._cid_binance_symbol.values()):
+            cached = self._spot_cache.get(sym)
+            if not cached or now - cached[1] >= self._SPOT_CACHE_TTL:
+                await self._get_spot_price(sym)
+
+    def _check_min_move(self, cid: str, outcome: str) -> bool:
+        """Check if underlying has moved enough in the bet direction.
+
+        Returns True (allow) when min_move_pct is 0 or data is unavailable.
+        """
+        if self.min_move_pct <= 0:
+            return True
+        ref = self._ref_prices.get(cid)
+        sym = self._cid_binance_symbol.get(cid)
+        if not ref or not sym:
+            return True  # no ref data → allow
+        cached = self._spot_cache.get(sym)
+        if not cached:
+            return True  # no spot data → allow
+        spot = cached[0]
+        move_pct = (spot - ref) / ref * 100
+        # For "Down" bets, a negative move (price dropped) is in our favour.
+        if outcome == "Down":
+            move_pct = -move_pct
+        return move_pct >= self.min_move_pct
+
+    @staticmethod
+    def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
+        """Parse slug like 'btc-updown-15m-1771079400' → ('BTCUSDT', slot_ts)."""
+        parts = slug.split("-")
+        if len(parts) >= 4 and parts[-1].isdigit():
+            symbol_map = {v: k for k, v in CRYPTO_SYMBOL_TO_SLUG.items()}
+            binance_symbol = symbol_map.get(parts[0].lower())
+            if binance_symbol:
+                return binance_symbol, int(parts[-1])
+        return None
+
+    # ------------------------------------------------------------------
     # Market discovery
     # ------------------------------------------------------------------
 
@@ -354,6 +452,24 @@ class CryptoTDMaker:
                     await self.user_feed.subscribe_markets(new_user_markets)
                 except Exception:
                     pass
+
+            # Fetch Binance reference prices for min-move filter.
+            if self.min_move_pct > 0:
+                for cid in new_user_markets:
+                    slug = _first_event_slug(self.known_markets.get(cid, {}))
+                    info = self._parse_slug_info(slug)
+                    if info:
+                        binance_symbol, slot_ts = info
+                        self._cid_binance_symbol[cid] = binance_symbol
+                        ref = await self._fetch_ref_price(binance_symbol, slot_ts)
+                        if ref:
+                            self._ref_prices[cid] = ref
+                            logger.debug(
+                                "td_ref_price_set",
+                                cid=cid[:16],
+                                symbol=binance_symbol,
+                                ref_price=ref,
+                            )
 
             logger.info(
                 "td_markets_discovered",
@@ -429,6 +545,10 @@ class CryptoTDMaker:
         pending_exposure = sum(o.size_usd for o in self.active_orders.values())
         budget_left = self.max_total_exposure_usd - current_exposure - pending_exposure
 
+        # Refresh Binance spot prices for min-move filter.
+        if self.min_move_pct > 0:
+            await self._refresh_spot_prices()
+
         cancel_ids: list[str] = []
         place_intents: list[tuple[str, str, str, float]] = []  # (cid, outcome, token_id, price)
 
@@ -452,13 +572,17 @@ class CryptoTDMaker:
                     self._last_book_update = now
                 existing_key = (cid, outcome)
 
-                # BUY signal: bid in [target_bid, max_bid]
+                # BUY signal: bid in [target_bid, max_bid] + min-move filter
                 bid_in_range = (
                     bid is not None
                     and self.target_bid <= bid <= self.max_bid
+                    and self._check_min_move(cid, outcome)
                 )
 
                 if self.ladder_rungs > 1 and bid is not None and bid >= self.target_bid:
+                    # Min-move filter for ladder mode.
+                    if not self._check_min_move(cid, outcome):
+                        continue
                     # ---- Sequential ladder: place only the next rung ----
                     next_idx = self._cid_fill_count.get(cid, 0)
                     if next_idx < len(self.rung_prices):
@@ -1020,6 +1144,8 @@ class CryptoTDMaker:
                 pass
 
             self.known_markets.pop(cid, None)
+            self._ref_prices.pop(cid, None)
+            self._cid_binance_symbol.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -1303,6 +1429,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cb-stale-cancel", type=float, default=120.0, help="Stale escalation: cancel all orders after N seconds")
     p.add_argument("--cb-stale-exit", type=float, default=300.0, help="Stale escalation: exit process after N seconds")
     p.add_argument("--cb-daily-limit", type=float, default=-200.0, help="Global daily loss limit USD")
+    p.add_argument(
+        "--min-move-pct", type=float, default=0.0,
+        help="Min underlying price move (%%) in bet direction to enter (0=disabled)",
+    )
     return p
 
 
@@ -1388,6 +1518,7 @@ async def main() -> None:
         guard=guard,
         db_url=args.db_url,
         ladder_rungs=args.ladder_rungs,
+        min_move_pct=args.min_move_pct,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"
@@ -1400,6 +1531,8 @@ async def main() -> None:
         print(f"  Ladder:      {args.ladder_rungs} rungs at [{rung_str}]")
     print(f"  Order size:  ${order_size:.2f}/rung")
     print(f"  Max exposure: ${max_exposure:.2f}")
+    if args.min_move_pct > 0:
+        print(f"  Min move:    {args.min_move_pct}% (Binance directional filter)")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print()
 
