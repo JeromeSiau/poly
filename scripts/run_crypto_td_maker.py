@@ -338,17 +338,7 @@ class CryptoTDMaker:
             threshold = self.min_move_pct * (rung_ratio / base_ratio)
         else:
             threshold = self.min_move_pct
-        allowed = move >= threshold
-        if not allowed:
-            logger.debug(
-                "min_move_filtered",
-                cid=cid[:16],
-                outcome=outcome,
-                move_pct=round(move, 4),
-                threshold=round(threshold, 4),
-                price=price,
-            )
-        return allowed
+        return move >= threshold
 
     @staticmethod
     def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
