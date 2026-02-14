@@ -17,13 +17,15 @@ BACKTEST METHODOLOGY:
     market, if either outcome has sufficient trade volume in the target zone,
     we simulate a fill at the VWAP.
 
-DATASET: 41K resolved BTC/ETH 15-min updown markets (Oct 2025 - Feb 2026)
+DATASET: 41K+ resolved BTC/ETH/SOL/XRP 15-min updown markets (Oct 2025 - Feb 2026)
 
 Usage:
     python scripts/backtest_crypto_td_maker.py
     python scripts/backtest_crypto_td_maker.py --mode sell --sell-lo 0.15 --sell-hi 0.35
     python scripts/backtest_crypto_td_maker.py --sweep
     python scripts/backtest_crypto_td_maker.py --symbol BTC
+    python scripts/backtest_crypto_td_maker.py --symbol SOL
+    python scripts/backtest_crypto_td_maker.py --symbol XRP
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ class TDMakerMarket:
     """A resolved 15-min crypto binary market for TD maker backtest."""
     market_id: str
     slug: str
-    symbol: str          # "BTC" or "ETH"
+    symbol: str          # "BTC", "ETH", "SOL", or "XRP"
     up_token_id: str
     down_token_id: str
     up_won: bool
@@ -104,7 +106,16 @@ def load_markets(con: duckdb.DuckDBPyConnection, markets_dir: str,
                 continue
 
             slug = row["slug"]
-            symbol = "BTC" if slug.startswith("btc") else "ETH"
+            if slug.startswith("btc"):
+                symbol = "BTC"
+            elif slug.startswith("eth"):
+                symbol = "ETH"
+            elif slug.startswith("sol"):
+                symbol = "SOL"
+            elif slug.startswith("xrp"):
+                symbol = "XRP"
+            else:
+                continue
 
             markets.append(TDMakerMarket(
                 market_id=str(row["id"]),
@@ -410,7 +421,8 @@ def print_report(stats: StrategyStats, args: argparse.Namespace, mode: str = "bu
     # Breakdown by symbol
     print(f"\n  {'Symbol':<6} | {'Trades':>6} | {'Win%':>5} | {'PnL':>10} | {'Avg Entry':>9} | {'Edge':>6}")
     print(f"  {'-'*6}-+-{'-'*6}-+-{'-'*5}-+-{'-'*10}-+-{'-'*9}-+-{'-'*6}")
-    for sym in ["BTC", "ETH"]:
+    all_symbols = sorted({t.symbol for t in stats.trades})
+    for sym in all_symbols:
         st = [t for t in stats.trades if t.symbol == sym]
         if not st:
             continue
@@ -620,8 +632,8 @@ def main():
                         help="Starting capital (USD)")
     parser.add_argument("--min-volume", type=float, default=5.0,
                         help="Min USD volume in bid range for entry")
-    parser.add_argument("--symbol", default=None, choices=["BTC", "ETH"],
-                        help="Filter to BTC or ETH only")
+    parser.add_argument("--symbol", default=None, choices=["BTC", "ETH", "SOL", "XRP"],
+                        help="Filter to a single symbol")
     parser.add_argument("--mode", default=None, choices=["buy", "sell"],
                         help="Run only buy or sell (default: both)")
     parser.add_argument("--sell-lo", type=float, default=0.15,

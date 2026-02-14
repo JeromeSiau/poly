@@ -7,7 +7,7 @@ source "$(dirname "$0")/_common.sh"
 #   run_crypto_td_maker.sh --live                  # live, auto-detect wallet
 #   run_crypto_td_maker.sh --live --wallet 500     # live, manual wallet
 
-SYMBOLS="BTCUSDT,ETHUSDT"
+SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
 MODE="paper"
 TARGET_BID="${TARGET_BID:-0.75}"
 MAX_BID="${MAX_BID:-0.85}"

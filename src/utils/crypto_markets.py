@@ -23,6 +23,7 @@ CRYPTO_SYMBOL_TO_SLUG: dict[str, str] = {
     "BTCUSDT": "btc",
     "ETHUSDT": "eth",
     "SOLUSDT": "sol",
+    "XRPUSDT": "xrp",
 }
 
 
