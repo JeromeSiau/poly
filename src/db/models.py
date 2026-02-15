@@ -4,7 +4,9 @@ from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import (
+    BigInteger,
     Column,
+    Index,
     Integer,
     String,
     Float,
@@ -303,11 +305,11 @@ class FearPosition(Base):
     __tablename__ = "fear_positions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    condition_id = Column(String, nullable=False, index=True)
-    token_id = Column(String, nullable=False)
-    title = Column(String, nullable=False)
-    cluster = Column(String, nullable=False, index=True)
-    side = Column(String, nullable=False, default="NO")
+    condition_id = Column(String(255), nullable=False, index=True)
+    token_id = Column(String(255), nullable=False)
+    title = Column(String(500), nullable=False)
+    cluster = Column(String(100), nullable=False, index=True)
+    side = Column(String(10), nullable=False, default="NO")
     entry_price = Column(Float, nullable=False)
     size_usd = Column(Float, nullable=False)
     shares = Column(Float, nullable=False)
@@ -317,7 +319,7 @@ class FearPosition(Base):
     realized_pnl = Column(Float, nullable=True)
     unrealized_pnl = Column(Float, default=0.0)
     is_open = Column(Boolean, default=True, index=True)
-    entry_trigger = Column(String, nullable=True)  # "scan" | "spike" | "manual"
+    entry_trigger = Column(String(20), nullable=True)  # "scan" | "spike" | "manual"
     opened_at = Column(DateTime, server_default=func.now())
     closed_at = Column(DateTime, nullable=True)
 
@@ -347,3 +349,75 @@ class TDMakerOrder(Base):
     pnl = Column(Float, nullable=True)
     extra = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RiskState(Base):
+    """Per-strategy risk state shared across daemon processes."""
+
+    __tablename__ = "risk_state"
+
+    strategy_tag = Column(String(100), primary_key=True)
+    daily_pnl = Column(Float, default=0.0)
+    session_pnl = Column(Float, default=0.0)
+    consec_losses = Column(Integer, default=0)
+    last_heartbeat = Column(Float, nullable=True)
+    circuit_broken = Column(Boolean, default=False)
+    circuit_reason = Column(String(255), nullable=True)
+    updated_at = Column(Float, nullable=True)
+
+
+class SlotSnapshot(Base):
+    """Book + Chainlink snapshot captured every ~30s during each 15-min slot."""
+
+    __tablename__ = "slot_snapshots"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False)
+    slot_ts = Column(Integer, nullable=False)
+    captured_at = Column(Float, nullable=False)
+    minutes_into_slot = Column(Float, nullable=False)
+
+    # Polymarket book
+    bid_up = Column(Float)
+    ask_up = Column(Float)
+    bid_down = Column(Float)
+    ask_down = Column(Float)
+    bid_size_up = Column(Float)
+    ask_size_up = Column(Float)
+    bid_size_down = Column(Float)
+    ask_size_down = Column(Float)
+    spread_up = Column(Float)
+    spread_down = Column(Float)
+
+    # Chainlink
+    chainlink_price = Column(Float)
+    dir_move_pct = Column(Float)
+    abs_move_pct = Column(Float)
+
+    # Context
+    hour_utc = Column(Integer)
+    day_of_week = Column(Integer)
+
+    __table_args__ = (
+        Index("idx_snap_symbol_slot", "symbol", "slot_ts"),
+        Index("idx_snap_slot_ts", "slot_ts"),
+    )
+
+
+class SlotResolution(Base):
+    """One row per slot per symbol, updated when resolution is known."""
+
+    __tablename__ = "slot_resolutions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False)
+    slot_ts = Column(Integer, nullable=False)
+    condition_id = Column(String(66), nullable=True)
+
+    resolved_up = Column(Boolean, nullable=True)
+    prev_resolved_up = Column(Boolean, nullable=True)
+    resolved_at = Column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("idx_res_symbol_slot", "symbol", "slot_ts", unique=True),
+    )

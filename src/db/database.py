@@ -1,4 +1,7 @@
-"""Database connection and session management with async support."""
+"""Database connection and session management with async support.
+
+Works with both SQLite (aiosqlite) and MySQL (aiomysql) via SQLAlchemy.
+"""
 
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
@@ -14,10 +17,11 @@ from sqlalchemy.orm import sessionmaker, Session
 
 from .models import Base
 
+from config.settings import settings
 
-# Default database URL (SQLite for development)
-DEFAULT_DATABASE_URL = "sqlite:///./data/arb.db"
-DEFAULT_ASYNC_DATABASE_URL = "sqlite+aiosqlite:///./data/arb.db"
+# Default URLs from settings
+DEFAULT_DATABASE_URL = settings.DATABASE_URL
+DEFAULT_ASYNC_DATABASE_URL = settings.DATABASE_URL
 
 # Global engine instances
 _sync_engine: Optional[create_engine] = None
@@ -26,12 +30,17 @@ _sync_session_factory: Optional[sessionmaker] = None
 _async_session_factory: Optional[async_sessionmaker] = None
 
 
+def _sync_url(url: str) -> str:
+    """Convert async URL to sync URL for create_engine."""
+    return url.replace("+aiosqlite", "").replace("+aiomysql", "+pymysql")
+
+
 def get_sync_engine(database_url: str = DEFAULT_DATABASE_URL):
     """Get or create synchronous database engine."""
     global _sync_engine
     if _sync_engine is None:
         _sync_engine = create_engine(
-            database_url,
+            _sync_url(database_url),
             echo=False,
             future=True,
         )
@@ -42,11 +51,11 @@ def get_async_engine(database_url: str = DEFAULT_ASYNC_DATABASE_URL) -> AsyncEng
     """Get or create asynchronous database engine."""
     global _async_engine
     if _async_engine is None:
-        _async_engine = create_async_engine(
-            database_url,
-            echo=False,
-            future=True,
-        )
+        kwargs = {"echo": False, "future": True}
+        # MySQL benefits from pool_pre_ping
+        if "mysql" in database_url or "mariadb" in database_url:
+            kwargs["pool_pre_ping"] = True
+        _async_engine = create_async_engine(database_url, **kwargs)
     return _async_engine
 
 
@@ -102,7 +111,7 @@ get_async_session = get_session
 
 
 def _migrate_add_columns(connection) -> None:
-    """Add missing columns to existing tables (SQLite-safe)."""
+    """Add missing columns to existing tables."""
     insp = inspect(connection)
     migrations = [
         ("paper_trades", "is_open", "BOOLEAN DEFAULT 1"),

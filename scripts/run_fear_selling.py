@@ -340,10 +340,9 @@ async def main(args: argparse.Namespace) -> None:
 
     # --- RiskGuard (replaces UnifiedRiskManager) -------------------------
     db_url = settings.DATABASE_URL or "sqlite+aiosqlite:///data/arb.db"
-    db_path = db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
     guard = RiskGuard(
         strategy_tag="fear_selling",
-        db_path=db_path,
+        db_url=db_url,
         max_consecutive_losses=args.cb_max_losses,
         max_drawdown_usd=args.cb_max_drawdown,
         stale_seconds=args.cb_stale_seconds,

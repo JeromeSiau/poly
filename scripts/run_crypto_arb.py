@@ -41,7 +41,7 @@ async def main(symbols: list[str], autopilot: bool) -> None:
     )
     guard = RiskGuard(
         strategy_tag="crypto_arb",
-        db_path="data/arb.db",
+        db_url=settings.DATABASE_URL,
         daily_loss_limit_usd=-(
             settings.GLOBAL_CAPITAL * settings.DAILY_LOSS_LIMIT_PCT
         ),

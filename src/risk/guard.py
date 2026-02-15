@@ -1,8 +1,10 @@
-"""SQLite-backed risk guard with circuit breaker, daily halt, and staleness detection.
+"""Database-backed risk guard with circuit breaker, daily halt, and staleness detection.
 
 Each strategy process instantiates its own RiskGuard. Shared state lives in the
 ``risk_state`` table so independent daemons can enforce a global daily loss
 limit cooperatively.
+
+Uses SQLAlchemy ORM — works with both SQLite and MySQL.
 """
 
 from __future__ import annotations
@@ -11,49 +13,43 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiosqlite
+from sqlalchemy import func as sa_func, select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    create_async_engine,
+    async_sessionmaker,
+)
 import structlog
+
+from src.db.models import Base, RiskState
 
 logger = structlog.get_logger()
 
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS risk_state (
-    strategy_tag    TEXT PRIMARY KEY,
-    daily_pnl       REAL DEFAULT 0.0,
-    session_pnl     REAL DEFAULT 0.0,
-    consec_losses   INTEGER DEFAULT 0,
-    last_heartbeat  REAL,
-    circuit_broken  INTEGER DEFAULT 0,
-    circuit_reason  TEXT,
-    updated_at      REAL
-);
-"""
+# Module-level engine cache: db_url -> (engine, session_factory)
+_engines: dict[str, tuple] = {}
 
-_UPSERT_SQL = """
-INSERT INTO risk_state (
-    strategy_tag, daily_pnl, session_pnl, consec_losses,
-    last_heartbeat, circuit_broken, circuit_reason, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(strategy_tag) DO UPDATE SET
-    daily_pnl      = excluded.daily_pnl,
-    session_pnl    = excluded.session_pnl,
-    consec_losses  = excluded.consec_losses,
-    last_heartbeat = excluded.last_heartbeat,
-    circuit_broken = excluded.circuit_broken,
-    circuit_reason = excluded.circuit_reason,
-    updated_at     = excluded.updated_at;
-"""
+
+def _get_factory(db_url: str) -> async_sessionmaker[AsyncSession]:
+    """Get or create an async session factory for the given URL."""
+    if db_url not in _engines:
+        engine = create_async_engine(db_url, echo=False, pool_pre_ping=True)
+        factory = async_sessionmaker(
+            bind=engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        _engines[db_url] = (engine, factory)
+    return _engines[db_url][1]
 
 
 class RiskGuard:
-    """Per-strategy risk guard backed by a shared SQLite database.
+    """Per-strategy risk guard backed by a shared database.
 
     Parameters
     ----------
     strategy_tag:
         Unique identifier for this strategy instance.
-    db_path:
-        Path to the SQLite database file (e.g. ``data/arb.db``).
+    db_url:
+        SQLAlchemy async database URL (e.g. ``mysql+aiomysql://...``
+        or ``sqlite+aiosqlite:///data/arb.db``).
     max_consecutive_losses:
         Circuit-break after this many consecutive losses.
     max_drawdown_usd:
@@ -73,7 +69,7 @@ class RiskGuard:
     def __init__(
         self,
         strategy_tag: str,
-        db_path: str,
+        db_url: str,
         max_consecutive_losses: int = 5,
         max_drawdown_usd: float = -50.0,
         stale_seconds: float = 30.0,
@@ -81,9 +77,11 @@ class RiskGuard:
         stale_exit_seconds: float = 300.0,
         daily_loss_limit_usd: float = -200.0,
         telegram_alerter: Optional[object] = None,
+        # Legacy alias — ignored, kept for backwards compat during migration
+        db_path: str = "",
     ) -> None:
         self.strategy_tag = strategy_tag
-        self.db_path = db_path
+        self.db_url = db_url
         self.max_consecutive_losses = max_consecutive_losses
         self.max_drawdown_usd = max_drawdown_usd
         self.stale_seconds = stale_seconds
@@ -91,6 +89,7 @@ class RiskGuard:
         self.stale_exit_seconds = stale_exit_seconds
         self.daily_loss_limit_usd = daily_loss_limit_usd
         self._alerter = telegram_alerter
+        self._factory: Optional[async_sessionmaker] = None
 
         # Local (in-memory) state — fast reads, persisted on writes.
         self.daily_pnl: float = 0.0
@@ -103,6 +102,11 @@ class RiskGuard:
         # Stale escalation state (reset when book recovers).
         self.should_cancel_orders: bool = False
         self._stale_cancel_alerted: bool = False
+
+    def _get_session_factory(self) -> async_sessionmaker[AsyncSession]:
+        if self._factory is None:
+            self._factory = _get_factory(self.db_url)
+        return self._factory
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -117,20 +121,23 @@ class RiskGuard:
           on a new process start.
         """
         now = time.time()
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute(_CREATE_TABLE_SQL)
-            await conn.commit()
+        factory = self._get_session_factory()
 
-            cursor = await conn.execute(
-                "SELECT daily_pnl, updated_at FROM risk_state WHERE strategy_tag = ?",
-                (self.strategy_tag,),
+        # Ensure table exists
+        engine = _engines[self.db_url][0]
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all, tables=[RiskState.__table__])
+
+        async with factory() as session:
+            # Read existing state
+            result = await session.execute(
+                select(RiskState).where(RiskState.strategy_tag == self.strategy_tag)
             )
-            row = await cursor.fetchone()
+            existing = result.scalar_one_or_none()
 
-            if row is not None:
-                prev_daily_pnl, updated_at = row
-                if self._same_utc_day(updated_at, now):
-                    self.daily_pnl = prev_daily_pnl
+            if existing is not None:
+                if self._same_utc_day(existing.updated_at or 0, now):
+                    self.daily_pnl = existing.daily_pnl or 0.0
                 else:
                     self.daily_pnl = 0.0
             else:
@@ -142,20 +149,19 @@ class RiskGuard:
             self.circuit_broken = False
             self.circuit_reason = ""
 
-            await conn.execute(
-                _UPSERT_SQL,
-                (
-                    self.strategy_tag,
-                    self.daily_pnl,
-                    self.session_pnl,
-                    self.consecutive_losses,
-                    now,
-                    int(self.circuit_broken),
-                    self.circuit_reason,
-                    now,
-                ),
+            # Upsert via merge
+            row = RiskState(
+                strategy_tag=self.strategy_tag,
+                daily_pnl=self.daily_pnl,
+                session_pnl=self.session_pnl,
+                consec_losses=self.consecutive_losses,
+                last_heartbeat=now,
+                circuit_broken=False,
+                circuit_reason="",
+                updated_at=now,
             )
-            await conn.commit()
+            await session.merge(row)
+            await session.commit()
 
         logger.info(
             "risk_guard_initialized",
@@ -282,13 +288,16 @@ class RiskGuard:
     async def heartbeat(self) -> None:
         """Update ``last_heartbeat`` in the database."""
         now = time.time()
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute(
-                "UPDATE risk_state SET last_heartbeat = ?, updated_at = ? "
-                "WHERE strategy_tag = ?",
-                (now, now, self.strategy_tag),
+        factory = self._get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(RiskState).where(RiskState.strategy_tag == self.strategy_tag)
             )
-            await conn.commit()
+            row = result.scalar_one_or_none()
+            if row:
+                row.last_heartbeat = now
+                row.updated_at = now
+                await session.commit()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -300,12 +309,12 @@ class RiskGuard:
         The limit is checked by summing ``daily_pnl`` across **all** rows
         in ``risk_state``.
         """
-        async with aiosqlite.connect(self.db_path) as conn:
-            cursor = await conn.execute(
-                "SELECT COALESCE(SUM(daily_pnl), 0.0) FROM risk_state"
+        factory = self._get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(sa_func.coalesce(sa_func.sum(RiskState.daily_pnl), 0.0))
             )
-            row = await cursor.fetchone()
-            total = row[0]
+            total = result.scalar()
 
         if total <= self.daily_loss_limit_usd:
             reason = f"global daily halt: total ${total:.2f}"
@@ -328,31 +337,34 @@ class RiskGuard:
             strategy_tag=self.strategy_tag,
             reason=reason,
         )
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute(
-                "UPDATE risk_state SET circuit_broken = 1, circuit_reason = ?, "
-                "updated_at = ? WHERE strategy_tag = ?",
-                (reason, now, self.strategy_tag),
+        factory = self._get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(RiskState).where(RiskState.strategy_tag == self.strategy_tag)
             )
-            await conn.commit()
+            row = result.scalar_one_or_none()
+            if row:
+                row.circuit_broken = True
+                row.circuit_reason = reason
+                row.updated_at = now
+                await session.commit()
 
     async def _persist_state(self, now: float) -> None:
         """Persist the full local state to the database."""
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute(
-                _UPSERT_SQL,
-                (
-                    self.strategy_tag,
-                    self.daily_pnl,
-                    self.session_pnl,
-                    self.consecutive_losses,
-                    now,
-                    int(self.circuit_broken),
-                    self.circuit_reason,
-                    now,
-                ),
+        factory = self._get_session_factory()
+        async with factory() as session:
+            row = RiskState(
+                strategy_tag=self.strategy_tag,
+                daily_pnl=self.daily_pnl,
+                session_pnl=self.session_pnl,
+                consec_losses=self.consecutive_losses,
+                last_heartbeat=now,
+                circuit_broken=self.circuit_broken,
+                circuit_reason=self.circuit_reason,
+                updated_at=now,
             )
-            await conn.commit()
+            await session.merge(row)
+            await session.commit()
 
     async def _send_alert(self, reason: str) -> None:
         """Send a one-shot Telegram alert (at most one per circuit break)."""

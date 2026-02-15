@@ -38,11 +38,12 @@ RULES: list[tuple[str, list[str] | str]] = [
                                      "run_sniper"]),
     ("src/feeds/polymarket",        ["run_crypto_td_maker",
                                      "run_crypto_maker", "run_crypto_two_sided_maker",
-                                     "run_sniper"]),
-    ("src/feeds/chainlink",         ["run_crypto_td_maker"]),
+                                     "run_sniper", "run_slot_collector"]),
+    ("src/feeds/chainlink",         ["run_crypto_td_maker", "run_slot_collector"]),
     ("src/feeds/kalshi",            ["run_kalshi_td_maker"]),
     ("src/db/td_orders",            ["run_crypto_td_maker", "run_kalshi_td_maker",
                                      "run_crypto_two_sided_maker"]),
+    ("src/db/slot_",                ["run_slot_collector"]),
     ("src/db/",                     ["run_fear_selling", "run_trades_api",
                                      "run_dashboard", "streamlit"]),
 
@@ -56,6 +57,7 @@ RULES: list[tuple[str, list[str] | str]] = [
 
     # ── API / dashboard ─────────────────────────────────────────────────
     ("src/api/trades_api",          ["run_trades_api"]),
+    ("src/api/slots_api",           ["run_trades_api"]),
     ("src/api/winrate",             ["run_trades_api"]),
     ("src/api/rn1_compare",         ["run_rn1_compare_api"]),
     ("src/paper_trading/",          ["run_dashboard", "streamlit", "run_auto_redeem"]),
@@ -70,6 +72,7 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("scripts/run_kalshi_td_maker.py",   ["run_kalshi_td_maker"]),
     ("scripts/run_crypto_two_sided_maker.py", ["run_crypto_two_sided_maker"]),
     ("scripts/run_sniper.py",           ["run_sniper"]),
+    ("scripts/run_slot_collector.py",    ["run_slot_collector"]),
 
     # ── Shell wrappers ──────────────────────────────────────────────────
     ("bin/run_fear_selling.sh",      ["run_fear_selling"]),
@@ -82,6 +85,7 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("bin/run_dashboard.sh",         ["run_dashboard", "streamlit"]),
     ("bin/run_rn1_compare_api.sh",   ["run_rn1_compare_api"]),
     ("bin/run_sniper.sh",           ["run_sniper"]),
+    ("bin/run_slot_collector.sh",    ["run_slot_collector"]),
 ]
 
 

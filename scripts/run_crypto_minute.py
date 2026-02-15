@@ -45,10 +45,9 @@ async def main() -> None:
         notify_closes=False,
     )
 
-    db_path = DB_URL.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
     guard = RiskGuard(
         strategy_tag="crypto_minute",
-        db_path=db_path,
+        db_url=DB_URL,
         max_consecutive_losses=5,
         max_drawdown_usd=-50.0,
         stale_seconds=300.0,

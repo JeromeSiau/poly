@@ -142,6 +142,7 @@ class CryptoTDMaker:
         min_entry_minutes: float = 0.0,
         max_entry_minutes: float = 0.0,
         chainlink_feed: Optional[ChainlinkFeed] = None,
+        model_path: str = "",
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -193,12 +194,111 @@ class CryptoTDMaker:
         self._cid_chainlink_symbol: dict[str, str] = {}  # cid -> "btc/usd"
         self._cid_slot_ts: dict[str, int] = {}  # cid -> slot start unix timestamp
         self._cid_fill_analytics: dict[str, dict] = {}  # cid -> {dir_move_pct, minutes_into_slot}
+        self._last_p_win: dict[tuple[str, str], float] = {}  # (cid, outcome) -> model P(win)
 
         # Stats
         self.total_fills: int = 0
         self.total_wins: int = 0
         self.total_losses: int = 0
         self.realized_pnl: float = 0.0
+
+        # ML model (optional)
+        self._model = None
+        self._model_features: list[str] = []
+        if model_path:
+            self._load_model(model_path)
+
+    def _load_model(self, path: str) -> None:
+        """Load trained XGBoost model from joblib file."""
+        import joblib
+        payload = joblib.load(path)
+        self._model = payload["model"]
+        self._model_features = payload["feature_cols"]
+        logger.info("model_loaded", path=path,
+                    features=len(self._model_features))
+
+    def _build_features(self, cid: str, outcome: str, bid: float) -> Optional[dict]:
+        """Build feature dict matching training features from current market state."""
+        if not self.chainlink_feed:
+            return None
+
+        sym = self._cid_chainlink_symbol.get(cid)
+        slot_ts = self._cid_slot_ts.get(cid)
+        if not sym or slot_ts is None:
+            return None
+
+        now = time.time()
+        minutes = (now - slot_ts) / 60
+
+        # Book levels for both outcomes
+        bid_up, _, ask_up, _ = self.polymarket.get_best_levels(cid, "Up")
+        bid_down, _, ask_down, _ = self.polymarket.get_best_levels(cid, "Down")
+        bsz_up, asz_up = 0.0, 0.0
+        bsz_down, asz_down = 0.0, 0.0
+
+        # Try to get sizes from the book
+        for out, bsz_attr, asz_attr in [("Up", "bsz_up", "asz_up"),
+                                         ("Down", "bsz_down", "asz_down")]:
+            b, bs, a, as_ = self.polymarket.get_best_levels(cid, out)
+            if out == "Up":
+                bsz_up = bs or 0.0
+                asz_up = as_ or 0.0
+            else:
+                bsz_down = bs or 0.0
+                asz_down = as_ or 0.0
+
+        spread_up = (ask_up - bid_up) if (ask_up and bid_up) else 0.0
+        spread_down = (ask_down - bid_down) if (ask_down and bid_down) else 0.0
+
+        # Chainlink move
+        dir_move = self._get_dir_move(cid, "Up")  # always Up direction
+        ref = self._ref_prices.get(cid)
+        current = self.chainlink_feed.get_price(sym)
+        abs_move = abs((current - ref) / ref * 100) if (ref and current) else 0.0
+
+        bid_up_val = bid_up or 0.0
+        bid_down_val = bid_down or 0.0
+        dt = datetime.fromtimestamp(now, tz=timezone.utc)
+
+        features = {
+            "bid_up": bid_up_val,
+            "ask_up": ask_up or 0.0,
+            "bid_down": bid_down_val,
+            "ask_down": ask_down or 0.0,
+            "spread_up": spread_up,
+            "spread_down": spread_down,
+            "bid_size_up": bsz_up,
+            "ask_size_up": asz_up,
+            "bid_size_down": bsz_down,
+            "ask_size_down": asz_down,
+            "dir_move_pct": dir_move or 0.0,
+            "abs_move_pct": abs_move,
+            "minutes_into_slot": minutes,
+            "hour_utc": dt.hour,
+            "day_of_week": dt.weekday(),
+            # Derived (same as train_td_model.py)
+            "spread_ratio": spread_up / max(spread_down, 0.001),
+            "bid_imbalance": bid_up_val - bid_down_val,
+            "fav_bid": max(bid_up_val, bid_down_val),
+            "move_velocity": (dir_move or 0.0) / max(minutes, 0.5),
+            "book_pressure": (bsz_up - bsz_down) / max(bsz_up + bsz_down, 0.01),
+        }
+        return features
+
+    def _check_model(self, cid: str, outcome: str, bid: float
+                     ) -> Optional[float]:
+        """Run ML model inference. Returns P(Up) or None if model unavailable."""
+        if not self._model:
+            return None
+        features = self._build_features(cid, outcome, bid)
+        if features is None:
+            return None
+        import numpy as np
+        row = np.array([[features.get(f, 0.0) for f in self._model_features]])
+        proba = self._model.predict_proba(row)[0]
+        # proba[1] = P(Up), proba[0] = P(Down)
+        p_win = proba[1] if outcome == "Up" else proba[0]
+        return float(p_win)
 
     # ------------------------------------------------------------------
     # DB persistence
@@ -580,15 +680,28 @@ class CryptoTDMaker:
                     self._last_book_update = now
                 existing_key = (cid, outcome)
 
-                # BUY signal: bid in [target_bid, max_bid] + timing + move filters
-                bid_in_range = (
-                    bid is not None
-                    and self.target_bid <= bid <= self.max_bid
-                    and self._check_min_entry_time(cid)
-                    and self._check_max_entry_time(cid)
-                    and self._check_min_move(cid, outcome, bid)
-                    and self._check_max_move(cid, outcome)
-                )
+                # BUY signal: bid in [target_bid, max_bid] + filters
+                if self._model:
+                    # ML model replaces manual move/timing filters
+                    p_win = self._check_model(cid, outcome, bid) if bid is not None else None
+                    bid_in_range = (
+                        bid is not None
+                        and self.target_bid <= bid <= self.max_bid
+                        and p_win is not None
+                        and p_win >= 0.55
+                    )
+                    if bid_in_range and p_win is not None:
+                        self._last_p_win[(cid, outcome)] = p_win
+                else:
+                    # Manual filters fallback
+                    bid_in_range = (
+                        bid is not None
+                        and self.target_bid <= bid <= self.max_bid
+                        and self._check_min_entry_time(cid)
+                        and self._check_max_entry_time(cid)
+                        and self._check_min_move(cid, outcome, bid)
+                        and self._check_max_move(cid, outcome)
+                    )
 
                 if self.ladder_rungs > 1 and bid is not None and bid >= self.target_bid:
                     # ---- Sequential ladder: place only the next rung ----
@@ -749,12 +862,23 @@ class CryptoTDMaker:
         if not self.manager:
             return None
 
+        # Model-based sizing: scale order_size by confidence
+        size_usd = self.order_size_usd
+        p_win = self._last_p_win.pop((cid, outcome), None)
+        if p_win is not None and self._model:
+            # Scale: 0.55 -> 0.2x, 0.75 -> 1.0x, 1.0 -> 2.0x (linear)
+            confidence_scale = max(0.2, min(2.0, (p_win - 0.5) / 0.25))
+            size_usd = round(self.order_size_usd * confidence_scale, 2)
+            logger.debug("model_sizing", cid=cid[:12], outcome=outcome,
+                         p_win=round(p_win, 3), scale=round(confidence_scale, 2),
+                         size_usd=size_usd)
+
         # Pre-register a placeholder BEFORE the await so the fill listener
         # can match fills that arrive while we're waiting for the API response.
         temp_id = f"_placing_{cid}_{outcome}_{int(round(price*100))}"
         placeholder = PassiveOrder(
             order_id=temp_id, condition_id=cid, outcome=outcome,
-            token_id=token_id, price=price, size_usd=self.order_size_usd,
+            token_id=token_id, price=price, size_usd=size_usd,
             placed_at=now,
         )
         self.active_orders[temp_id] = placeholder
@@ -765,7 +889,7 @@ class CryptoTDMaker:
         slug = _first_event_slug(self.known_markets.get(cid, {}))
         intent = TradeIntent(
             condition_id=cid, token_id=token_id, outcome=outcome,
-            side="BUY", price=price, size_usd=self.order_size_usd,
+            side="BUY", price=price, size_usd=size_usd,
             reason="td_maker_passive", title=slug, timestamp=now,
         )
         try:
@@ -1509,6 +1633,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-entry-minutes", type=float, default=0.0,
         help="Max minutes into slot — stop entering after this (0=disabled)",
     )
+    p.add_argument(
+        "--model-path", type=str, default="",
+        help="Path to trained XGBoost model (.joblib). Model replaces manual filters.",
+    )
     return p
 
 
@@ -1544,7 +1672,7 @@ async def main() -> None:
 
     guard = RiskGuard(
         strategy_tag=strategy_tag,
-        db_path=args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", ""),
+        db_url=args.db_url,
         max_consecutive_losses=args.cb_max_losses,
         max_drawdown_usd=args.cb_max_drawdown,
         stale_seconds=args.cb_stale_seconds,
@@ -1605,6 +1733,7 @@ async def main() -> None:
         min_entry_minutes=args.min_entry_minutes,
         max_entry_minutes=args.max_entry_minutes,
         chainlink_feed=chainlink_feed,
+        model_path=args.model_path,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"
@@ -1631,6 +1760,8 @@ async def main() -> None:
         if args.max_move_pct > 0:
             parts.append(f"<={args.max_move_pct}%")
         print(f"  Move filter: {' & '.join(parts)} (Chainlink directional)")
+    if args.model_path:
+        print(f"  ML model:    {args.model_path}")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print()
 

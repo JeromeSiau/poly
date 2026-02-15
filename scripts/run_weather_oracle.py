@@ -124,10 +124,9 @@ async def main():
         notify_closes=False,
     )
 
-    db_path = args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
     guard = RiskGuard(
         strategy_tag="weather_oracle",
-        db_path=db_path,
+        db_url=args.db_url,
         max_consecutive_losses=args.cb_max_losses,
         max_drawdown_usd=args.cb_max_drawdown,
         stale_seconds=args.cb_stale_seconds,

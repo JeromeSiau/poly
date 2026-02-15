@@ -90,7 +90,7 @@ class RealityArbBot:
         # Initialize RiskGuard
         self.guard = RiskGuard(
             strategy_tag="reality_arb",
-            db_path="data/arb.db",
+            db_url=settings.DATABASE_URL,
             daily_loss_limit_usd=-(
                 settings.GLOBAL_CAPITAL * settings.DAILY_LOSS_LIMIT_PCT
             ),

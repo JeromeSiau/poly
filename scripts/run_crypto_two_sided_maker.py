@@ -1328,7 +1328,7 @@ async def main() -> None:
 
     guard = RiskGuard(
         strategy_tag=strategy_tag,
-        db_path=args.db_url.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", ""),
+        db_url=args.db_url,
         max_consecutive_losses=args.cb_max_losses,
         max_drawdown_usd=args.cb_max_drawdown,
         stale_seconds=args.cb_stale_seconds,

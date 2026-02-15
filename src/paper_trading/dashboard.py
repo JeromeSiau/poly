@@ -344,7 +344,7 @@ st.markdown(
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════
 
-tab_live, tab_analysis = st.tabs(["Live", "Strategy Analysis"])
+tab_live, tab_analysis, tab_slot = st.tabs(["Live", "Strategy Analysis", "Slot ML"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -849,3 +849,278 @@ with tab_analysis:
                 st.caption("No slots with multiple markets found")
 
     analysis_tab_content()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 3: SLOT ML
+# ═══════════════════════════════════════════════════════════════════════════
+
+_TIMING_ORDER = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12"]
+_MOVE_ORDER = ["< -0.2", "-0.2/-0.1", "-0.1/0", "0/0.1", "0.1/0.2", "> 0.2"]
+_DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+with tab_slot:
+
+    @st.fragment(run_every="60s")
+    def slot_ml_content():
+        h = max(LOOKBACK_MAP[st.session_state.get("lookback", "24h")], 168)
+
+        sym_choice = st.radio(
+            "Symbol", ["All", "BTC", "ETH", "SOL", "XRP"],
+            horizontal=True, key="slot_symbol",
+        )
+
+        params: dict = {"hours": h}
+        if sym_choice != "All":
+            params["symbol"] = sym_choice
+
+        data = _api("/slots", params)
+
+        if data.get("error"):
+            st.warning(f"Slot data: {data['error']}")
+            return
+
+        total = data.get("total_slots", 0)
+        if total == 0:
+            st.caption("No slot data yet. Start the collector: `bin/run_slot_collector.sh`")
+            return
+
+        # -- KPIs --
+        resolved = data.get("resolved", 0)
+        unresolved = data.get("unresolved", 0)
+        snap_count = data.get("snapshot_count", 0)
+        last_ts = data.get("last_ts")
+
+        import time as _time
+        if last_ts:
+            age_min = int((_time.time() - last_ts) / 60)
+            age_str = f"{age_min}m" if age_min < 60 else f"{age_min // 60}h {age_min % 60}m"
+        else:
+            age_str = "--"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Slots", f"{total:,}", delta=f"{resolved} resolved")
+        c2.metric("Unresolved", str(unresolved))
+        c3.metric("Snapshots", f"{snap_count:,}")
+        c4.metric("Latest Data", age_str)
+
+        st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
+
+        # -- Heatmap: timing x move -> WR --
+        heatmap = data.get("heatmap", [])
+        if heatmap:
+            st.markdown(
+                '<p class="section-label">Win Rate Heatmap: Entry Timing x Price Move</p>',
+                unsafe_allow_html=True,
+            )
+
+            lookup = {(r["timing"], r["move"]): r for r in heatmap}
+            z = []
+            text_arr = []
+            for move in _MOVE_ORDER:
+                row_z = []
+                row_t = []
+                for timing in _TIMING_ORDER:
+                    r = lookup.get((timing, move))
+                    if r and r["total"] >= 3:
+                        row_z.append(r["wr"])
+                        row_t.append(f"{r['wr']:.0f}%\n({r['total']})")
+                    else:
+                        row_z.append(None)
+                        row_t.append("")
+                z.append(row_z)
+                text_arr.append(row_t)
+
+            fig_hm = go.Figure(data=go.Heatmap(
+                z=z,
+                x=_TIMING_ORDER,
+                y=_MOVE_ORDER,
+                text=text_arr,
+                texttemplate="%{text}",
+                textfont=dict(size=11, color=C_TEXT),
+                colorscale=[
+                    [0, "#991b1b"], [0.35, "#dc2626"],
+                    [0.5, "#1e293b"],
+                    [0.65, "#16a34a"], [1, "#14532d"],
+                ],
+                zmid=50, zmin=25, zmax=75,
+                colorbar=dict(
+                    title=dict(text="WR%", font=dict(size=10, color=C_MUTED)),
+                    ticksuffix="%",
+                    tickfont=dict(color=C_MUTED, size=10),
+                    bgcolor="rgba(0,0,0,0)",
+                ),
+                hovertemplate="Timing: %{x} min<br>Move: %{y}%<br>WR: %{z:.1f}%<extra></extra>",
+                xgap=2, ygap=2,
+            ))
+            layout_hm = _plotly_layout(height=340)
+            layout_hm["yaxis"]["tickprefix"] = ""
+            layout_hm["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
+            layout_hm["yaxis"]["title"] = dict(text="dir. move %", font=dict(size=10, color=C_MUTED))
+            fig_hm.update_layout(**layout_hm)
+            st.plotly_chart(fig_hm, use_container_width=True, config={"displayModeBar": False})
+
+        st.markdown('<div style="height: 12px"></div>', unsafe_allow_html=True)
+
+        # -- Bottom row: calibration + per-symbol --
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            cal = data.get("calibration", [])
+            if cal:
+                st.markdown(
+                    '<p class="section-label">Market Calibration (Bid Up vs Actual P(Up))</p>',
+                    unsafe_allow_html=True,
+                )
+                fig_cal = go.Figure()
+                # Perfect calibration line
+                fig_cal.add_trace(go.Scatter(
+                    x=[10, 95], y=[10, 95],
+                    mode="lines", line=dict(color=C_MUTED, dash="dot", width=1),
+                    showlegend=False, hoverinfo="skip",
+                ))
+                # Actual
+                fig_cal.add_trace(go.Scatter(
+                    x=[r["avg_bid"] * 100 for r in cal],
+                    y=[r["wr"] for r in cal],
+                    mode="lines+markers",
+                    line=dict(color=C_ACCENT, width=2),
+                    marker=dict(
+                        size=[max(6, min(r["total"] / 5, 16)) for r in cal],
+                        color=C_ACCENT,
+                    ),
+                    showlegend=False,
+                    customdata=[[r["total"]] for r in cal],
+                    hovertemplate=(
+                        "Bid: %{x:.0f}%<br>Actual: %{y:.1f}%<br>"
+                        "n=%{customdata[0]}<extra></extra>"
+                    ),
+                ))
+                layout_cal = _plotly_layout(height=300)
+                layout_cal["xaxis"]["title"] = dict(
+                    text="market implied P(Up) %", font=dict(size=10, color=C_MUTED),
+                )
+                layout_cal["yaxis"]["title"] = dict(
+                    text="actual win rate %", font=dict(size=10, color=C_MUTED),
+                )
+                layout_cal["yaxis"]["tickprefix"] = ""
+                layout_cal["yaxis"]["ticksuffix"] = "%"
+                layout_cal["xaxis"]["ticksuffix"] = "%"
+                fig_cal.update_layout(**layout_cal)
+                st.plotly_chart(fig_cal, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.caption("Calibration data requires snapshots at 4-10 min")
+
+        with col_right:
+            by_symbol = data.get("by_symbol", [])
+            if by_symbol:
+                st.markdown(
+                    '<p class="section-label">Win Rate by Symbol</p>',
+                    unsafe_allow_html=True,
+                )
+                colors_s = [C_GREEN if s["wr"] >= 50 else C_RED for s in by_symbol]
+                fig_s = go.Figure()
+                fig_s.add_trace(go.Bar(
+                    x=[s["symbol"] for s in by_symbol],
+                    y=[s["wr"] for s in by_symbol],
+                    marker_color=colors_s, marker_line_width=0, opacity=0.85,
+                    text=[f"{s['wr']:.1f}% ({s['total']})" for s in by_symbol],
+                    textposition="outside", cliponaxis=False, textfont=dict(size=10),
+                    customdata=[[s["wins"], s["total"]] for s in by_symbol],
+                    hovertemplate=(
+                        "%{x}<br>WR: %{y:.1f}%<br>"
+                        "%{customdata[0]}W / %{customdata[1]}<extra></extra>"
+                    ),
+                ))
+                fig_s.add_hline(y=50, line=dict(color=C_MUTED, width=0.5, dash="dot"))
+                layout_s = _plotly_layout(height=300)
+                layout_s["yaxis"]["tickprefix"] = ""
+                layout_s["yaxis"]["ticksuffix"] = "%"
+                layout_s["yaxis"]["range"] = [0, 100]
+                fig_s.update_layout(**layout_s)
+                st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.caption("No resolved slots yet")
+
+        st.markdown('<div style="height: 12px"></div>', unsafe_allow_html=True)
+
+        # -- Bottom: hour + day patterns --
+        by_hour = data.get("by_hour", [])
+        by_day = data.get("by_day", [])
+
+        if by_hour or by_day:
+            col_h, col_d = st.columns(2)
+
+            with col_h:
+                if by_hour:
+                    st.markdown(
+                        '<p class="section-label">Win Rate by Hour (UTC)</p>',
+                        unsafe_allow_html=True,
+                    )
+                    colors_hr = [C_GREEN if h_d["wr"] >= 50 else C_RED for h_d in by_hour]
+                    fig_hr = go.Figure()
+                    fig_hr.add_trace(go.Bar(
+                        x=[f"{h_d['hour']:02d}" for h_d in by_hour],
+                        y=[h_d["wr"] for h_d in by_hour],
+                        marker_color=colors_hr, marker_line_width=0, opacity=0.85,
+                        text=[f"{h_d['wr']:.0f}%" for h_d in by_hour],
+                        textposition="outside", cliponaxis=False, textfont=dict(size=9),
+                        customdata=[[h_d["wins"], h_d["total"]] for h_d in by_hour],
+                        hovertemplate=(
+                            "%{x}:00 UTC<br>WR: %{y:.1f}%<br>"
+                            "%{customdata[0]}W / %{customdata[1]}<extra></extra>"
+                        ),
+                    ))
+                    fig_hr.add_hline(y=50, line=dict(color=C_MUTED, width=0.5, dash="dot"))
+                    layout_hr = _plotly_layout(height=240)
+                    layout_hr["yaxis"]["tickprefix"] = ""
+                    layout_hr["yaxis"]["ticksuffix"] = "%"
+                    max_hr = max(h_d["wr"] for h_d in by_hour) if by_hour else 50
+                    layout_hr["yaxis"]["range"] = [0, min(max_hr + 15, 100)]
+                    layout_hr["xaxis"]["type"] = "category"
+                    fig_hr.update_layout(**layout_hr)
+                    st.plotly_chart(fig_hr, use_container_width=True, config={"displayModeBar": False})
+
+            with col_d:
+                if by_day:
+                    st.markdown(
+                        '<p class="section-label">Win Rate by Day of Week</p>',
+                        unsafe_allow_html=True,
+                    )
+                    colors_dy = [C_GREEN if d["wr"] >= 50 else C_RED for d in by_day]
+                    fig_dy = go.Figure()
+                    fig_dy.add_trace(go.Bar(
+                        x=[_DAY_NAMES[d["day"]] if d["day"] < 7 else str(d["day"]) for d in by_day],
+                        y=[d["wr"] for d in by_day],
+                        marker_color=colors_dy, marker_line_width=0, opacity=0.85,
+                        text=[f"{d['wr']:.0f}% ({d['total']})" for d in by_day],
+                        textposition="outside", cliponaxis=False, textfont=dict(size=9),
+                        customdata=[[d["wins"], d["total"]] for d in by_day],
+                        hovertemplate=(
+                            "%{x}<br>WR: %{y:.1f}%<br>"
+                            "%{customdata[0]}W / %{customdata[1]}<extra></extra>"
+                        ),
+                    ))
+                    fig_dy.add_hline(y=50, line=dict(color=C_MUTED, width=0.5, dash="dot"))
+                    layout_dy = _plotly_layout(height=240)
+                    layout_dy["yaxis"]["tickprefix"] = ""
+                    layout_dy["yaxis"]["ticksuffix"] = "%"
+                    max_dy = max(d["wr"] for d in by_day) if by_day else 50
+                    layout_dy["yaxis"]["range"] = [0, min(max_dy + 15, 100)]
+                    layout_dy["xaxis"]["type"] = "category"
+                    fig_dy.update_layout(**layout_dy)
+                    st.plotly_chart(fig_dy, use_container_width=True, config={"displayModeBar": False})
+
+        # Summary caption
+        if by_symbol:
+            total_wins = sum(s["wins"] for s in by_symbol)
+            total_res = sum(s["total"] for s in by_symbol)
+            overall_wr = round(total_wins / total_res * 100, 1) if total_res else 0
+            st.caption(
+                f"{total_res} resolved slots  |  "
+                f"Overall WR: {overall_wr}%  |  "
+                f"Lookback: {h}h  |  "
+                f"Auto-refresh 60s"
+            )
+
+    slot_ml_content()

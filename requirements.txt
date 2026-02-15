@@ -16,6 +16,7 @@ poly-web3>=1.0.0       # Polymarket gas-free redeems
 # Database
 sqlalchemy>=2.0.23
 aiosqlite>=0.19.0
+aiomysql>=0.2.0
 
 # Telegram
 python-telegram-bot>=20.7

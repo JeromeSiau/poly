@@ -611,10 +611,9 @@ async def main() -> None:
         notify_closes=not paper_mode,
     )
 
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "").replace("sqlite:///", "")
     guard = RiskGuard(
         strategy_tag="kalshi_td_maker",
-        db_path=db_path,
+        db_url=settings.DATABASE_URL,
         max_consecutive_losses=args.cb_max_losses,
         max_drawdown_usd=args.cb_max_drawdown,
         stale_seconds=args.cb_stale_seconds,

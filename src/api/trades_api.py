@@ -9,11 +9,13 @@ from fastapi import FastAPI, Query
 from sqlalchemy import select
 
 from config.settings import settings
+from src.api.slots_api import router as slots_router
 from src.api.winrate import fetch_activity, analyse, resolve_open_markets
 from src.db.database import get_sync_session, init_db
 from src.db.models import LiveObservation as LO, PaperTrade as PT
 
 app = FastAPI(title="Trades API", version="1.0.0")
+app.include_router(slots_router)
 
 DB_URL = "sqlite:///data/arb.db"
 

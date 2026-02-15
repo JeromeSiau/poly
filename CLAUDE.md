@@ -149,7 +149,7 @@ Daemons are discovered automatically from supervisor configs in `/etc/supervisor
 Logs are on the production server and can be accessed via:
 
 ```bash
-ssh ploi@5.135.136.96
+ssh ploi@94.130.218.197
 # Logs directory:
 cd /home/ploi/orb.lvlup-dev.com/logs
 ```
@@ -173,8 +173,10 @@ Key risk parameters (configurable via env):
 
 ## Database
 
-Default: SQLite at `data/arb.db` (async via aiosqlite)
-Supports PostgreSQL via `DATABASE_URL` env variable
+Production: MySQL via `DATABASE_URL=mysql+aiomysql://user:pass@host/db`
+Development/tests: SQLite via `DATABASE_URL=sqlite+aiosqlite:///data/arb.db` (default)
+
+All tables (trades, risk_state, slot_snapshots, slot_resolutions) live in a single database. RiskGuard uses SQLAlchemy ORM (no raw SQL).
 
 ## Historical Dataset (Backtesting)
 
