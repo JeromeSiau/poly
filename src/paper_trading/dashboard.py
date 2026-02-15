@@ -955,6 +955,8 @@ with tab_slot:
             ))
             layout_hm = _plotly_layout(height=340)
             layout_hm["yaxis"]["tickprefix"] = ""
+            layout_hm["xaxis"]["type"] = "category"
+            layout_hm["yaxis"]["type"] = "category"
             layout_hm["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
             layout_hm["yaxis"]["title"] = dict(text="dir. move %", font=dict(size=10, color=C_MUTED))
             fig_hm.update_layout(**layout_hm)
