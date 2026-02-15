@@ -82,7 +82,8 @@ class TradeManager:
 
     # --- place ---
 
-    async def place(self, intent: TradeIntent) -> PendingOrder:
+    async def place(self, intent: TradeIntent, *,
+                    order_type: str = "GTC") -> PendingOrder:
         """Place an order. Paper: fake ID. Live: via executor."""
         if self.paper or self.executor is None:
             order_id = self._next_paper_id()
@@ -93,6 +94,7 @@ class TradeManager:
                 size=intent.size_usd,
                 price=intent.price,
                 outcome=intent.outcome,
+                order_type=order_type,
             )
             result = self._adapt_result(raw)
             if result.status == "error":

@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -143,6 +144,8 @@ class CryptoTDMaker:
         max_entry_minutes: float = 0.0,
         chainlink_feed: Optional[ChainlinkFeed] = None,
         model_path: str = "",
+        hybrid_skip_below: float = 0.55,
+        hybrid_taker_above: float = 0.72,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -195,6 +198,11 @@ class CryptoTDMaker:
         self._cid_slot_ts: dict[str, int] = {}  # cid -> slot start unix timestamp
         self._cid_fill_analytics: dict[str, dict] = {}  # cid -> {dir_move_pct, minutes_into_slot}
         self._last_p_win: dict[tuple[str, str], float] = {}  # (cid, outcome) -> model P(win)
+        self._last_order_type: dict[tuple[str, str], str] = {}  # (cid, outcome) -> "maker"/"taker"
+
+        # Book history ring buffer for trend features (per cid).
+        # Each entry: (timestamp, bid_up, ask_up, spread_up, spread_down)
+        self._book_history: dict[str, deque] = {}  # cid -> deque of tuples (max 20)
 
         # Stats
         self.total_fills: int = 0
@@ -207,6 +215,8 @@ class CryptoTDMaker:
         self._model_features: list[str] = []
         if model_path:
             self._load_model(model_path)
+        self.HYBRID_SKIP_BELOW = hybrid_skip_below
+        self.HYBRID_TAKER_ABOVE = hybrid_taker_above
 
     def _load_model(self, path: str) -> None:
         """Load trained XGBoost model from joblib file."""
@@ -216,6 +226,43 @@ class CryptoTDMaker:
         self._model_features = payload["feature_cols"]
         logger.info("model_loaded", path=path,
                     features=len(self._model_features))
+
+    def _record_book_snapshot(self, cid: str) -> None:
+        """Append current book state to the history ring buffer for trend features."""
+        bid_up, _, ask_up, _ = self.polymarket.get_best_levels(cid, "Up")
+        if bid_up is None:
+            return
+        bid_down, _, ask_down, _ = self.polymarket.get_best_levels(cid, "Down")
+        spread_up = (ask_up - bid_up) if (ask_up and bid_up) else 0.0
+        spread_down = (ask_down - bid_down) if (ask_down and bid_down) else 0.0
+        entry = (time.time(), bid_up, ask_up or 0.0, spread_up, spread_down)
+        if cid not in self._book_history:
+            self._book_history[cid] = deque(maxlen=20)
+        self._book_history[cid].append(entry)
+
+    def _get_trend(self, cid: str, seconds_ago: float, field_idx: int) -> float:
+        """Look back in book history and return delta (current - past) for a field.
+
+        field_idx: 1=bid_up, 2=ask_up, 3=spread_up, 4=spread_down
+        Returns 0.0 if insufficient history.
+        """
+        hist = self._book_history.get(cid)
+        if not hist or len(hist) < 2:
+            return 0.0
+        now_ts = hist[-1][0]
+        current_val = hist[-1][field_idx]
+        target_ts = now_ts - seconds_ago
+        # Find closest snapshot to target_ts
+        best = None
+        best_diff = float("inf")
+        for entry in hist:
+            diff = abs(entry[0] - target_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best = entry
+        if best is None or best_diff > seconds_ago * 0.8:
+            return 0.0
+        return current_val - best[field_idx]
 
     def _build_features(self, cid: str, outcome: str, bid: float) -> Optional[dict]:
         """Build feature dict matching training features from current market state."""
@@ -237,8 +284,7 @@ class CryptoTDMaker:
         bsz_down, asz_down = 0.0, 0.0
 
         # Try to get sizes from the book
-        for out, bsz_attr, asz_attr in [("Up", "bsz_up", "asz_up"),
-                                         ("Down", "bsz_down", "asz_down")]:
+        for out in ("Up", "Down"):
             b, bs, a, as_ = self.polymarket.get_best_levels(cid, out)
             if out == "Up":
                 bsz_up = bs or 0.0
@@ -282,12 +328,27 @@ class CryptoTDMaker:
             "fav_bid": max(bid_up_val, bid_down_val),
             "move_velocity": (dir_move or 0.0) / max(minutes, 0.5),
             "book_pressure": (bsz_up - bsz_down) / max(bsz_up + bsz_down, 0.01),
+            # Trend features (from ring buffer)
+            "bid_trend_30s": self._get_trend(cid, 30, 1),
+            "bid_trend_2m": self._get_trend(cid, 120, 1),
+            "ask_trend_30s": self._get_trend(cid, 30, 2),
+            "spread_trend": self._get_trend(cid, 60, 3),
         }
         return features
 
+    # Hybrid thresholds (set from CLI args in __init__)
+    HYBRID_SKIP_BELOW: float = 0.55
+    HYBRID_TAKER_ABOVE: float = 0.72
+
     def _check_model(self, cid: str, outcome: str, bid: float
                      ) -> Optional[float]:
-        """Run ML model inference. Returns P(Up) or None if model unavailable."""
+        """Run ML model inference. Returns P(win) or None if model unavailable.
+
+        Also stores the recommended order type in ``_last_order_type``:
+        - "skip" if p_win < HYBRID_SKIP_BELOW
+        - "taker" if p_win >= HYBRID_TAKER_ABOVE
+        - "maker" otherwise
+        """
         if not self._model:
             return None
         features = self._build_features(cid, outcome, bid)
@@ -298,7 +359,16 @@ class CryptoTDMaker:
         proba = self._model.predict_proba(row)[0]
         # proba[1] = P(Up), proba[0] = P(Down)
         p_win = proba[1] if outcome == "Up" else proba[0]
-        return float(p_win)
+        p_win = float(p_win)
+
+        if p_win < self.HYBRID_SKIP_BELOW:
+            self._last_order_type[(cid, outcome)] = "skip"
+        elif p_win >= self.HYBRID_TAKER_ABOVE:
+            self._last_order_type[(cid, outcome)] = "taker"
+        else:
+            self._last_order_type[(cid, outcome)] = "maker"
+
+        return p_win
 
     # ------------------------------------------------------------------
     # DB persistence
@@ -658,7 +728,8 @@ class CryptoTDMaker:
         budget_left = self.max_total_exposure_usd - current_exposure - pending_exposure
 
         cancel_ids: list[str] = []
-        place_intents: list[tuple[str, str, str, float]] = []  # (cid, outcome, token_id, price)
+        # (cid, outcome, token_id, price, order_type)
+        place_intents: list[tuple[str, str, str, float, str]] = []
 
         for cid in list(self.known_markets):
             # Skip markets where all ladder rungs have filled.
@@ -668,6 +739,10 @@ class CryptoTDMaker:
             outcomes = self.market_outcomes.get(cid, [])
             if len(outcomes) < 2:
                 continue
+
+            # Record book snapshot for trend features (once per cid per tick).
+            if self._model:
+                self._record_book_snapshot(cid)
 
             for outcome in outcomes:
                 token_id = self.market_tokens.get((cid, outcome))
@@ -684,14 +759,18 @@ class CryptoTDMaker:
                 if self._model:
                     # ML model replaces manual move/timing filters
                     p_win = self._check_model(cid, outcome, bid) if bid is not None else None
+                    order_type = self._last_order_type.pop((cid, outcome), "skip")
                     bid_in_range = (
                         bid is not None
                         and self.target_bid <= bid <= self.max_bid
                         and p_win is not None
-                        and p_win >= 0.55
+                        and order_type != "skip"
                     )
                     if bid_in_range and p_win is not None:
                         self._last_p_win[(cid, outcome)] = p_win
+                        # For taker orders, buy at the ask instead of bidding
+                        if order_type == "taker" and ask is not None:
+                            self._last_order_type[(cid, outcome)] = "taker"
                 else:
                     # Manual filters fallback
                     bid_in_range = (
@@ -722,7 +801,7 @@ class CryptoTDMaker:
                             continue
                         rung_key = (cid, outcome, int(round(rung_price * 100)))
                         if rung_key not in self._rung_placed:
-                            place_intents.append((cid, outcome, token_id, rung_price))
+                            place_intents.append((cid, outcome, token_id, rung_price, "maker"))
                 else:
                     # ---- Single-order mode (original logic) ----
                     existing_oid = self._orders_by_cid_outcome.get(existing_key)
@@ -746,7 +825,11 @@ class CryptoTDMaker:
                     else:
                         # No existing order — place if in range
                         if bid_in_range and budget_left >= self.order_size_usd:
-                            place_intents.append((cid, outcome, token_id, bid))
+                            ot = self._last_order_type.get((cid, outcome), "maker")
+                            if ot == "taker" and ask is not None:
+                                place_intents.append((cid, outcome, token_id, ask, "taker"))
+                            else:
+                                place_intents.append((cid, outcome, token_id, bid, "maker"))
 
         # Execute cancels.
         for oid in cancel_ids:
@@ -791,7 +874,7 @@ class CryptoTDMaker:
         placed_cids_this_tick: set[str] = set()  # prevent BUY Up + SELL Down on same cid
         # Collect condition_ids with pending cancels — don't place new orders there.
         pending_cancel_cids = {o.condition_id for o in self._pending_cancels.values()}
-        for cid, outcome, token_id, price in place_intents:
+        for cid, outcome, token_id, price, order_type in place_intents:
             if self._cid_fill_count.get(cid, 0) >= self.ladder_rungs:
                 continue
             # Don't place new orders while a cancel is in-flight for this market.
@@ -817,7 +900,9 @@ class CryptoTDMaker:
             if budget_left < self.order_size_usd:
                 continue
 
-            order_id = await self._place_order(cid, outcome, token_id, price, now)
+            order_id = await self._place_order(
+                cid, outcome, token_id, price, now, order_type=order_type,
+            )
             if order_id:
                 placed += 1
                 placed_cids_this_tick.add(cid)
@@ -857,10 +942,13 @@ class CryptoTDMaker:
 
     async def _place_order(
         self, cid: str, outcome: str, token_id: str, price: float, now: float,
+        *, order_type: str = "maker",
     ) -> Optional[str]:
-        """Place a GTC maker BUY order at the given price."""
+        """Place a BUY order — GTC maker or FOK taker depending on order_type."""
         if not self.manager:
             return None
+
+        is_taker = order_type == "taker"
 
         # Model-based sizing: scale order_size by confidence
         size_usd = self.order_size_usd
@@ -871,7 +959,7 @@ class CryptoTDMaker:
             size_usd = round(self.order_size_usd * confidence_scale, 2)
             logger.debug("model_sizing", cid=cid[:12], outcome=outcome,
                          p_win=round(p_win, 3), scale=round(confidence_scale, 2),
-                         size_usd=size_usd)
+                         size_usd=size_usd, order_type=order_type)
 
         # Pre-register a placeholder BEFORE the await so the fill listener
         # can match fills that arrive while we're waiting for the API response.
@@ -887,13 +975,16 @@ class CryptoTDMaker:
         self._rung_placed.add(rung_key)
 
         slug = _first_event_slug(self.known_markets.get(cid, {}))
+        reason = "td_taker_fok" if is_taker else "td_maker_passive"
         intent = TradeIntent(
             condition_id=cid, token_id=token_id, outcome=outcome,
             side="BUY", price=price, size_usd=size_usd,
-            reason="td_maker_passive", title=slug, timestamp=now,
+            reason=reason, title=slug, timestamp=now,
         )
         try:
-            pending = await self.manager.place(intent)
+            pending = await self.manager.place(
+                intent, order_type="FOK" if is_taker else "GTC",
+            )
         except Exception as exc:
             # Placement failed — clean up placeholder.
             self.active_orders.pop(temp_id, None)
@@ -909,6 +1000,27 @@ class CryptoTDMaker:
                 del self._orders_by_cid_outcome[(cid, outcome)]
             self._rung_placed.discard(rung_key)
             return None
+
+        # FOK taker orders fill immediately (or reject entirely).
+        # In paper mode we simulate an instant fill at the ask.
+        if is_taker:
+            self.active_orders.pop(temp_id, None)
+            if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
+                del self._orders_by_cid_outcome[(cid, outcome)]
+            order = PassiveOrder(
+                order_id=pending.order_id, condition_id=cid, outcome=outcome,
+                token_id=token_id, price=price, size_usd=size_usd,
+                placed_at=now,
+            )
+            self._process_fill(order, now)
+            self._cancel_other_side(cid, outcome)
+            self._db_fire(self._db_save_order(order))
+            self._db_fire(self._db_mark_filled(
+                pending.order_id, size_usd / price, now,
+            ))
+            logger.info("td_taker_fok_filled", order_id=pending.order_id[:16],
+                         outcome=outcome, price=price)
+            return pending.order_id
 
         # Fill listener may have already processed a fill for the placeholder.
         # For single-order mode: position means this rung was filled.
@@ -1312,6 +1424,7 @@ class CryptoTDMaker:
             self._cid_chainlink_symbol.pop(cid, None)
             self._cid_slot_ts.pop(cid, None)
             self._cid_fill_analytics.pop(cid, None)
+            self._book_history.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -1637,6 +1750,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-path", type=str, default="",
         help="Path to trained XGBoost model (.joblib). Model replaces manual filters.",
     )
+    p.add_argument(
+        "--hybrid-skip-below", type=float, default=0.55,
+        help="ML p_win below this → skip (default: 0.55)",
+    )
+    p.add_argument(
+        "--hybrid-taker-above", type=float, default=0.72,
+        help="ML p_win above this → taker FOK at ask (default: 0.72)",
+    )
     return p
 
 
@@ -1734,6 +1855,8 @@ async def main() -> None:
         max_entry_minutes=args.max_entry_minutes,
         chainlink_feed=chainlink_feed,
         model_path=args.model_path,
+        hybrid_skip_below=args.hybrid_skip_below,
+        hybrid_taker_above=args.hybrid_taker_above,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"
@@ -1762,6 +1885,9 @@ async def main() -> None:
         print(f"  Move filter: {' & '.join(parts)} (Chainlink directional)")
     if args.model_path:
         print(f"  ML model:    {args.model_path}")
+        print(f"  Hybrid:      skip<{args.hybrid_skip_below} | "
+              f"maker {args.hybrid_skip_below}-{args.hybrid_taker_above} | "
+              f"taker>{args.hybrid_taker_above}")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print()
 

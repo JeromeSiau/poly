@@ -54,6 +54,11 @@ FEATURE_COLS = [
     "fav_bid",
     "move_velocity",
     "book_pressure",
+    # Trend (computed from consecutive snapshots within a slot)
+    "bid_trend_30s",
+    "bid_trend_2m",
+    "ask_trend_30s",
+    "spread_trend",
 ]
 
 
@@ -80,15 +85,42 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_trend_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute trend features from consecutive snapshots within each slot.
+
+    Snapshots are captured every ~30s.  For each snapshot we look back to
+    find the nearest measurement ~30s and ~120s ago (within the same slot)
+    and compute deltas for bid_up, ask_up, and spread_up.
+    """
+    df = df.copy()
+    df.sort_values(["symbol", "slot_ts", "captured_at"], inplace=True)
+
+    group = df.groupby(["symbol", "slot_ts"])
+
+    # Time deltas between consecutive snapshots within the same slot.
+    # shift(1) = previous snapshot (~30s ago), shift(4) = ~2min ago.
+    df["bid_trend_30s"] = df["bid_up"] - group["bid_up"].shift(1)
+    df["bid_trend_2m"] = df["bid_up"] - group["bid_up"].shift(4)
+    df["ask_trend_30s"] = df["ask_up"] - group["ask_up"].shift(1)
+    df["spread_trend"] = df["spread_up"] - group["spread_up"].shift(2)
+
+    return df
+
+
 async def load_data(db_url: str, min_minutes: float = 4.0,
                     max_minutes: float = 10.0) -> pd.DataFrame:
-    """Load snapshots joined with resolutions from MySQL."""
+    """Load all snapshots for resolved slots, compute trends, then filter.
+
+    Loads ALL snapshots per slot (not just the target window) so that
+    trend features can be computed from consecutive measurements.  After
+    trend computation the rows are filtered to [min_minutes, max_minutes].
+    """
     from sqlalchemy.ext.asyncio import create_async_engine
 
     engine = create_async_engine(db_url, echo=False)
-    query = f"""
+    query = """
         SELECT
-            s.symbol, s.slot_ts, s.minutes_into_slot,
+            s.symbol, s.slot_ts, s.minutes_into_slot, s.captured_at,
             s.bid_up, s.ask_up, s.bid_down, s.ask_down,
             s.bid_size_up, s.ask_size_up, s.bid_size_down, s.ask_size_down,
             s.spread_up, s.spread_down,
@@ -98,8 +130,7 @@ async def load_data(db_url: str, min_minutes: float = 4.0,
         FROM slot_snapshots s
         JOIN slot_resolutions r ON s.symbol = r.symbol AND s.slot_ts = r.slot_ts
         WHERE r.resolved_up IS NOT NULL
-          AND s.minutes_into_slot BETWEEN {min_minutes} AND {max_minutes}
-        ORDER BY s.slot_ts, s.symbol, s.minutes_into_slot
+        ORDER BY s.symbol, s.slot_ts, s.captured_at
     """
 
     async with engine.connect() as conn:
@@ -110,8 +141,22 @@ async def load_data(db_url: str, min_minutes: float = 4.0,
     await engine.dispose()
 
     df = pd.DataFrame(rows, columns=list(cols))
-    logger.info("loaded_data", rows=len(df),
+    logger.info("loaded_raw_snapshots", rows=len(df),
                 symbols=sorted(df["symbol"].unique().tolist()) if len(df) > 0 else [])
+
+    if df.empty:
+        return df
+
+    # Compute trend features from consecutive snapshots within each slot.
+    df = compute_trend_features(df)
+
+    # Now filter to the target minute window.
+    before = len(df)
+    df = df[(df["minutes_into_slot"] >= min_minutes) &
+            (df["minutes_into_slot"] <= max_minutes)]
+    logger.info("filtered_to_window", before=before, after=len(df),
+                min_minutes=min_minutes, max_minutes=max_minutes)
+
     return df
 
 
