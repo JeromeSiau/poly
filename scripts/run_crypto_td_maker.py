@@ -146,6 +146,10 @@ class CryptoTDMaker:
         model_path: str = "",
         hybrid_skip_below: float = 0.55,
         hybrid_taker_above: float = 0.72,
+        stoploss_peak: float = 0.0,
+        stoploss_exit: float = 0.0,
+        exit_model_path: str = "",
+        exit_threshold: float = 0.35,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -168,6 +172,8 @@ class CryptoTDMaker:
         self.max_move_pct = max_move_pct
         self.min_entry_minutes = min_entry_minutes
         self.max_entry_minutes = max_entry_minutes
+        self.stoploss_peak = stoploss_peak
+        self.stoploss_exit = stoploss_exit
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -204,13 +210,16 @@ class CryptoTDMaker:
         # Each entry: (timestamp, bid_up, ask_up, spread_up, spread_down)
         self._book_history: dict[str, deque] = {}  # cid -> deque of tuples (max 20)
 
+        # Stop-loss: track highest bid seen per position.
+        self._position_bid_max: dict[str, float] = {}  # cid -> highest bid since fill
+
         # Stats
         self.total_fills: int = 0
         self.total_wins: int = 0
         self.total_losses: int = 0
         self.realized_pnl: float = 0.0
 
-        # ML model (optional)
+        # ML entry model (optional)
         self._model = None
         self._model_features: list[str] = []
         if model_path:
@@ -218,14 +227,30 @@ class CryptoTDMaker:
         self.HYBRID_SKIP_BELOW = hybrid_skip_below
         self.HYBRID_TAKER_ABOVE = hybrid_taker_above
 
+        # ML exit model (optional — complements or replaces rule-based stop-loss)
+        self._exit_model = None
+        self._exit_model_features: list[str] = []
+        self._exit_threshold = exit_threshold
+        if exit_model_path:
+            self._load_exit_model(exit_model_path)
+
     def _load_model(self, path: str) -> None:
-        """Load trained XGBoost model from joblib file."""
+        """Load trained XGBoost entry model from joblib file."""
         import joblib
         payload = joblib.load(path)
         self._model = payload["model"]
         self._model_features = payload["feature_cols"]
-        logger.info("model_loaded", path=path,
+        logger.info("entry_model_loaded", path=path,
                     features=len(self._model_features))
+
+    def _load_exit_model(self, path: str) -> None:
+        """Load trained XGBoost exit model from joblib file."""
+        import joblib
+        payload = joblib.load(path)
+        self._exit_model = payload["model"]
+        self._exit_model_features = payload["feature_cols"]
+        logger.info("exit_model_loaded", path=path,
+                    features=len(self._exit_model_features))
 
     def _record_book_snapshot(self, cid: str) -> None:
         """Append current book state to the history ring buffer for trend features."""
@@ -418,6 +443,7 @@ class CryptoTDMaker:
                 )
                 self.positions[row.condition_id] = pos
                 self._position_order_ids[row.condition_id] = row.order_id
+                self._position_bid_max[row.condition_id] = row.price
         if stale_count:
             logger.info("td_stale_orders_cleaned", count=stale_count)
 
@@ -557,6 +583,181 @@ class CryptoTDMaker:
             return True
         elapsed = (time.time() - slot_ts) / 60
         return elapsed <= self.max_entry_minutes
+
+    # ------------------------------------------------------------------
+    # Stop-loss: exit when bid peaked then crashed
+    # ------------------------------------------------------------------
+
+    async def _check_stop_losses(self, now: float) -> None:
+        """Check all positions for stop-loss trigger and exit if needed.
+
+        Two modes:
+        1. Rule-based: bid_max >= stoploss_peak AND current bid <= stoploss_exit.
+        2. ML exit model: P(win) < exit_threshold.
+        ML takes priority when available.
+        """
+        exits: list[str] = []
+        for cid, pos in self.positions.items():
+            bid, _, _, _ = self.polymarket.get_best_levels(cid, pos.outcome)
+            if bid is None:
+                continue
+
+            # Update bid max.
+            prev_max = self._position_bid_max.get(cid, pos.entry_price)
+            if bid > prev_max:
+                self._position_bid_max[cid] = bid
+                prev_max = bid
+
+            # ML exit model takes priority.
+            if self._exit_model:
+                p_win = self._check_exit_model(cid, pos, bid, now)
+                if p_win is not None and p_win < self._exit_threshold:
+                    logger.info("ml_exit_triggered", cid=cid[:16],
+                                p_win=round(p_win, 3), threshold=self._exit_threshold,
+                                bid=bid, bid_max=round(prev_max, 3))
+                    exits.append(cid)
+                continue  # skip rule-based when ML is active
+
+            # Rule-based trigger.
+            if prev_max >= self.stoploss_peak and bid <= self.stoploss_exit:
+                exits.append(cid)
+
+        for cid in exits:
+            pos = self.positions.get(cid)
+            if not pos:
+                continue
+            await self._execute_stop_loss(pos, now)
+
+    def _check_exit_model(self, cid: str, pos: OpenPosition,
+                          bid: float, now: float) -> Optional[float]:
+        """Run ML exit model inference. Returns P(win) or None."""
+        features = self._build_features(cid, pos.outcome, bid)
+        if features is None:
+            return None
+
+        # Add exit-specific features.
+        bid_max = self._position_bid_max.get(cid, pos.entry_price)
+        slot_ts = self._cid_slot_ts.get(cid)
+        minutes_into = (now - slot_ts) / 60 if slot_ts else 0
+        fill_minutes = (pos.filled_at - slot_ts) / 60 if slot_ts else 0
+
+        features["entry_price"] = pos.entry_price
+        features["bid_max"] = bid_max
+        features["bid_drop"] = bid_max - bid
+        features["bid_drop_pct"] = (bid_max - bid) / max(bid_max, 0.01)
+        features["minutes_remaining"] = max(15.0 - minutes_into, 0)
+        features["minutes_held"] = minutes_into - fill_minutes
+        features["pnl_unrealized"] = bid - pos.entry_price
+
+        import numpy as np
+        row = np.array([[features.get(f, 0.0) for f in self._exit_model_features]])
+        proba = self._exit_model.predict_proba(row)[0]
+        p_win = float(proba[1] if pos.outcome == "Up" else proba[0])
+        return p_win
+
+    async def _execute_stop_loss(self, pos: OpenPosition, now: float) -> None:
+        """Sell position at market (stop-loss early exit)."""
+        bid, _, _, _ = self.polymarket.get_best_levels(pos.condition_id, pos.outcome)
+        sell_price = bid if bid is not None else self.stoploss_exit
+        bid_max = self._position_bid_max.get(pos.condition_id, pos.entry_price)
+
+        # PnL: we sell shares at sell_price instead of waiting for resolution.
+        pnl = pos.shares * (sell_price - pos.entry_price)
+
+        # Remove position from all tracking.
+        self.positions.pop(pos.condition_id, None)
+        self._position_bid_max.pop(pos.condition_id, None)
+
+        # Cancel any remaining orders for this market.
+        oids_to_cancel = [oid for oid, o in self.active_orders.items()
+                          if o.condition_id == pos.condition_id]
+        for oid in oids_to_cancel:
+            order = self.active_orders.pop(oid)
+            self._orders_by_cid_outcome.pop((order.condition_id, order.outcome), None)
+            self._rung_placed.discard(
+                (order.condition_id, order.outcome, int(round(order.price * 100))))
+            if not self.paper_mode and self.executor:
+                asyncio.create_task(self._async_cancel(oid))
+            else:
+                self._db_fire(self._db_delete_order(oid))
+
+        self.total_losses += 1
+        self.realized_pnl += pnl
+
+        # DB settlement.
+        oid = self._position_order_ids.pop(pos.condition_id, None)
+        if oid:
+            self._db_fire(self._db_mark_settled(oid, pnl, now))
+
+        if self.guard:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.guard.record_result(pnl=pnl, won=False))
+            except RuntimeError:
+                pass
+
+        # Live mode: actually sell the shares.
+        if not self.paper_mode and self.manager:
+            slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
+            sell_intent = TradeIntent(
+                condition_id=pos.condition_id,
+                token_id=pos.token_id,
+                outcome=pos.outcome,
+                side="SELL",
+                price=max(sell_price - 0.01, 0.01),  # slightly below bid to ensure fill
+                size_usd=pos.shares * sell_price,
+                reason="stop_loss_exit",
+                title=slug,
+                timestamp=now,
+            )
+            try:
+                await self.manager.place(sell_intent, order_type="FOK")
+            except Exception as exc:
+                logger.error("stop_loss_sell_failed",
+                             cid=pos.condition_id[:16], error=str(exc)[:80])
+
+        logger.info(
+            "td_stop_loss_exit",
+            condition_id=pos.condition_id[:16],
+            outcome=pos.outcome,
+            entry=pos.entry_price,
+            sell=sell_price,
+            bid_max=round(bid_max, 3),
+            pnl=round(pnl, 4),
+            shares=round(pos.shares, 2),
+            paper=self.paper_mode,
+        )
+
+        # Telegram notification via TradeManager.
+        if self.manager:
+            slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
+            settle_intent = TradeIntent(
+                condition_id=pos.condition_id,
+                token_id=pos.token_id,
+                outcome=pos.outcome,
+                side="SELL",
+                price=pos.entry_price,
+                size_usd=pos.size_usd,
+                reason="stop_loss_exit",
+                title=slug,
+                timestamp=now,
+            )
+            settle_fill = FillResult(
+                filled=True,
+                shares=pos.shares,
+                avg_price=sell_price,
+                pnl_delta=pnl,
+            )
+            context = f"STOP-LOSS | peak {bid_max:.2f} -> {sell_price:.2f}"
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.manager.record_settle_direct(
+                    settle_intent, settle_fill,
+                    extra_state={"stop_loss": True, "bid_max": bid_max},
+                    notify_context=context,
+                ))
+            except RuntimeError:
+                pass
 
     @staticmethod
     def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
@@ -721,6 +922,10 @@ class CryptoTDMaker:
         # Check for paper fills every tick.
         if self.paper_mode:
             self._check_fills_paper(now)
+
+        # Stop-loss: exit positions where bid peaked then crashed.
+        if self.stoploss_peak > 0:
+            await self._check_stop_losses(now)
 
         # Check exposure budget.
         current_exposure = sum(p.size_usd for p in self.positions.values())
@@ -1130,6 +1335,9 @@ class CryptoTDMaker:
 
         self._position_order_ids[order.condition_id] = order.order_id
         self._cid_fill_count[order.condition_id] = self._cid_fill_count.get(order.condition_id, 0) + 1
+        # Initialize bid_max tracking for stop-loss.
+        if order.condition_id not in self._position_bid_max:
+            self._position_bid_max[order.condition_id] = order.price
         self.total_fills += 1
         self._db_fire(self._db_mark_filled(order.order_id, new_shares, now))
 
@@ -1425,6 +1633,7 @@ class CryptoTDMaker:
             self._cid_slot_ts.pop(cid, None)
             self._cid_fill_analytics.pop(cid, None)
             self._book_history.pop(cid, None)
+            self._position_bid_max.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -1556,6 +1765,7 @@ class CryptoTDMaker:
 
         won = token_resolved_1
         pnl = pos.shares * (1.0 - pos.entry_price) if won else -pos.size_usd
+        self._position_bid_max.pop(pos.condition_id, None)
 
         if won:
             self.total_wins += 1
@@ -1758,6 +1968,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--hybrid-taker-above", type=float, default=0.72,
         help="ML p_win above this → taker FOK at ask (default: 0.72)",
     )
+    p.add_argument(
+        "--stoploss-peak", type=float, default=0.0,
+        help="Stop-loss: min bid_max to arm (0=disabled, recommended: 0.75)",
+    )
+    p.add_argument(
+        "--stoploss-exit", type=float, default=0.0,
+        help="Stop-loss: sell when bid drops to this after peak (0=disabled)",
+    )
+    p.add_argument(
+        "--exit-model-path", type=str, default="",
+        help="Path to trained exit model (.joblib). Replaces rule-based stop-loss.",
+    )
+    p.add_argument(
+        "--exit-threshold", type=float, default=0.35,
+        help="ML exit: sell when P(win) drops below this (default: 0.35)",
+    )
     return p
 
 
@@ -1857,6 +2083,10 @@ async def main() -> None:
         model_path=args.model_path,
         hybrid_skip_below=args.hybrid_skip_below,
         hybrid_taker_above=args.hybrid_taker_above,
+        stoploss_peak=args.stoploss_peak,
+        stoploss_exit=args.stoploss_exit,
+        exit_model_path=args.exit_model_path,
+        exit_threshold=args.exit_threshold,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"
@@ -1888,6 +2118,11 @@ async def main() -> None:
         print(f"  Hybrid:      skip<{args.hybrid_skip_below} | "
               f"maker {args.hybrid_skip_below}-{args.hybrid_taker_above} | "
               f"taker>{args.hybrid_taker_above}")
+    if args.stoploss_peak > 0:
+        print(f"  Stop-loss:   peak>={args.stoploss_peak} & bid<={args.stoploss_exit} → sell FOK")
+    if args.exit_model_path:
+        print(f"  Exit model:  {args.exit_model_path}")
+        print(f"  Exit thresh: P(win)<{args.exit_threshold} → sell FOK")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print()
 
