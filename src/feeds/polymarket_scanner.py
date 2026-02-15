@@ -55,6 +55,9 @@ def classify_slug(slug: str, question: str) -> tuple[str, bool, float]:
         return "crypto_15min", True, 0.0625
     if "updown" in slug_lower:
         return "crypto_hourly", False, 0.0
+    # Event-level slugs use "up-or-down" instead of "updown"
+    if "up-or-down" in slug_lower:
+        return "crypto_hourly", False, 0.0
     if "price-of" in slug_lower:
         return "crypto_bracket", False, 0.0
 

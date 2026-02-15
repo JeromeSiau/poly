@@ -152,24 +152,41 @@ class SniperEngine:
         On restart, in-memory positions are lost. This queries the DB
         for is_open=true sniper trades and reconstructs SniperPosition
         objects so the settle loop can close them.
+
+        Retries a few times since the trades API may not be ready yet
+        at startup (403/connection errors).
         """
-        try:
-            resp = await client.get(
-                "http://localhost:8788/trades",
-                params={
-                    "event_type": "last_penny_sniper",
-                    "is_open": "true",
-                    "hours": 168,  # 7 days
-                    "limit": 2000,
-                },
-                timeout=10.0,
-            )
-            if resp.status_code != 200:
-                logger.warning("reload_positions_api_error", status=resp.status_code)
-                return
-            data = resp.json()
-        except Exception as exc:
-            logger.warning("reload_positions_failed", error=str(exc))
+        data = None
+        for attempt in range(5):
+            try:
+                resp = await client.get(
+                    "http://localhost:8788/trades",
+                    params={
+                        "event_type": "last_penny_sniper",
+                        "is_open": "true",
+                        "hours": 168,  # 7 days
+                        "limit": 2000,
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    break
+                logger.warning(
+                    "reload_positions_api_error",
+                    status=resp.status_code,
+                    attempt=attempt + 1,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reload_positions_failed",
+                    error=str(exc),
+                    attempt=attempt + 1,
+                )
+            await asyncio.sleep(3.0)
+
+        if data is None:
+            logger.error("reload_positions_gave_up", attempts=5)
             return
 
         trades = data.get("trades", [])
