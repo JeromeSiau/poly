@@ -1334,10 +1334,23 @@ class CryptoTDMaker:
                 pnl_delta=pnl,
             )
             try:
+                analytics = self._cid_fill_analytics.pop(pos.condition_id, None)
+                # Build context for Telegram notification
+                context_parts = []
+                if analytics:
+                    dir_move = analytics.get("dir_move_pct")
+                    timing = analytics.get("minutes_into_slot")
+                    if dir_move is not None:
+                        context_parts.append(f"move {dir_move:+.2f}%")
+                    if timing is not None:
+                        context_parts.append(f"entry {timing:.0f}m")
+                notify_ctx = " | ".join(context_parts) if context_parts else None
+
                 loop = asyncio.get_running_loop()
                 loop.create_task(self.manager.record_settle_direct(
                     settle_intent, settle_fill,
-                    extra_state=self._cid_fill_analytics.pop(pos.condition_id, None),
+                    extra_state=analytics,
+                    notify_context=notify_ctx,
                 ))
             except RuntimeError:
                 pass

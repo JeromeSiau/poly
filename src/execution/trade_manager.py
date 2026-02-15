@@ -242,6 +242,7 @@ class TradeManager:
         *,
         fair_prices: dict[str, float] | None = None,
         extra_state: dict[str, Any] | None = None,
+        notify_context: str | None = None,
     ) -> None:
         """Record a settlement detected externally.
 
@@ -271,7 +272,7 @@ class TradeManager:
                 logger.warning("record_settle_direct_failed", error=str(exc))
 
         if self.notify_closes:
-            await self.notify_settle(intent, fill.avg_price, pnl, won)
+            await self.notify_settle(intent, fill.avg_price, pnl, won, context=notify_context)
 
         logger.info(
             "settle_recorded_direct",
@@ -433,17 +434,21 @@ class TradeManager:
 
     async def notify_settle(
         self, intent: TradeIntent, exit_price: float, pnl: float, won: bool,
+        context: str | None = None,
     ) -> None:
         """Send Telegram WIN/LOSS notification."""
         mode = self._mode_emoji()
         result_emoji = _WIN if won else _LOSS
         result_text = "WIN" if won else "LOSS"
         record = f"{self._wins}W-{self._losses}L"
-        msg = (
-            f"{mode}{result_emoji} {self.strategy}\n"
-            f"{result_text} {intent.outcome} {intent.price:.2f} \u2192 {exit_price:.2f} | ${pnl:+.2f}\n"
-            f"{record} | Total: ${self._total_pnl:+.2f}"
-        )
+        lines = [
+            f"{mode}{result_emoji} {self.strategy}",
+            f"{result_text} {intent.outcome} {intent.price:.2f} \u2192 {exit_price:.2f} | ${pnl:+.2f}",
+        ]
+        if context:
+            lines.append(context)
+        lines.append(f"{record} | Total: ${self._total_pnl:+.2f}")
+        msg = "\n".join(lines)
         try:
             await self._alerter.send_custom_alert(msg)
         except Exception as exc:
