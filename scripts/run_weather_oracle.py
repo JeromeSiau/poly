@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db-url", type=str,
-        default="sqlite:///data/arb.db",
+        default=settings.DATABASE_URL,
         help="Database URL for persistence.",
     )
     parser.add_argument("--cb-max-losses", type=int, default=5, help="Circuit breaker: max consecutive losses")

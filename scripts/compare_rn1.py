@@ -2,7 +2,7 @@
 """CLI report: compare local two-sided behavior vs RN1 public activity.
 
 Usage:
-    uv run python scripts/compare_rn1.py --db data/arb.db --hours 6
+    uv run python scripts/compare_rn1.py --hours 6
     uv run python scripts/compare_rn1.py --strategy-tag edge_1p5_0p3 --hours 24
 """
 
@@ -17,7 +17,7 @@ from src.analysis.rn1_comparison import DEFAULT_RN1_WALLET, build_comparison_rep
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare local two-sided behavior against RN1.")
-    parser.add_argument("--db", type=str, default="data/arb.db", help="SQLite path or SQLAlchemy URL.")
+    parser.add_argument("--db", type=str, default="", help="Database URL (default: from settings).")
     parser.add_argument("--hours", type=float, default=6.0, help="Comparison window in hours.")
     parser.add_argument("--strategy-tag", type=str, default=None, help="Optional local strategy_tag filter.")
     parser.add_argument("--rn1-wallet", type=str, default=DEFAULT_RN1_WALLET, help="Benchmark wallet address.")

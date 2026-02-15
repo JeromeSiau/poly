@@ -389,7 +389,7 @@ class WeatherOracleEngine:
         self,
         fetcher=None,
         scanner=None,
-        database_url: str = "sqlite:///data/arb.db",
+        database_url: str = "",
         manager: Optional["TradeManager"] = None,
         guard: Optional["RiskGuard"] = None,
     ):

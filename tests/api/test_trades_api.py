@@ -120,18 +120,19 @@ def client(db_url):
     """TestClient that points the API at the temp DB."""
     import src.api.trades_api as api_mod
     import src.db.database as db_mod
+    from config.settings import settings
 
     # Reset global engine/session singletons so init_db picks up our URL
     db_mod.reset_engines()
 
-    original_db_url = api_mod.DB_URL
-    api_mod.DB_URL = db_url
+    original_db_url = settings.DATABASE_URL
+    settings.DATABASE_URL = db_url
 
     with TestClient(api_mod.app) as c:
         yield c
 
     # Restore
-    api_mod.DB_URL = original_db_url
+    settings.DATABASE_URL = original_db_url
     db_mod.reset_engines()
 
 

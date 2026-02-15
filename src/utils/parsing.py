@@ -46,7 +46,8 @@ def _to_bool(value: Any) -> bool:
 
 def _ensure_sync_db_url(database_url: str) -> str:
     if not database_url:
-        return "sqlite:///data/arb.db"
+        from config.settings import settings
+        return settings.DATABASE_URL
     if "://" not in database_url:
         return database_url
     scheme, suffix = database_url.split("://", 1)

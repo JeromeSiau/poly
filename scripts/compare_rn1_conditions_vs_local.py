@@ -2,8 +2,8 @@
 """Compare RN1 traded conditions with local traded conditions.
 
 Usage:
-    uv run python scripts/compare_rn1_conditions_vs_local.py --db data/arb.db --hours 6
-    uv run python scripts/compare_rn1_conditions_vs_local.py --db data/arb.db --hours 24 --strategy-tag edge_1p5_0p3
+    uv run python scripts/compare_rn1_conditions_vs_local.py --hours 6
+    uv run python scripts/compare_rn1_conditions_vs_local.py --hours 24 --strategy-tag edge_1p5_0p3
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from src.analysis.rn1_comparison import DEFAULT_RN1_WALLET, build_rn1_vs_local_c
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare RN1 conditions versus local condition universe.")
-    parser.add_argument("--db", type=str, default="data/arb.db", help="SQLite path or SQLAlchemy URL.")
+    parser.add_argument("--db", type=str, default="", help="Database URL (default: from settings).")
     parser.add_argument("--hours", type=float, default=6.0, help="Analysis window in hours.")
     parser.add_argument("--strategy-tag", type=str, default=None, help="Optional local strategy tag filter.")
     parser.add_argument("--rn1-wallet", type=str, default=DEFAULT_RN1_WALLET, help="Benchmark wallet.")

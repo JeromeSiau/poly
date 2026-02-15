@@ -17,14 +17,12 @@ from src.db.models import LiveObservation as LO, PaperTrade as PT
 app = FastAPI(title="Trades API", version="1.0.0")
 app.include_router(slots_router)
 
-DB_URL = "sqlite:///data/arb.db"
-
 _LIVE_MODES = {"live", "live_fill", "live_settlement", "autopilot"}
 
 
 @app.on_event("startup")
 def _startup() -> None:
-    init_db(DB_URL)
+    init_db(settings.DATABASE_URL)
 
 
 @app.get("/health")
@@ -43,7 +41,7 @@ def list_trades(
 ) -> dict:
     """Return trades joined with their observations, newest first."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    session = get_sync_session(DB_URL)
+    session = get_sync_session(settings.DATABASE_URL)
     try:
         # Use INNER JOIN when is_open is set (we need PT.is_open to filter)
         if is_open is not None:
@@ -239,7 +237,7 @@ def balance(
             return {"balance": 0.0, "mode": "live", "error": str(exc)}
 
     # Paper: starting capital + sum of closed paper-mode pnl
-    session = get_sync_session(DB_URL)
+    session = get_sync_session(settings.DATABASE_URL)
     try:
         rows = session.execute(
             select(PT.pnl, LO.game_state)
@@ -293,7 +291,7 @@ def positions(
             return {"positions": [], "error": str(exc)}
 
     # Paper: open positions from internal DB
-    session = get_sync_session(DB_URL)
+    session = get_sync_session(settings.DATABASE_URL)
     try:
         rows = session.execute(
             select(LO, PT)
@@ -329,7 +327,7 @@ def positions(
 def _winrate_paper(hours: float) -> dict:
     """Compute paper-mode win rate from the internal DB."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    session = get_sync_session(DB_URL)
+    session = get_sync_session(settings.DATABASE_URL)
     try:
         rows = session.execute(
             select(LO, PT)
@@ -443,7 +441,7 @@ def list_tags(
 ) -> dict:
     """Return all distinct strategy_tags and event_types seen recently."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    session = get_sync_session(DB_URL)
+    session = get_sync_session(settings.DATABASE_URL)
     try:
         rows = session.execute(
             select(LO.event_type, LO.game_state)

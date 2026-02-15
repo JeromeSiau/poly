@@ -26,7 +26,7 @@ from src.risk.guard import RiskGuard
 
 logger = structlog.get_logger()
 
-DB_URL = "sqlite:///data/arb.db"
+DB_URL = settings.DATABASE_URL
 
 
 async def main() -> None:

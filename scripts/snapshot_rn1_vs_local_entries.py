@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Store RN1 transactions and compare whether local entries matched them."
     )
-    parser.add_argument("--db", type=str, default="data/arb.db", help="SQLite path or SQLAlchemy URL.")
+    parser.add_argument("--db", type=str, default="", help="Database URL (default: from settings).")
     parser.add_argument("--hours", type=float, default=12.0, help="Analysis window in hours.")
     parser.add_argument(
         "--strategy-tag",

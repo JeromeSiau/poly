@@ -329,7 +329,7 @@ async def main(args: argparse.Namespace) -> None:
     manager = TradeManager(
         strategy="fear_selling",
         paper=not args.autopilot,
-        db_url=settings.DATABASE_URL or "sqlite+aiosqlite:///data/arb.db",
+        db_url=settings.DATABASE_URL,
         event_type="fear_selling",
         run_id="",
         notify_bids=False,
@@ -339,7 +339,7 @@ async def main(args: argparse.Namespace) -> None:
     logger.info("trade_manager_ready", strategy="fear_selling")
 
     # --- RiskGuard (replaces UnifiedRiskManager) -------------------------
-    db_url = settings.DATABASE_URL or "sqlite+aiosqlite:///data/arb.db"
+    db_url = settings.DATABASE_URL
     guard = RiskGuard(
         strategy_tag="fear_selling",
         db_url=db_url,

@@ -317,7 +317,7 @@ class CryptoMinuteEngine:
         self,
         poller: Optional[BinanceSpotPoller] = None,
         scanner: Optional[MarketScanner] = None,
-        database_url: str = "sqlite:///data/arb.db",
+        database_url: str = "",
         manager: Optional["TradeManager"] = None,
         guard: Optional["RiskGuard"] = None,
     ):

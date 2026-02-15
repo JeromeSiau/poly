@@ -30,7 +30,7 @@ def main():
     parser.add_argument(
         "--db",
         type=str,
-        default="data/arb.db",
+        default="",
         help="Database path",
     )
     parser.add_argument(

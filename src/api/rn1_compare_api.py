@@ -23,7 +23,7 @@ def health() -> dict[str, bool]:
 
 @app.get("/compare/rn1")
 def compare_rn1(
-    db: str = Query(default="data/arb.db", description="SQLite path or SQLAlchemy URL."),
+    db: str = Query(default="", description="SQLite path or SQLAlchemy URL."),
     hours: float = Query(default=6.0, ge=0.1, le=168.0, description="Comparison window in hours."),
     strategy_tag: Optional[str] = Query(default=None, description="Optional local strategy tag filter."),
     rn1_wallet: str = Query(default=DEFAULT_RN1_WALLET, description="RN1 wallet (or another benchmark wallet)."),
@@ -77,7 +77,7 @@ def compare_rn1_transactions(
 
 @app.get("/compare/rn1/conditions-vs-local")
 def compare_rn1_conditions_vs_local(
-    db: str = Query(default="data/arb.db", description="SQLite path or SQLAlchemy URL."),
+    db: str = Query(default="", description="SQLite path or SQLAlchemy URL."),
     hours: float = Query(default=6.0, ge=0.1, le=168.0, description="Analysis window in hours."),
     strategy_tag: Optional[str] = Query(default=None, description="Optional local strategy tag filter."),
     rn1_wallet: str = Query(default=DEFAULT_RN1_WALLET, description="RN1 wallet (or another benchmark wallet)."),
