@@ -802,16 +802,16 @@ def test_lottery_no_threshold_high():
         slug="highest-temp-dallas-feb-14",
         title="Highest temperature in Dallas on February 14?",
         city="Dallas",
-        target_date="2026-02-14",
+        target_date=_future_target_date(),
         outcomes={"58°F or higher": "tok1", "56-57°F": "tok2"},
         # YES at 99.9% → NO at 0.1% — massive mispricing!
         outcome_prices={"58°F or higher": 0.999, "56-57°F": 0.001},
-        end_date="2026-02-15T00:00:00Z",
+        end_date=_future_end_date(),
         resolution_source="Weather Underground",
     )
 
     forecast = ForecastData(
-        city="Dallas", date="2026-02-14",
+        city="Dallas", date=_future_target_date(),
         temp_max=50.0, temp_min=35.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
@@ -836,16 +836,16 @@ def test_lottery_no_threshold_low():
         slug="highest-temp-atlanta-feb-14",
         title="Highest temperature in Atlanta on February 14?",
         city="Atlanta",
-        target_date="2026-02-14",
+        target_date=_future_target_date(),
         outcomes={"45°F or below": "tok1"},
         # Market thinks 45°F or below is almost certain — but forecast says 60°F
         outcome_prices={"45°F or below": 0.98},
-        end_date="2026-02-15T00:00:00Z",
+        end_date=_future_end_date(),
         resolution_source="Weather Underground",
     )
 
     forecast = ForecastData(
-        city="Atlanta", date="2026-02-14",
+        city="Atlanta", date=_future_target_date(),
         temp_max=60.0, temp_min=42.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
@@ -867,16 +867,16 @@ def test_lottery_no_skips_when_forecast_agrees_with_market():
         slug="highest-temp-miami-feb-14",
         title="Highest temperature in Miami on February 14?",
         city="Miami",
-        target_date="2026-02-14",
+        target_date=_future_target_date(),
         outcomes={"70°F or higher": "tok1"},
         outcome_prices={"70°F or higher": 0.99},
-        end_date="2026-02-15T00:00:00Z",
+        end_date=_future_end_date(),
         resolution_source="Weather Underground",
     )
 
     # Forecast AGREES with market: 80°F, well above 70°F threshold
     forecast = ForecastData(
-        city="Miami", date="2026-02-14",
+        city="Miami", date=_future_target_date(),
         temp_max=80.0, temp_min=68.0, unit="fahrenheit", fetched_at=time.time(),
     )
 
@@ -894,13 +894,13 @@ async def test_lottery_no_sizing():
 
     market = WeatherMarket(
         condition_id="0xtest", slug="test", title="test",
-        city="Dallas", target_date="2026-02-14",
+        city="Dallas", target_date=_future_target_date(),
         outcomes={"58°F or higher": "tok1"},
         outcome_prices={"58°F or higher": 0.999},
-        end_date="2026-02-15T00:00:00Z", resolution_source="",
+        end_date=_future_end_date(), resolution_source="",
     )
     forecast = ForecastData(
-        city="Dallas", date="2026-02-14",
+        city="Dallas", date=_future_target_date(),
         temp_max=50.0, temp_min=35.0, unit="fahrenheit", fetched_at=time.time(),
     )
 

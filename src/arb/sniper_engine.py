@@ -126,6 +126,9 @@ class SniperEngine:
         ) as client:
             self._http_client = client
 
+            # Reload open positions from previous runs
+            await self._reload_open_positions(client)
+
             tasks = [
                 self._scan_loop(client),
                 self._snipe_loop(),
@@ -138,6 +141,101 @@ class SniperEngine:
                 await asyncio.gather(*tasks)
             finally:
                 self._http_client = None
+
+    # ------------------------------------------------------------------
+    # Reload open positions from DB (survive restarts)
+    # ------------------------------------------------------------------
+
+    async def _reload_open_positions(self, client: httpx.AsyncClient) -> None:
+        """Reload open sniper positions from the trades API.
+
+        On restart, in-memory positions are lost. This queries the DB
+        for is_open=true sniper trades and reconstructs SniperPosition
+        objects so the settle loop can close them.
+        """
+        try:
+            resp = await client.get(
+                "http://localhost:8788/trades",
+                params={
+                    "event_type": "last_penny_sniper",
+                    "is_open": "true",
+                    "hours": 168,  # 7 days
+                    "limit": 2000,
+                },
+                timeout=10.0,
+            )
+            if resp.status_code != 200:
+                logger.warning("reload_positions_api_error", status=resp.status_code)
+                return
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("reload_positions_failed", error=str(exc))
+            return
+
+        trades = data.get("trades", [])
+        loaded = 0
+        for t in trades:
+            cid = t.get("match_id", "")
+            if not cid or cid in self._positions:
+                continue
+
+            # game_state fields (from extra_state if available)
+            gs = t.get("game_state") or {}
+            token_id = gs.get("token_id", "")
+            slug = gs.get("slug", "")
+            category = gs.get("category", "other")
+            fee_cost = gs.get("fee_cost", 0.0)
+            shares = gs.get("shares", 0.0)
+            size_usd = t.get("size", 0.0)
+
+            # Fallback: if no token_id in game_state, look up via CLOB
+            if not token_id:
+                token_id = await self._lookup_token_id(client, cid, t.get("outcome", ""))
+                if not token_id:
+                    continue
+
+            entry_price = t.get("entry_price", 0.0)
+            if not shares and entry_price > 0:
+                shares = size_usd / entry_price
+
+            self._positions[cid] = SniperPosition(
+                condition_id=cid,
+                token_id=token_id,
+                outcome=t.get("outcome", ""),
+                entry_price=entry_price,
+                shares=shares,
+                size_usd=size_usd,
+                fee_cost=fee_cost,
+                entry_ts=time.time(),
+                question=t.get("title", ""),
+                category=category,
+                slug=slug,
+            )
+            self._total_exposure += size_usd
+            self.scanner.mark_traded(cid)
+            loaded += 1
+
+        if loaded:
+            logger.info("sniper_positions_reloaded", count=loaded, exposure=round(self._total_exposure, 2))
+
+    async def _lookup_token_id(
+        self, client: httpx.AsyncClient, condition_id: str, outcome: str,
+    ) -> str:
+        """Look up token_id from CLOB API for legacy trades without extra_state."""
+        try:
+            resp = await client.get(
+                f"https://clob.polymarket.com/markets/{condition_id}",
+                timeout=10.0,
+            )
+            if resp.status_code != 200:
+                return ""
+            data = resp.json()
+            for tok in data.get("tokens", []):
+                if tok.get("outcome") == outcome:
+                    return tok.get("token_id", "")
+        except Exception:
+            pass
+        return ""
 
     # ------------------------------------------------------------------
     # Scan loop: discover markets via REST
@@ -299,11 +397,18 @@ class SniperEngine:
 
                 # Taker = immediate fill
                 fill = FillResult(filled=True, shares=shares, avg_price=ask)
+                extra = {
+                    "token_id": target.token_id,
+                    "slug": target.slug,
+                    "category": target.category,
+                    "fee_cost": round(fee_cost, 6),
+                }
                 try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(self.manager.record_fill_direct(
                         intent, fill,
                         execution_mode="paper" if self.paper else "live",
+                        extra_state=extra,
                     ))
                 except RuntimeError:
                     pass

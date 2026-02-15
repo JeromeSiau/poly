@@ -196,6 +196,7 @@ class TradeManager:
         fair_prices: dict[str, float] | None = None,
         execution_mode: str = "paper",
         extra_state: dict[str, Any] | None = None,
+        notify_context: str | None = None,
     ) -> None:
         """Record a fill detected externally (not via place/check_paper_fills).
 
@@ -222,7 +223,7 @@ class TradeManager:
                 logger.warning("record_fill_direct_failed", error=str(exc))
 
         if self.notify_fills:
-            await self.notify_fill(intent, fill)
+            await self.notify_fill(intent, fill, context=notify_context)
 
         logger.info(
             "fill_recorded_direct",
@@ -412,14 +413,19 @@ class TradeManager:
         except Exception as exc:
             logger.warning("notify_bid_failed", error=str(exc))
 
-    async def notify_fill(self, intent: TradeIntent, fill: FillResult) -> None:
+    async def notify_fill(
+        self, intent: TradeIntent, fill: FillResult, context: str | None = None,
+    ) -> None:
         """Send Telegram FILL notification."""
         mode = self._mode_emoji()
-        msg = (
-            f"{mode}{_FILL} {self.strategy}\n"
-            f"FILL {intent.outcome} @ {fill.avg_price:.2f} | {fill.shares:.1f} shares\n"
-            f"{intent.title}"
-        )
+        lines = [
+            f"{mode}{_FILL} {self.strategy}",
+            f"FILL {intent.outcome} @ {fill.avg_price:.2f} | {fill.shares:.1f} shares",
+        ]
+        if context:
+            lines.append(context)
+        lines.append(intent.title)
+        msg = "\n".join(lines)
         try:
             await self._alerter.send_custom_alert(msg)
         except Exception as exc:

@@ -138,6 +138,7 @@ class CryptoTDMaker:
         db_url: str = "",
         ladder_rungs: int = 1,
         min_move_pct: float = 0.0,
+        min_entry_minutes: float = 0.0,
         chainlink_feed: Optional[ChainlinkFeed] = None,
     ) -> None:
         self.executor = executor
@@ -158,6 +159,7 @@ class CryptoTDMaker:
         self._db_url = db_url
         self.ladder_rungs = ladder_rungs
         self.min_move_pct = min_move_pct
+        self.min_entry_minutes = min_entry_minutes
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -341,6 +343,20 @@ class CryptoTDMaker:
         else:
             threshold = self.min_move_pct
         return move >= threshold
+
+    def _check_min_entry_time(self, cid: str) -> bool:
+        """Return True if enough time has elapsed since slot start.
+
+        Returns True (allow) when min_entry_minutes is 0 or slot timestamp
+        is unavailable.
+        """
+        if self.min_entry_minutes <= 0:
+            return True
+        slot_ts = self._cid_slot_ts.get(cid)
+        if slot_ts is None:
+            return True
+        elapsed = (time.time() - slot_ts) / 60
+        return elapsed >= self.min_entry_minutes
 
     @staticmethod
     def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
@@ -534,15 +550,18 @@ class CryptoTDMaker:
                     self._last_book_update = now
                 existing_key = (cid, outcome)
 
-                # BUY signal: bid in [target_bid, max_bid] + min-move filter
+                # BUY signal: bid in [target_bid, max_bid] + timing + min-move filter
                 bid_in_range = (
                     bid is not None
                     and self.target_bid <= bid <= self.max_bid
+                    and self._check_min_entry_time(cid)
                     and self._check_min_move(cid, outcome, bid)
                 )
 
                 if self.ladder_rungs > 1 and bid is not None and bid >= self.target_bid:
                     # ---- Sequential ladder: place only the next rung ----
+                    if not self._check_min_entry_time(cid):
+                        continue
                     next_idx = self._cid_fill_count.get(cid, 0)
                     if next_idx < len(self.rung_prices):
                         rung_price = self.rung_prices[next_idx]
@@ -887,12 +906,20 @@ class CryptoTDMaker:
                     if order.condition_id in self._cid_slot_ts else None,
             }
             self._cid_fill_analytics[order.condition_id] = analytics
+            move_str = f"{dir_move:+.2f}%" if dir_move is not None else None
+            timing = analytics.get("minutes_into_slot")
+            timing_str = f"{timing:.0f}m" if timing is not None else None
+            context_parts = [p for p in [
+                f"move {move_str}" if move_str else None,
+                f"entry {timing_str}" if timing_str else None,
+            ] if p]
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self.manager.record_fill_direct(
                     intent, fill_result,
                     execution_mode="paper_fill" if self.paper_mode else "live_fill",
                     extra_state={"condition_id": order.condition_id, **analytics},
+                    notify_context=" | ".join(context_parts) if context_parts else None,
                 ))
             except RuntimeError:
                 pass
@@ -1386,7 +1413,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Passive time-decay maker for crypto 15-min markets"
     )
-    p.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT")
+    p.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
     p.add_argument("--paper", action="store_true", default=True)
     p.add_argument("--live", action="store_true", default=False)
     p.add_argument(
@@ -1420,6 +1447,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-move-pct", type=float, default=0.0,
         help="Min underlying price move (%%) in bet direction to enter (0=disabled)",
+    )
+    p.add_argument(
+        "--min-entry-minutes", type=float, default=0.0,
+        help="Min minutes into slot before placing orders (0=disabled)",
     )
     return p
 
@@ -1511,6 +1542,7 @@ async def main() -> None:
         db_url=args.db_url,
         ladder_rungs=args.ladder_rungs,
         min_move_pct=args.min_move_pct,
+        min_entry_minutes=args.min_entry_minutes,
         chainlink_feed=chainlink_feed,
     )
 
@@ -1524,6 +1556,8 @@ async def main() -> None:
         print(f"  Ladder:      {args.ladder_rungs} rungs at [{rung_str}]")
     print(f"  Order size:  ${order_size:.2f}/rung")
     print(f"  Max exposure: ${max_exposure:.2f}")
+    if args.min_entry_minutes > 0:
+        print(f"  Min entry:   {args.min_entry_minutes} min into slot")
     if args.min_move_pct > 0:
         print(f"  Min move:    {args.min_move_pct}% (Chainlink directional filter)")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")

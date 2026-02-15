@@ -43,6 +43,7 @@ class TestFullArbFlow:
             market_mapper=mapper
         )
         engine.capital = 10000
+        engine.anomaly_threshold = 0.25  # CS:GO match points produce legit high edges
 
         return {
             "polymarket": polymarket,

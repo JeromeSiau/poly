@@ -112,9 +112,13 @@ def list_trades(
             # Extra fields from game_state (crypto_minute + td_maker analytics)
             for key in ("gap_pct", "gap_bucket", "time_bucket", "time_remaining_s",
                         "spot_at_entry", "spot_at_resolution", "sub_strategy",
-                        "dir_move_pct", "minutes_into_slot"):
+                        "dir_move_pct", "minutes_into_slot",
+                        "token_id", "category", "fee_cost"):
                 if key in gs:
                     entry[key] = gs[key]
+
+            # Include full game_state for programmatic consumers
+            entry["game_state"] = gs
 
             trades.append(entry)
             if len(trades) >= limit:
