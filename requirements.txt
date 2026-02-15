@@ -17,6 +17,7 @@ poly-web3>=1.0.0       # Polymarket gas-free redeems
 sqlalchemy>=2.0.23
 aiosqlite>=0.19.0
 aiomysql>=0.2.0
+cryptography>=42.0.0  # MySQL caching_sha2_password auth
 
 # Telegram
 python-telegram-bot>=20.7
