@@ -1520,9 +1520,7 @@ async def main() -> None:
     order_size = args.order_size if args.order_size > 0 else max(wallet * 0.025, 1.0)
     max_exposure = args.max_exposure if args.max_exposure > 0 else max(wallet * 0.50, 50.0)
 
-    chainlink_feed: Optional[ChainlinkFeed] = None
-    if args.min_move_pct > 0:
-        chainlink_feed = ChainlinkFeed()
+    chainlink_feed = ChainlinkFeed()
 
     maker = CryptoTDMaker(
         executor=executor,
