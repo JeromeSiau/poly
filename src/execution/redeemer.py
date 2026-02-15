@@ -106,6 +106,27 @@ class PolymarketRedeemer:
         positions = self._fetch_redeemable(wallet)
         if not positions:
             return {"results": [], "positions": []}
+
+        # Pre-check: only redeem positions whose condition is resolved on-chain.
+        verified = []
+        for p in positions:
+            cid = p.get("conditionId") or p.get("condition_id") or ""
+            if not cid:
+                verified.append(p)
+                continue
+            try:
+                if self._service.is_condition_resolved(cid):
+                    verified.append(p)
+                else:
+                    logger.warning("redeem_skip_unresolved", condition_id=cid[:18])
+            except Exception:
+                verified.append(p)  # on error, try anyway
+
+        if not verified:
+            logger.info("redeem_scan_done", redeemed=0, msg="no on-chain resolved positions")
+            return {"results": [], "positions": []}
+
+        positions = verified
         results = self._service._redeem_from_positions(positions, batch_size)
         out: list[dict[str, Any]] = []
         for r in results:
