@@ -1352,7 +1352,7 @@ class CryptoTDMaker:
         await self._load_db_state()
         await self.polymarket.connect()
 
-        if self.chainlink_feed and self.min_move_pct > 0:
+        if self.chainlink_feed:
             await self.chainlink_feed.connect()
             # Give WS a moment to receive initial prices.
             await asyncio.sleep(2)
