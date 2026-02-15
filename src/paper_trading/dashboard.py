@@ -894,15 +894,15 @@ with tab_slot:
         import time as _time
         if last_ts:
             age_min = int((_time.time() - last_ts) / 60)
-            age_str = f"{age_min}m" if age_min < 60 else f"{age_min // 60}h {age_min % 60}m"
+            age_str = f"{age_min}m ago" if age_min < 60 else f"{age_min // 60}h {age_min % 60}m ago"
         else:
             age_str = "--"
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Slots", f"{total:,}", delta=f"{resolved} resolved")
-        c2.metric("Unresolved", str(unresolved))
+        c2.metric("In Progress", str(unresolved))
         c3.metric("Snapshots", f"{snap_count:,}")
-        c4.metric("Latest Data", age_str)
+        c4.metric("Data Age", age_str)
 
         st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
 
@@ -955,8 +955,10 @@ with tab_slot:
             ))
             layout_hm = _plotly_layout(height=340)
             layout_hm["yaxis"]["tickprefix"] = ""
+            layout_hm["yaxis"]["side"] = "left"
             layout_hm["xaxis"]["type"] = "category"
             layout_hm["yaxis"]["type"] = "category"
+            layout_hm["margin"] = dict(l=80, r=60, t=36, b=40)
             layout_hm["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
             layout_hm["yaxis"]["title"] = dict(text="dir. move %", font=dict(size=10, color=C_MUTED))
             fig_hm.update_layout(**layout_hm)
