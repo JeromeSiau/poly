@@ -176,6 +176,8 @@ class SniperEngine:
                     "reload_positions_api_error",
                     status=resp.status_code,
                     attempt=attempt + 1,
+                    url=str(resp.url),
+                    body=resp.text[:500],
                 )
             except Exception as exc:
                 logger.warning(
