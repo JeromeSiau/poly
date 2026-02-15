@@ -641,13 +641,14 @@ with tab_analysis:
                 bins = [-float("inf"), 0.0, 0.1, 0.2, 0.5, 1.0, float("inf")]
                 labels = ["<0%", "0~0.1%", "0.1~0.2%", "0.2~0.5%", "0.5~1%", ">1%"]
                 df_m["bucket"] = pd.cut(df_m["dir_move_pct"], bins=bins, labels=labels)
-                grouped = df_m.groupby("bucket", observed=True).agg(
+                grouped = df_m.groupby("bucket", observed=False).agg(
                     wins=("pnl", lambda x: (x > 0).sum()),
                     total=("pnl", "count"),
                 ).reset_index()
-                grouped["wr"] = (grouped["wins"] / grouped["total"] * 100).round(1)
+                grouped["wr"] = (grouped["wins"] / grouped["total"].replace(0, float("nan")) * 100).round(1)
+                grouped["bucket"] = grouped["bucket"].astype(str)
 
-                colors = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped["wr"]]
+                colors = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) if pd.notna(w) else C_GRID for w in grouped["wr"]]
 
                 fig = go.Figure()
                 fig.add_trace(go.Bar(
@@ -655,7 +656,7 @@ with tab_analysis:
                     marker_color=colors, marker_line_width=0,
                     opacity=0.85,
                     text=grouped.apply(
-                        lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                        lambda r: f"{r['wr']:.0f}% ({int(r['total'])})" if pd.notna(r['wr']) else "", axis=1
                     ),
                     textposition="outside",
                     cliponaxis=False,
@@ -666,7 +667,8 @@ with tab_analysis:
                 layout_mv = _plotly_layout(height=260)
                 layout_mv["yaxis"]["tickprefix"] = ""
                 layout_mv["yaxis"]["ticksuffix"] = "%"
-                layout_mv["yaxis"]["range"] = [0, min(grouped["wr"].max() + 20, 110)]
+                layout_mv["yaxis"]["range"] = [0, min(grouped["wr"].max(skipna=True) + 20, 110) if grouped["wr"].notna().any() else 110]
+                layout_mv["xaxis"]["type"] = "category"
                 fig.update_layout(**layout_mv)
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             else:
@@ -682,13 +684,14 @@ with tab_analysis:
                 bins_t = [0, 2, 4, 6, 8, 10, 12, 15]
                 labels_t = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12", "12-15"]
                 df_t["bucket"] = pd.cut(df_t["minutes_into_slot"], bins=bins_t, labels=labels_t, include_lowest=True)
-                grouped_t = df_t.groupby("bucket", observed=True).agg(
+                grouped_t = df_t.groupby("bucket", observed=False).agg(
                     wins=("pnl", lambda x: (x > 0).sum()),
                     total=("pnl", "count"),
                 ).reset_index()
-                grouped_t["wr"] = (grouped_t["wins"] / grouped_t["total"] * 100).round(1)
+                grouped_t["wr"] = (grouped_t["wins"] / grouped_t["total"].replace(0, float("nan")) * 100).round(1)
+                grouped_t["bucket"] = grouped_t["bucket"].astype(str)
 
-                colors_t = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) for w in grouped_t["wr"]]
+                colors_t = [C_GREEN if w >= 70 else (C_ACCENT if w >= 50 else C_RED) if pd.notna(w) else C_GRID for w in grouped_t["wr"]]
 
                 fig_t = go.Figure()
                 fig_t.add_trace(go.Bar(
@@ -696,7 +699,7 @@ with tab_analysis:
                     marker_color=colors_t, marker_line_width=0,
                     opacity=0.85,
                     text=grouped_t.apply(
-                        lambda r: f"{r['wr']:.0f}% ({int(r['total'])})", axis=1
+                        lambda r: f"{r['wr']:.0f}% ({int(r['total'])})" if pd.notna(r['wr']) else "", axis=1
                     ),
                     textposition="outside",
                     cliponaxis=False,
@@ -707,8 +710,9 @@ with tab_analysis:
                 layout_t = _plotly_layout(height=260)
                 layout_t["yaxis"]["tickprefix"] = ""
                 layout_t["yaxis"]["ticksuffix"] = "%"
-                layout_t["yaxis"]["range"] = [0, min(grouped_t["wr"].max() + 20, 110)]
+                layout_t["yaxis"]["range"] = [0, min(grouped_t["wr"].max(skipna=True) + 20, 110) if grouped_t["wr"].notna().any() else 110]
                 layout_t["xaxis"]["title"] = dict(text="minutes into slot", font=dict(size=10, color=C_MUTED))
+                layout_t["xaxis"]["type"] = "category"
                 fig_t.update_layout(**layout_t)
                 st.plotly_chart(fig_t, use_container_width=True, config={"displayModeBar": False})
             else:
