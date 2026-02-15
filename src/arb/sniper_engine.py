@@ -157,35 +157,36 @@ class SniperEngine:
         at startup (403/connection errors).
         """
         data = None
-        for attempt in range(5):
-            try:
-                resp = await client.get(
-                    "http://localhost:8788/trades",
-                    params={
-                        "event_type": "last_penny_sniper",
-                        "is_open": "true",
-                        "hours": 168,  # 7 days
-                        "limit": 2000,
-                    },
-                    timeout=10.0,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    break
-                logger.warning(
-                    "reload_positions_api_error",
-                    status=resp.status_code,
-                    attempt=attempt + 1,
-                    url=str(resp.url),
-                    body=resp.text[:500],
-                )
-            except Exception as exc:
-                logger.warning(
-                    "reload_positions_failed",
-                    error=str(exc),
-                    attempt=attempt + 1,
-                )
-            await asyncio.sleep(3.0)
+        # Use a separate client without proxy for localhost calls —
+        # the process may inherit HTTP_PROXY that blocks localhost.
+        async with httpx.AsyncClient(trust_env=False, timeout=10.0) as local:
+            for attempt in range(5):
+                try:
+                    resp = await local.get(
+                        "http://localhost:8788/trades",
+                        params={
+                            "event_type": "last_penny_sniper",
+                            "is_open": "true",
+                            "hours": 168,  # 7 days
+                            "limit": 2000,
+                        },
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        break
+                    logger.warning(
+                        "reload_positions_api_error",
+                        status=resp.status_code,
+                        attempt=attempt + 1,
+                        body=resp.text[:200],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "reload_positions_failed",
+                        error=str(exc),
+                        attempt=attempt + 1,
+                    )
+                await asyncio.sleep(3.0)
 
         if data is None:
             logger.error("reload_positions_gave_up", attempts=5)
