@@ -138,7 +138,9 @@ class CryptoTDMaker:
         db_url: str = "",
         ladder_rungs: int = 1,
         min_move_pct: float = 0.0,
+        max_move_pct: float = 0.0,
         min_entry_minutes: float = 0.0,
+        max_entry_minutes: float = 0.0,
         chainlink_feed: Optional[ChainlinkFeed] = None,
     ) -> None:
         self.executor = executor
@@ -159,7 +161,9 @@ class CryptoTDMaker:
         self._db_url = db_url
         self.ladder_rungs = ladder_rungs
         self.min_move_pct = min_move_pct
+        self.max_move_pct = max_move_pct
         self.min_entry_minutes = min_entry_minutes
+        self.max_entry_minutes = max_entry_minutes
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -344,6 +348,18 @@ class CryptoTDMaker:
             threshold = self.min_move_pct
         return move >= threshold
 
+    def _check_max_move(self, cid: str, outcome: str) -> bool:
+        """Check if underlying hasn't moved too much (excessive volatility).
+
+        Returns True (allow) when max_move_pct is 0 or data is unavailable.
+        """
+        if self.max_move_pct <= 0:
+            return True
+        move = self._get_dir_move(cid, outcome)
+        if move is None:
+            return True
+        return move <= self.max_move_pct
+
     def _check_min_entry_time(self, cid: str) -> bool:
         """Return True if enough time has elapsed since slot start.
 
@@ -357,6 +373,20 @@ class CryptoTDMaker:
             return True
         elapsed = (time.time() - slot_ts) / 60
         return elapsed >= self.min_entry_minutes
+
+    def _check_max_entry_time(self, cid: str) -> bool:
+        """Return True if not too late into the slot.
+
+        Returns True (allow) when max_entry_minutes is 0 or slot timestamp
+        is unavailable.
+        """
+        if self.max_entry_minutes <= 0:
+            return True
+        slot_ts = self._cid_slot_ts.get(cid)
+        if slot_ts is None:
+            return True
+        elapsed = (time.time() - slot_ts) / 60
+        return elapsed <= self.max_entry_minutes
 
     @staticmethod
     def _parse_slug_info(slug: str) -> Optional[tuple[str, int]]:
@@ -550,23 +580,29 @@ class CryptoTDMaker:
                     self._last_book_update = now
                 existing_key = (cid, outcome)
 
-                # BUY signal: bid in [target_bid, max_bid] + timing + min-move filter
+                # BUY signal: bid in [target_bid, max_bid] + timing + move filters
                 bid_in_range = (
                     bid is not None
                     and self.target_bid <= bid <= self.max_bid
                     and self._check_min_entry_time(cid)
+                    and self._check_max_entry_time(cid)
                     and self._check_min_move(cid, outcome, bid)
+                    and self._check_max_move(cid, outcome)
                 )
 
                 if self.ladder_rungs > 1 and bid is not None and bid >= self.target_bid:
                     # ---- Sequential ladder: place only the next rung ----
                     if not self._check_min_entry_time(cid):
                         continue
+                    if not self._check_max_entry_time(cid):
+                        continue
                     next_idx = self._cid_fill_count.get(cid, 0)
                     if next_idx < len(self.rung_prices):
                         rung_price = self.rung_prices[next_idx]
-                        # Min-move filter scaled to rung price.
+                        # Move filters scaled to rung price.
                         if not self._check_min_move(cid, outcome, rung_price):
+                            continue
+                        if not self._check_max_move(cid, outcome):
                             continue
                         # Skip if rung would cross the book (post-only rejection)
                         if ask is not None and rung_price >= ask:
@@ -1462,8 +1498,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Min underlying price move (%%) in bet direction to enter (0=disabled)",
     )
     p.add_argument(
+        "--max-move-pct", type=float, default=0.0,
+        help="Max underlying price move (%%) — reject excessive volatility (0=disabled)",
+    )
+    p.add_argument(
         "--min-entry-minutes", type=float, default=0.0,
         help="Min minutes into slot before placing orders (0=disabled)",
+    )
+    p.add_argument(
+        "--max-entry-minutes", type=float, default=0.0,
+        help="Max minutes into slot — stop entering after this (0=disabled)",
     )
     return p
 
@@ -1472,7 +1516,11 @@ async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    symbols = [
+        s if s.endswith("USDT") else s + "USDT"
+        for s in (tok.strip().upper() for tok in args.symbols.split(","))
+        if s
+    ]
     paper_mode = not args.live
     strategy_tag = args.strategy_tag.strip() or "crypto_td_maker"
 
@@ -1553,7 +1601,9 @@ async def main() -> None:
         db_url=args.db_url,
         ladder_rungs=args.ladder_rungs,
         min_move_pct=args.min_move_pct,
+        max_move_pct=args.max_move_pct,
         min_entry_minutes=args.min_entry_minutes,
+        max_entry_minutes=args.max_entry_minutes,
         chainlink_feed=chainlink_feed,
     )
 
@@ -1567,10 +1617,20 @@ async def main() -> None:
         print(f"  Ladder:      {args.ladder_rungs} rungs at [{rung_str}]")
     print(f"  Order size:  ${order_size:.2f}/rung")
     print(f"  Max exposure: ${max_exposure:.2f}")
-    if args.min_entry_minutes > 0:
-        print(f"  Min entry:   {args.min_entry_minutes} min into slot")
-    if args.min_move_pct > 0:
-        print(f"  Min move:    {args.min_move_pct}% (Chainlink directional filter)")
+    if args.min_entry_minutes > 0 or args.max_entry_minutes > 0:
+        parts = []
+        if args.min_entry_minutes > 0:
+            parts.append(f">={args.min_entry_minutes}m")
+        if args.max_entry_minutes > 0:
+            parts.append(f"<={args.max_entry_minutes}m")
+        print(f"  Entry time:  {' & '.join(parts)} into slot")
+    if args.min_move_pct > 0 or args.max_move_pct > 0:
+        parts = []
+        if args.min_move_pct > 0:
+            parts.append(f">={args.min_move_pct}%")
+        if args.max_move_pct > 0:
+            parts.append(f"<={args.max_move_pct}%")
+        print(f"  Move filter: {' & '.join(parts)} (Chainlink directional)")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print()
 
