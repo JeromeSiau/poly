@@ -2,6 +2,9 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "$0")/.." && pwd)"
+
+# NOTE: This script only works with SQLite databases.
+# For MySQL, connect directly: mysql -u poly -p poly -e "DELETE FROM paper_trades;"
 DB_PATH="$BASE/data/arb.db"
 MAKE_BACKUP=1
 ASSUME_YES=0
@@ -22,7 +25,6 @@ Options:
 Examples:
   ./reset_arb_db.sh
   ./reset_arb_db.sh --yes
-  ./reset_arb_db.sh --db /home/ploi/orb.lvlup-dev.com/data/arb.db --yes
   ./reset_arb_db.sh --yes --keep-cache
 EOF
 }

@@ -50,10 +50,7 @@ def _ensure_sync_db_url(database_url: str) -> str:
         return settings.DATABASE_URL
     if "://" not in database_url:
         return database_url
-    scheme, suffix = database_url.split("://", 1)
-    if "+" in scheme:
-        scheme = scheme.split("+", 1)[0]
-    return f"{scheme}://{suffix}"
+    return database_url.replace("+aiosqlite", "").replace("+aiomysql", "+pymysql")
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:

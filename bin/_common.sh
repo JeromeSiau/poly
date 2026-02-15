@@ -17,7 +17,11 @@ if [[ -f "$BASE/.env" ]]; then
 fi
 
 PYTHON="$BASE/.venv/bin/python"
-DB_URL="sqlite+aiosqlite:///data/arb.db"
+# Read DATABASE_URL from .env
+if [[ -f "$BASE/.env" ]]; then
+  _db=$(grep -m1 '^DATABASE_URL=' "$BASE/.env" | cut -d= -f2-)
+  [[ -n "$_db" ]] && DB_URL="$_db"
+fi
 
 # Circuit breaker defaults (override via env vars)
 CB_MAX_LOSSES="${CB_MAX_LOSSES:-5}"
