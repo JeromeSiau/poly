@@ -5,8 +5,8 @@ Queries MySQL slot data (snapshots + resolutions), engineers features,
 trains a calibrated binary classifier, and saves to joblib.
 
 Usage:
-    ./run scripts/train_td_model.py --mysql-url mysql+aiomysql://...
-    ./run scripts/train_td_model.py  # uses MYSQL_URL from .env
+    ./run scripts/train_td_model.py --db-url mysql+aiomysql://...
+    ./run scripts/train_td_model.py  # uses DATABASE_URL from .env
 
 Output: data/models/td_model_YYYYMMDD.joblib
 """
@@ -80,12 +80,12 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-async def load_data(mysql_url: str, min_minutes: float = 4.0,
+async def load_data(db_url: str, min_minutes: float = 4.0,
                     max_minutes: float = 10.0) -> pd.DataFrame:
     """Load snapshots joined with resolutions from MySQL."""
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine(mysql_url, echo=False)
+    engine = create_async_engine(db_url, echo=False)
     query = f"""
         SELECT
             s.symbol, s.slot_ts, s.minutes_into_slot,
@@ -225,7 +225,7 @@ def save_model(model: CalibratedClassifierCV, output_dir: str) -> str:
 
 async def run(args: argparse.Namespace) -> None:
     # Load
-    df = await load_data(args.mysql_url, args.min_minutes, args.max_minutes)
+    df = await load_data(args.db_url, args.min_minutes, args.max_minutes)
     if len(df) < 100:
         print(f"Only {len(df)} rows — need at least 100 resolved slots. Collect more data.")
         sys.exit(1)
@@ -286,9 +286,9 @@ async def run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     from config.settings import settings
     p = argparse.ArgumentParser(description="Train TD maker ML model")
-    p.add_argument("--mysql-url", type=str,
-                   default=settings.MYSQL_URL,
-                   help="MySQL connection string")
+    p.add_argument("--db-url", type=str,
+                   default=settings.DATABASE_URL,
+                   help="Database connection string")
     p.add_argument("--min-minutes", type=float, default=4.0,
                    help="Min minutes into slot for snapshot selection")
     p.add_argument("--max-minutes", type=float, default=10.0,
