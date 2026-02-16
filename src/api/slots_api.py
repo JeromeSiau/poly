@@ -258,7 +258,9 @@ async def slot_stoploss(
                     COUNT(*) AS total,
                     SUM(peaked.resolved_up = 1) AS wins,
                     SUM(peaked.resolved_up = 0) AS losses,
-                    SUM(peaked.min_bid_after_peak <= t.t) AS triggered
+                    SUM(peaked.min_bid_after_peak <= t.t) AS triggered,
+                    SUM(peaked.min_bid_after_peak <= t.t AND peaked.resolved_up = 0) AS true_saves,
+                    SUM(peaked.min_bid_after_peak <= t.t AND peaked.resolved_up = 1) AS false_exits
                 FROM peaked
                 CROSS JOIN thresholds t
                 WHERE 1=1 {sym_clause}
@@ -276,18 +278,20 @@ async def slot_stoploss(
                 wins = int(r["wins"] or 0)
                 losses = int(r["losses"] or 0)
                 triggered = int(r["triggered"] or 0)
-                # Of those triggered at this threshold: how many were actually losses?
-                # triggered = slots where bid dipped to threshold
-                # If we had sold at threshold, we'd avoid the loss but also lose the win
-                # hold_wr = wins/total (do nothing)
+                true_saves = int(r["true_saves"] or 0)
+                false_exits = int(r["false_exits"] or 0)
                 hold_wr = round(wins / total * 100, 1) if total else 0
+                precision = round(true_saves / triggered * 100, 1) if triggered else 0
                 thresholds.append({
                     "threshold": float(r["threshold"]),
                     "total": total,
                     "wins": wins,
                     "losses": losses,
                     "triggered": triggered,
+                    "true_saves": true_saves,
+                    "false_exits": false_exits,
                     "hold_wr": hold_wr,
+                    "precision": precision,
                 })
 
             return {"peak": peak, "total_peaked": total_peaked, "thresholds": thresholds}
