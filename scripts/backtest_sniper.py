@@ -282,7 +282,8 @@ def simulate(
     capital: float,
     risk_pct: float,
     max_per_market_pct: float,
-    fee_rate: float = 0.0625,
+    fee_rate: float = 0.25,
+    fee_exponent: int = 2,
 ) -> SniperStats:
     """Simulate sniper strategy on historical trades.
 
@@ -328,7 +329,7 @@ def simulate(
             # Fee calculation
             fee_pct = 0.0
             if m.category in fee_categories:
-                fee_pct = avg_price * (1 - avg_price) * fee_rate
+                fee_pct = avg_price * fee_rate * (avg_price * (1 - avg_price)) ** fee_exponent
 
             # Sizing: constant risk per trade
             max_risk = current_capital * risk_pct

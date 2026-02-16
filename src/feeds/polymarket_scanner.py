@@ -42,30 +42,38 @@ class SniperTarget:
     fee_pct: float
 
 
-def classify_slug(slug: str, question: str) -> tuple[str, bool, float]:
+def _compute_taker_fee(price: float, fee_rate: float, exponent: int) -> float:
+    """Polymarket taker fee per share.
+
+    Official formula: fee = p × feeRate × (p × (1 - p))^exponent
+    """
+    return price * fee_rate * (price * (1.0 - price)) ** exponent
+
+
+def classify_slug(slug: str, question: str) -> tuple[str, bool, float, int]:
     """Classify market category and fee structure.
 
-    Returns (category, has_fee, fee_rate).
-    Fee formula: fee_per_share = price * (1 - price) * rate
+    Returns (category, has_fee, fee_rate, exponent).
+    Fee formula: fee_per_share = p × feeRate × (p × (1 - p))^exponent
     """
     slug_lower = slug.lower() if slug else ""
     q_lower = question.lower() if question else ""
 
     if "updown-15m" in slug_lower:
-        return "crypto_15min", True, 0.0625
+        return "crypto_15min", True, 0.25, 2
     if "updown" in slug_lower:
-        return "crypto_hourly", False, 0.0
+        return "crypto_hourly", False, 0.0, 1
     # Event-level slugs use "up-or-down" instead of "updown"
     if "up-or-down" in slug_lower:
-        return "crypto_hourly", False, 0.0
+        return "crypto_hourly", False, 0.0, 1
     if "price-of" in slug_lower:
-        return "crypto_bracket", False, 0.0
+        return "crypto_bracket", False, 0.0, 1
 
     # Sports with fees: NCAAB, Serie A
     if "ncaab" in q_lower or "ncaa" in q_lower:
-        return "sports", True, 0.0175
+        return "sports", True, 0.0175, 1
     if "serie a" in q_lower or "serie-a" in slug_lower:
-        return "sports", True, 0.0175
+        return "sports", True, 0.0175, 1
 
     # Sports without fees
     sport_hints = [
@@ -74,9 +82,9 @@ def classify_slug(slug: str, question: str) -> tuple[str, bool, float]:
         "la liga", "bundesliga",
     ]
     if any(h in q_lower for h in sport_hints):
-        return "sports", False, 0.0
+        return "sports", False, 0.0, 1
 
-    return "other", False, 0.0
+    return "other", False, 0.0, 1
 
 
 class MarketScanner:
@@ -214,7 +222,7 @@ class MarketScanner:
                 if not slug:
                     slug = str(raw.get("slug", ""))
 
-                cat, has_fee, fee_rate = classify_slug(slug, question)
+                cat, has_fee, fee_rate, fee_exponent = classify_slug(slug, question)
 
                 # Fee markets only accepted if price > fee_ok_above
                 if has_fee and max(prices) < self.fee_ok_above:
@@ -231,6 +239,7 @@ class MarketScanner:
                 raw["_category"] = cat
                 raw["_has_fee"] = has_fee
                 raw["_fee_rate"] = fee_rate
+                raw["_fee_exponent"] = fee_exponent
                 raw["_slug"] = slug
                 candidates.append(raw)
 
@@ -268,6 +277,7 @@ class MarketScanner:
             cat = raw["_category"]
             has_fee = raw["_has_fee"]
             fee_rate = raw["_fee_rate"]
+            fee_exponent = raw.get("_fee_exponent", 1)
             slug = raw["_slug"]
 
             async with semaphore:
@@ -303,7 +313,7 @@ class MarketScanner:
             if best_ask is None or best_ask < self.watch_threshold:
                 return None
 
-            fee_pct = best_ask * (1 - best_ask) * fee_rate if has_fee else 0.0
+            fee_pct = _compute_taker_fee(best_ask, fee_rate, fee_exponent) if has_fee else 0.0
 
             return SniperTarget(
                 condition_id=cid,

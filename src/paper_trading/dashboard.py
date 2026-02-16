@@ -1063,29 +1063,35 @@ with tab_slot:
             sl_items = sl_data["thresholds"]
             total_peaked = sl_data["total_peaked"]
 
-            # Chart: triggered count + hold WR by threshold
+            # Chart: stacked bars (true saves vs false exits) + precision line
             thresholds = [f"{s['threshold']:.2f}" for s in sl_items]
-            triggered = [s["triggered"] for s in sl_items]
-            hold_wr = [s["hold_wr"] for s in sl_items]
+            true_saves = [s.get("true_saves", 0) for s in sl_items]
+            false_exits = [s.get("false_exits", 0) for s in sl_items]
+            precision = [s.get("precision", 0) for s in sl_items]
 
             fig_sl = go.Figure()
-            # Bar: triggered slots
             fig_sl.add_trace(go.Bar(
-                x=thresholds, y=triggered,
-                name="Triggered",
-                marker_color=C_RED, opacity=0.6,
+                x=thresholds, y=true_saves,
+                name="True Saves",
+                marker_color=C_GREEN, opacity=0.7,
                 yaxis="y",
-                hovertemplate="Threshold: %{x}<br>Triggered: %{y}<extra></extra>",
+                hovertemplate="Threshold: %{x}<br>True saves: %{y}<extra></extra>",
             ))
-            # Line: hold WR
+            fig_sl.add_trace(go.Bar(
+                x=thresholds, y=false_exits,
+                name="False Exits",
+                marker_color=C_RED, opacity=0.7,
+                yaxis="y",
+                hovertemplate="Threshold: %{x}<br>False exits: %{y}<extra></extra>",
+            ))
             fig_sl.add_trace(go.Scatter(
-                x=thresholds, y=hold_wr,
-                name="Hold WR %",
+                x=thresholds, y=precision,
+                name="Precision %",
                 mode="lines+markers",
-                line=dict(color=C_GREEN, width=2),
-                marker=dict(size=6, color=C_GREEN),
+                line=dict(color=C_ACCENT, width=2),
+                marker=dict(size=6, color=C_ACCENT),
                 yaxis="y2",
-                hovertemplate="Threshold: %{x}<br>Hold WR: %{y:.1f}%<extra></extra>",
+                hovertemplate="Threshold: %{x}<br>Precision: %{y:.0f}%<extra></extra>",
             ))
 
             layout_sl = _plotly_layout(height=300)
@@ -1097,17 +1103,17 @@ with tab_slot:
                     tickfont=dict(color=C_MUTED, size=10),
                 ),
                 yaxis=dict(
-                    title=dict(text="triggered slots", font=dict(size=10, color=C_RED)),
+                    title=dict(text="slots", font=dict(size=10, color=C_MUTED)),
                     side="left",
                     gridcolor=C_GRID,
-                    tickfont=dict(color=C_RED, size=10),
+                    tickfont=dict(color=C_MUTED, size=10),
                 ),
                 yaxis2=dict(
-                    title=dict(text="hold win rate %", font=dict(size=10, color=C_GREEN)),
+                    title=dict(text="precision %", font=dict(size=10, color=C_ACCENT)),
                     side="right",
                     overlaying="y",
                     gridcolor="rgba(0,0,0,0)",
-                    tickfont=dict(color=C_GREEN, size=10),
+                    tickfont=dict(color=C_ACCENT, size=10),
                     ticksuffix="%",
                     range=[0, 100],
                 ),
@@ -1115,7 +1121,7 @@ with tab_slot:
                     orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
                     font=dict(color=C_MUTED, size=10),
                 ),
-                barmode="overlay",
+                barmode="stack",
             )
             fig_sl.update_layout(**layout_sl)
             st.plotly_chart(fig_sl, use_container_width=True, config={"displayModeBar": False})
@@ -1125,24 +1131,23 @@ with tab_slot:
             sl_df = sl_df[sl_df["triggered"] > 0]
             if not sl_df.empty:
                 sl_df["threshold"] = sl_df["threshold"].apply(lambda x: f"{x:.2f}")
-                sl_df["hold_wr"] = sl_df["hold_wr"].apply(lambda x: f"{x:.1f}%")
+                sl_df["precision"] = sl_df["precision"].apply(lambda x: f"{x:.0f}%")
                 st.dataframe(
-                    sl_df[["threshold", "total", "wins", "losses", "triggered", "hold_wr"]].rename(
+                    sl_df[["threshold", "triggered", "true_saves", "false_exits", "precision"]].rename(
                         columns={
-                            "threshold": "Dip Threshold",
-                            "total": "Peaked Slots",
-                            "wins": "Wins",
-                            "losses": "Losses",
-                            "triggered": "Would Trigger",
-                            "hold_wr": "Hold WR",
+                            "threshold": "Threshold",
+                            "triggered": "Triggered",
+                            "true_saves": "True Saves",
+                            "false_exits": "False Exits",
+                            "precision": "Precision",
                         }
                     ),
                     use_container_width=True,
                     hide_index=True,
                 )
             st.caption(
-                f"{total_peaked} slots where bid reached 0.75+  |  "
-                f"Lower threshold = fewer false exits  |  "
+                f"{total_peaked} slots peaked 0.75+ ({sl_items[0]['wins']}W / {sl_items[0]['losses']}L)  |  "
+                f"Precision = true saves / triggered  |  "
                 f"Lookback: {h}h"
             )
 
