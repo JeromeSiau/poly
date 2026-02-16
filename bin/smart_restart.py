@@ -60,7 +60,8 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("src/api/slots_api",           ["run_trades_api"]),
     ("src/api/winrate",             ["run_trades_api"]),
     ("src/api/rn1_compare",         ["run_rn1_compare_api"]),
-    ("src/paper_trading/",          ["run_dashboard", "streamlit", "run_auto_redeem"]),
+    ("src/dashboard/",              ["run_dashboard", "streamlit"]),
+    ("src/paper_trading/",          ["run_auto_redeem"]),
     ("src/ml/",                     ["run_dashboard", "streamlit"]),
 
     # ── Scripts (entry points) ──────────────────────────────────────────

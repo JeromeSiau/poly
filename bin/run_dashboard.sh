@@ -8,7 +8,7 @@ cd "$BASE"
 export PYTHONPATH="$BASE"
 export PYTHONUNBUFFERED=1
 
-exec "$BASE/.venv/bin/streamlit" run "$BASE/src/paper_trading/dashboard.py" \
+exec "$BASE/.venv/bin/streamlit" run "$BASE/src/dashboard/app.py" \
   --server.port "$PORT" \
   --server.address 0.0.0.0 \
   --server.headless true
