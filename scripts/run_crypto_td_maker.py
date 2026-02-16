@@ -601,9 +601,11 @@ class CryptoTDMaker:
             bid, _, _, _ = self.polymarket.get_best_levels(cid, pos.outcome)
 
             # Empty book = worst case for stoploss purposes.
+            # But skip if bid_max is high — book empties naturally near
+            # resolution for winning positions (bid_max > 0.90).
             if bid is None:
                 prev_max = self._position_bid_max.get(cid, pos.entry_price)
-                if prev_max >= self.stoploss_peak:
+                if prev_max >= self.stoploss_peak and prev_max <= 0.90:
                     logger.warning("stoploss_bid_none_trigger", cid=cid[:16],
                                    bid_max=round(prev_max, 3),
                                    peak=self.stoploss_peak, exit=self.stoploss_exit)
