@@ -119,6 +119,7 @@ class PolymarketExecutor:
         price: float,
         outcome: Optional[str] = None,
         order_type: str = "",
+        force_taker: bool = False,
     ) -> dict[str, Any]:
         self._ensure_creds()
 
@@ -152,7 +153,11 @@ class PolymarketExecutor:
             order_type if order_type else settings.POLYMARKET_ORDER_TYPE
         )
         # post_only is only valid for GTC/GTD — never for FOK/IOC.
-        use_post_only = settings.POLYMARKET_POST_ONLY and resolved_type in ("GTC", "GTD")
+        # force_taker=True disables post_only (used by stoploss sells).
+        if force_taker:
+            use_post_only = False
+        else:
+            use_post_only = settings.POLYMARKET_POST_ONLY and resolved_type in ("GTC", "GTD")
         response = self._client.post_order(
             order,
             orderType=resolved_type,
@@ -179,12 +184,14 @@ class PolymarketExecutor:
         price: float,
         outcome: Optional[str] = None,
         order_type: str = "",
+        force_taker: bool = False,
     ) -> dict[str, Any]:
         """Place an order asynchronously.
 
         Args:
             order_type: Override order type (e.g. "GTC", "FOK").
                         Empty string falls back to settings.POLYMARKET_ORDER_TYPE.
+            force_taker: If True, disables post_only regardless of settings.
         """
         try:
             return await asyncio.to_thread(
@@ -195,6 +202,7 @@ class PolymarketExecutor:
                 price,
                 outcome,
                 order_type,
+                force_taker,
             )
         except Exception as e:
             logger.error("polymarket_order_failed", error=str(e))

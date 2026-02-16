@@ -19,6 +19,7 @@ class ExecutorProtocol(Protocol):
         price: float,
         outcome: str = "",
         order_type: str = "GTC",
+        force_taker: bool = False,
     ) -> dict[str, Any] | OrderResult: ...
 
     async def cancel_order(self, order_id: str) -> dict[str, Any] | bool: ...

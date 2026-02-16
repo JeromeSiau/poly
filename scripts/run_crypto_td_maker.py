@@ -600,16 +600,10 @@ class CryptoTDMaker:
         for cid, pos in self.positions.items():
             bid, _, _, _ = self.polymarket.get_best_levels(cid, pos.outcome)
 
-            # Empty book = worst case for stoploss purposes.
-            # But skip if bid_max is high — book empties naturally near
-            # resolution for winning positions (bid_max > 0.90).
+            # Empty book: skip — a momentary empty book is almost always a
+            # websocket gap, not a real crash.  Real crashes have low bids,
+            # not empty books, so the rule-based trigger catches them.
             if bid is None:
-                prev_max = self._position_bid_max.get(cid, pos.entry_price)
-                if prev_max >= self.stoploss_peak and prev_max <= 0.90:
-                    logger.warning("stoploss_bid_none_trigger", cid=cid[:16],
-                                   bid_max=round(prev_max, 3),
-                                   peak=self.stoploss_peak, exit=self.stoploss_exit)
-                    exits.append(cid)
                 continue
 
             # Update bid max.
@@ -689,8 +683,8 @@ class CryptoTDMaker:
         sell_ok = self.paper_mode  # paper always "succeeds"
         if not self.paper_mode and self.manager:
             slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
-            # FOK at 0.01 = "sell at any bid, fill-or-kill".
-            # FOK bypasses post_only (our executor fix), so it acts as taker.
+            # GTC at 0.01 + force_taker: sells at any bid, allows partial fills,
+            # and bypasses post_only so the order crosses the spread immediately.
             sell_intent = TradeIntent(
                 condition_id=pos.condition_id,
                 token_id=pos.token_id,
@@ -703,7 +697,8 @@ class CryptoTDMaker:
                 timestamp=now,
             )
             try:
-                pending = await self.manager.place(sell_intent, order_type="FOK")
+                pending = await self.manager.place(
+                    sell_intent, order_type="GTC", force_taker=True)
                 sell_ok = bool(pending.order_id)  # empty string = executor error
             except Exception as exc:
                 logger.error("stop_loss_sell_failed",
