@@ -208,3 +208,88 @@ async def slot_analytics(
             }
     except Exception as exc:
         return {"error": f"Query failed: {str(exc)[:200]}"}
+
+
+@router.get("/slots/stoploss")
+async def slot_stoploss(
+    hours: float = Query(default=168.0, ge=1.0, le=2160.0, description="Lookback window in hours."),
+    symbol: Optional[str] = Query(default=None, description="Filter by symbol."),
+    peak: float = Query(default=0.75, ge=0.50, le=0.95, description="Min bid_up peak to consider."),
+) -> dict:
+    """Stop-loss threshold sweep: WR by dip depth after bid reaches peak."""
+    factory = _get_factory()
+    if factory is None:
+        return {"error": "DATABASE_URL not configured"}
+
+    cutoff = int(time.time() - hours * 3600)
+    sym_clause = "AND peaked.symbol = :symbol" if symbol else ""
+    params: dict = {"cutoff": cutoff, "peak": peak}
+    if symbol:
+        params["symbol"] = symbol.upper()
+
+    try:
+        async with factory() as session:
+            rows = (await session.execute(text(f"""
+                WITH thresholds AS (
+                    SELECT 0.95 AS t UNION SELECT 0.90 UNION SELECT 0.85
+                    UNION SELECT 0.80 UNION SELECT 0.75 UNION SELECT 0.70
+                    UNION SELECT 0.65 UNION SELECT 0.60 UNION SELECT 0.55
+                    UNION SELECT 0.50 UNION SELECT 0.45 UNION SELECT 0.40
+                    UNION SELECT 0.35 UNION SELECT 0.30 UNION SELECT 0.25
+                    UNION SELECT 0.20 UNION SELECT 0.15 UNION SELECT 0.10
+                    UNION SELECT 0.05
+                ),
+                peaked AS (
+                    SELECT sr.symbol, sr.slot_ts, sr.resolved_up,
+                           MAX(ss.bid_up) AS max_bid,
+                           MIN(ss.bid_up) AS min_bid_after_peak
+                    FROM slot_resolutions sr
+                    JOIN slot_snapshots ss
+                        ON ss.symbol = sr.symbol AND ss.slot_ts = sr.slot_ts
+                    WHERE sr.resolved_up IS NOT NULL
+                        AND sr.slot_ts > :cutoff
+                        AND ss.bid_up IS NOT NULL
+                        AND ss.minutes_into_slot BETWEEN 0 AND 13
+                    GROUP BY sr.symbol, sr.slot_ts, sr.resolved_up
+                    HAVING MAX(ss.bid_up) >= :peak
+                )
+                SELECT
+                    t.t AS threshold,
+                    COUNT(*) AS total,
+                    SUM(peaked.resolved_up = 1) AS wins,
+                    SUM(peaked.resolved_up = 0) AS losses,
+                    SUM(peaked.min_bid_after_peak <= t.t) AS triggered
+                FROM peaked
+                CROSS JOIN thresholds t
+                WHERE 1=1 {sym_clause}
+                GROUP BY t.t
+                ORDER BY t.t DESC
+            """), params)).mappings().all()
+
+            if not rows:
+                return {"peak": peak, "total_peaked": 0, "thresholds": []}
+
+            total_peaked = int(rows[0]["total"]) if rows else 0
+            thresholds = []
+            for r in rows:
+                total = int(r["total"])
+                wins = int(r["wins"] or 0)
+                losses = int(r["losses"] or 0)
+                triggered = int(r["triggered"] or 0)
+                # Of those triggered at this threshold: how many were actually losses?
+                # triggered = slots where bid dipped to threshold
+                # If we had sold at threshold, we'd avoid the loss but also lose the win
+                # hold_wr = wins/total (do nothing)
+                hold_wr = round(wins / total * 100, 1) if total else 0
+                thresholds.append({
+                    "threshold": float(r["threshold"]),
+                    "total": total,
+                    "wins": wins,
+                    "losses": losses,
+                    "triggered": triggered,
+                    "hold_wr": hold_wr,
+                })
+
+            return {"peak": peak, "total_peaked": total_peaked, "thresholds": thresholds}
+    except Exception as exc:
+        return {"error": f"Query failed: {str(exc)[:200]}"}

@@ -1048,6 +1048,106 @@ with tab_slot:
 
         st.markdown('<div style="height: 12px"></div>', unsafe_allow_html=True)
 
+        # -- Stop-loss analysis --
+        sl_params: dict = {"hours": h, "peak": 0.75}
+        if sym_choice != "All":
+            sl_params["symbol"] = sym_choice
+        sl_data = _api("/slots/stoploss", sl_params)
+
+        if sl_data.get("thresholds") and sl_data.get("total_peaked", 0) > 0:
+            st.markdown(
+                '<p class="section-label">Stop-Loss Threshold Sweep (bid dip after peak &ge; 0.75)</p>',
+                unsafe_allow_html=True,
+            )
+
+            sl_items = sl_data["thresholds"]
+            total_peaked = sl_data["total_peaked"]
+
+            # Chart: triggered count + hold WR by threshold
+            thresholds = [f"{s['threshold']:.2f}" for s in sl_items]
+            triggered = [s["triggered"] for s in sl_items]
+            hold_wr = [s["hold_wr"] for s in sl_items]
+
+            fig_sl = go.Figure()
+            # Bar: triggered slots
+            fig_sl.add_trace(go.Bar(
+                x=thresholds, y=triggered,
+                name="Triggered",
+                marker_color=C_RED, opacity=0.6,
+                yaxis="y",
+                hovertemplate="Threshold: %{x}<br>Triggered: %{y}<extra></extra>",
+            ))
+            # Line: hold WR
+            fig_sl.add_trace(go.Scatter(
+                x=thresholds, y=hold_wr,
+                name="Hold WR %",
+                mode="lines+markers",
+                line=dict(color=C_GREEN, width=2),
+                marker=dict(size=6, color=C_GREEN),
+                yaxis="y2",
+                hovertemplate="Threshold: %{x}<br>Hold WR: %{y:.1f}%<extra></extra>",
+            ))
+
+            layout_sl = _plotly_layout(height=300)
+            layout_sl.update(
+                xaxis=dict(
+                    title=dict(text="dip threshold", font=dict(size=10, color=C_MUTED)),
+                    type="category",
+                    gridcolor=C_GRID,
+                    tickfont=dict(color=C_MUTED, size=10),
+                ),
+                yaxis=dict(
+                    title=dict(text="triggered slots", font=dict(size=10, color=C_RED)),
+                    side="left",
+                    gridcolor=C_GRID,
+                    tickfont=dict(color=C_RED, size=10),
+                ),
+                yaxis2=dict(
+                    title=dict(text="hold win rate %", font=dict(size=10, color=C_GREEN)),
+                    side="right",
+                    overlaying="y",
+                    gridcolor="rgba(0,0,0,0)",
+                    tickfont=dict(color=C_GREEN, size=10),
+                    ticksuffix="%",
+                    range=[0, 100],
+                ),
+                legend=dict(
+                    orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                    font=dict(color=C_MUTED, size=10),
+                ),
+                barmode="overlay",
+            )
+            fig_sl.update_layout(**layout_sl)
+            st.plotly_chart(fig_sl, use_container_width=True, config={"displayModeBar": False})
+
+            # Compact table
+            sl_df = pd.DataFrame(sl_items)
+            sl_df = sl_df[sl_df["triggered"] > 0]
+            if not sl_df.empty:
+                sl_df["threshold"] = sl_df["threshold"].apply(lambda x: f"{x:.2f}")
+                sl_df["hold_wr"] = sl_df["hold_wr"].apply(lambda x: f"{x:.1f}%")
+                st.dataframe(
+                    sl_df[["threshold", "total", "wins", "losses", "triggered", "hold_wr"]].rename(
+                        columns={
+                            "threshold": "Dip Threshold",
+                            "total": "Peaked Slots",
+                            "wins": "Wins",
+                            "losses": "Losses",
+                            "triggered": "Would Trigger",
+                            "hold_wr": "Hold WR",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            st.caption(
+                f"{total_peaked} slots where bid reached 0.75+  |  "
+                f"Lower threshold = fewer false exits  |  "
+                f"Lookback: {h}h"
+            )
+
+        st.markdown('<div style="height: 12px"></div>', unsafe_allow_html=True)
+
         # -- Bottom: hour + day patterns --
         by_hour = data.get("by_hour", [])
         by_day = data.get("by_day", [])
