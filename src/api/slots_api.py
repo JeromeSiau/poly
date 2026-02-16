@@ -109,18 +109,24 @@ async def slot_analytics(
     hours: float = Query(default=168.0, ge=1.0, le=2160.0, description="Lookback window in hours."),
     symbol: Optional[str] = Query(default=None, description="Filter by symbol (BTC, ETH, SOL, XRP)."),
     duration: Optional[str] = Query(default=None, description="Slot duration filter: 5m, 15m, or null for all."),
+    start_ts: Optional[int] = Query(default=None, description="Absolute start unix timestamp (overrides hours)."),
+    end_ts: Optional[int] = Query(default=None, description="Absolute end unix timestamp (overrides hours)."),
 ) -> dict:
     """Slot analytics for ML dashboard: heatmap, calibration, per-symbol stats."""
     factory = _get_factory()
     if factory is None:
         return {"error": "DATABASE_URL not configured"}
 
-    cutoff = int(time.time() - hours * 3600)
+    cutoff = start_ts if start_ts is not None else int(time.time() - hours * 3600)
+    end_clause_sr = "AND sr.slot_ts <= :end_ts" if end_ts is not None else ""
+    end_clause_ss = "AND ss.slot_ts <= :end_ts" if end_ts is not None else ""
     sym_clause = "AND sr.symbol = :symbol" if symbol else ""
     sym_clause_ss = "AND ss.symbol = :symbol" if symbol else ""
     dur_clause_sr = _duration_clause("sr", duration)
     dur_clause_ss = _duration_clause("ss", duration)
     params: dict = {"cutoff": cutoff, **_duration_params(duration)}
+    if end_ts is not None:
+        params["end_ts"] = end_ts
     if symbol:
         params["symbol"] = symbol.upper()
 
@@ -136,7 +142,7 @@ async def slot_analytics(
                        SUM(resolved_up IS NULL) unresolved,
                        MIN(slot_ts) first_ts, MAX(slot_ts) last_ts
                 FROM slot_resolutions sr
-                WHERE slot_ts > :cutoff {sym_clause} {dur_clause_sr}
+                WHERE slot_ts > :cutoff {end_clause_sr} {sym_clause} {dur_clause_sr}
             """), params)).mappings().first()
 
             total = int(row["total"] or 0)
@@ -151,7 +157,7 @@ async def slot_analytics(
             # --- Snapshot count ---
             snap = (await session.execute(text(f"""
                 SELECT COUNT(*) cnt FROM slot_snapshots ss
-                WHERE slot_ts > :cutoff {sym_clause_ss} {dur_clause_ss}
+                WHERE slot_ts > :cutoff {end_clause_ss} {sym_clause_ss} {dur_clause_ss}
             """), params)).mappings().first()
 
             # --- By symbol ---
@@ -159,7 +165,7 @@ async def slot_analytics(
                 SELECT symbol, COUNT(*) total,
                        SUM(resolved_up = 1) wins
                 FROM slot_resolutions sr
-                WHERE slot_ts > :cutoff AND resolved_up IS NOT NULL {sym_clause} {dur_clause_sr}
+                WHERE slot_ts > :cutoff {end_clause_sr} AND resolved_up IS NOT NULL {sym_clause} {dur_clause_sr}
                 GROUP BY symbol ORDER BY symbol
             """), params)).mappings().all()
 
@@ -182,7 +188,7 @@ async def slot_analytics(
                     ON ss.symbol = sr.symbol AND ss.slot_ts = sr.slot_ts
                     AND ss.slot_duration = sr.slot_duration
                 WHERE sr.resolved_up IS NOT NULL
-                    AND ss.slot_ts > :cutoff
+                    AND ss.slot_ts > :cutoff {end_clause_ss}
                     AND ss.minutes_into_slot <= :max_minutes
                     AND ss.dir_move_pct IS NOT NULL
                     {sym_clause} {dur_clause_sr}
@@ -204,7 +210,7 @@ async def slot_analytics(
                     AND ss.bid_up IS NOT NULL
                     AND ss.bid_up BETWEEN 0.10 AND 0.95
                     AND ss.minutes_into_slot BETWEEN :cal_min AND :cal_max
-                    AND ss.slot_ts > :cutoff
+                    AND ss.slot_ts > :cutoff {end_clause_ss}
                     {sym_clause} {dur_clause_sr}
                 GROUP BY bid_bucket HAVING total >= 3
                 ORDER BY bid_bucket
@@ -217,7 +223,7 @@ async def slot_analytics(
                     COUNT(*) total,
                     SUM(resolved_up = 1) wins
                 FROM slot_resolutions sr
-                WHERE resolved_up IS NOT NULL AND slot_ts > :cutoff {sym_clause} {dur_clause_sr}
+                WHERE resolved_up IS NOT NULL AND slot_ts > :cutoff {end_clause_sr} {sym_clause} {dur_clause_sr}
                 GROUP BY hour_utc ORDER BY hour_utc
             """), params)).mappings().all()
 
@@ -228,7 +234,7 @@ async def slot_analytics(
                     COUNT(*) total,
                     SUM(resolved_up = 1) wins
                 FROM slot_resolutions sr
-                WHERE resolved_up IS NOT NULL AND slot_ts > :cutoff {sym_clause} {dur_clause_sr}
+                WHERE resolved_up IS NOT NULL AND slot_ts > :cutoff {end_clause_sr} {sym_clause} {dur_clause_sr}
                 GROUP BY day_of_week ORDER BY day_of_week
             """), params)).mappings().all()
 
@@ -279,18 +285,24 @@ async def slot_stoploss(
     symbol: Optional[str] = Query(default=None, description="Filter by symbol."),
     peak: float = Query(default=0.75, ge=0.50, le=0.95, description="Min bid_up peak to consider."),
     duration: Optional[str] = Query(default=None, description="Slot duration filter: 5m, 15m, or null for all."),
+    start_ts: Optional[int] = Query(default=None, description="Absolute start unix timestamp (overrides hours)."),
+    end_ts: Optional[int] = Query(default=None, description="Absolute end unix timestamp (overrides hours)."),
 ) -> dict:
     """Stop-loss threshold sweep: WR by dip depth after bid reaches peak."""
     factory = _get_factory()
     if factory is None:
         return {"error": "DATABASE_URL not configured"}
 
-    cutoff = int(time.time() - hours * 3600)
+    cutoff = start_ts if start_ts is not None else int(time.time() - hours * 3600)
+    end_clause_ss = "AND ss.slot_ts <= :end_ts" if end_ts is not None else ""
+    end_clause_sr = "AND sr.slot_ts <= :end_ts" if end_ts is not None else ""
     sym_clause = "AND peaked.symbol = :symbol" if symbol else ""
     dur_clause_ss = _duration_clause("ss", duration)
     dur_clause_sr = _duration_clause("sr", duration)
     max_minutes = 5.0 if duration == "5m" else 13.0
     params: dict = {"cutoff": cutoff, "peak": peak, **_duration_params(duration)}
+    if end_ts is not None:
+        params["end_ts"] = end_ts
     if symbol:
         params["symbol"] = symbol.upper()
 
@@ -312,7 +324,7 @@ async def slot_stoploss(
                     FROM slot_snapshots ss
                     WHERE ss.bid_up >= :peak
                         AND ss.minutes_into_slot <= :max_minutes
-                        AND ss.slot_ts > :cutoff
+                        AND ss.slot_ts > :cutoff {end_clause_ss}
                         {dur_clause_ss}
                     GROUP BY ss.symbol, ss.slot_ts, ss.slot_duration
                 ),
@@ -329,7 +341,7 @@ async def slot_stoploss(
                         AND ss.slot_duration = sr.slot_duration
                         AND ss.minutes_into_slot <= :max_minutes
                     WHERE sr.resolved_up IS NOT NULL
-                        AND sr.slot_ts > :cutoff
+                        AND sr.slot_ts > :cutoff {end_clause_sr}
                         AND ss.bid_up IS NOT NULL
                         {dur_clause_sr}
                     GROUP BY sr.symbol, sr.slot_ts, sr.resolved_up

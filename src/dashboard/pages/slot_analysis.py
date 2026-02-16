@@ -1,13 +1,13 @@
 """Slot analysis page — ML mode."""
 
 import time as _time
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from src.dashboard._shared import (
-    LOOKBACK_MAP,
     C_ACCENT,
     C_GREEN,
     C_GRID,
@@ -24,10 +24,18 @@ _MOVE_ORDER = ["< -0.2", "-0.2/-0.1", "-0.1/0", "0/0.1", "0.1/0.2", "> 0.2"]
 _DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
+_PERIOD_PRESETS = {
+    "7d": 7,
+    "14d": 14,
+    "30d": 30,
+    "All": None,
+    "Custom": -1,
+}
+
+
 @st.fragment(run_every="60s")
 def slot_ml_content():
-    h = max(LOOKBACK_MAP[st.session_state.get("lookback", "24h")], 168)
-
+    # -- Filters row 1: duration + symbol --
     filter_left, filter_right = st.columns(2)
     with filter_left:
         dur_choice = st.radio(
@@ -35,17 +43,53 @@ def slot_ml_content():
             horizontal=True, key="slot_duration",
         )
     with filter_right:
-        # 5m markets only exist for BTC
         sym_options = ["All", "BTC", "ETH", "SOL", "XRP"] if dur_choice != "5m" else ["BTC"]
         sym_choice = st.radio(
             "Symbol", sym_options,
             horizontal=True, key="slot_symbol",
         )
 
+    # -- Filters row 2: period --
+    period_col, date_col = st.columns([1, 2])
+    with period_col:
+        period_choice = st.radio(
+            "Period", list(_PERIOD_PRESETS.keys()),
+            horizontal=True, key="slot_period",
+        )
+    preset_days = _PERIOD_PRESETS[period_choice]
+
+    start_ts = None
+    end_ts = None
+    h = 2160  # max fallback
+
+    if preset_days == -1:
+        # Custom date range
+        with date_col:
+            today = date.today()
+            dates = st.date_input(
+                "Date range",
+                value=(today - timedelta(days=14), today),
+                max_value=today,
+                key="slot_dates",
+            )
+            if isinstance(dates, (list, tuple)) and len(dates) == 2:
+                d_start, d_end = dates
+                start_ts = int(datetime.combine(d_start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+                end_ts = int(datetime.combine(d_end, datetime.max.time(), tzinfo=timezone.utc).timestamp())
+    elif preset_days is not None:
+        h = preset_days * 24
+    else:
+        # "All" — use max lookback
+        h = 2160
+
     duration = dur_choice if dur_choice != "All" else None
     timing_order = _TIMING_5M if duration == "5m" else _TIMING_15M
 
     params: dict = {"hours": h}
+    if start_ts is not None:
+        params["start_ts"] = start_ts
+    if end_ts is not None:
+        params["end_ts"] = end_ts
     if sym_choice != "All":
         params["symbol"] = sym_choice
     if duration:
@@ -224,6 +268,10 @@ def slot_ml_content():
 
     # -- Stop-loss analysis --
     sl_params: dict = {"hours": h, "peak": 0.75}
+    if start_ts is not None:
+        sl_params["start_ts"] = start_ts
+    if end_ts is not None:
+        sl_params["end_ts"] = end_ts
     if sym_choice != "All":
         sl_params["symbol"] = sym_choice
     if duration:
@@ -325,8 +373,7 @@ def slot_ml_content():
             )
         st.caption(
             f"{total_peaked} slots peaked 0.75+ ({sl_items[0]['wins']}W / {sl_items[0]['losses']}L)  |  "
-            f"Precision = true saves / triggered  |  "
-            f"Lookback: {h}h"
+            f"Precision = true saves / triggered"
         )
 
     st.markdown('<div style="height: 12px"></div>', unsafe_allow_html=True)
@@ -404,10 +451,16 @@ def slot_ml_content():
         total_wins = sum(s["wins"] for s in by_symbol)
         total_res = sum(s["total"] for s in by_symbol)
         overall_wr = round(total_wins / total_res * 100, 1) if total_res else 0
+        if start_ts is not None and end_ts is not None:
+            period_label = f"{dates[0].strftime('%b %d')} - {dates[1].strftime('%b %d')}"
+        elif preset_days is not None and preset_days > 0:
+            period_label = f"{preset_days}d"
+        else:
+            period_label = "all"
         st.caption(
             f"{total_res} resolved slots  |  "
             f"Overall WR: {overall_wr}%  |  "
-            f"Lookback: {h}h  |  "
+            f"Period: {period_label}  |  "
             f"Auto-refresh 60s"
         )
 
