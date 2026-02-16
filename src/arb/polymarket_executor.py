@@ -151,10 +151,12 @@ class PolymarketExecutor:
         resolved_type = self._resolve_order_type(
             order_type if order_type else settings.POLYMARKET_ORDER_TYPE
         )
+        # post_only is only valid for GTC/GTD — never for FOK/IOC.
+        use_post_only = settings.POLYMARKET_POST_ONLY and resolved_type in ("GTC", "GTD")
         response = self._client.post_order(
             order,
             orderType=resolved_type,
-            post_only=settings.POLYMARKET_POST_ONLY,
+            post_only=use_post_only,
         )
 
         logger.info(
