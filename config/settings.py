@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     # === Database ===
     DATABASE_URL: str = "sqlite+aiosqlite:///data/arb.db"
 
+    # === Production Database (for dump script) ===
+    PROD_SSH_HOST: str = ""        # e.g. "ploi@94.130.218.197"
+    PROD_DB_HOST: str = "localhost" # MySQL host on prod server
+    PROD_DB_NAME: str = ""
+    PROD_DB_USER: str = ""
+    PROD_DB_PASS: str = ""
+
     # === Azuro (Cross-Market) ===
     AZURO_SUBGRAPH_URL: str = "https://thegraph.azuro.org/subgraphs/name/azuro-protocol/azuro-api-polygon-v3"
     AZURO_POLYGON_RPC: str = ""
