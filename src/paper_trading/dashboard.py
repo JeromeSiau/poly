@@ -295,11 +295,44 @@ hr {
     background: #34d399;
     border-radius: 50%;
     animation: pulse-dot 2s ease-in-out infinite;
-    margin-left: auto;
 }
 @keyframes pulse-dot {
     0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52,211,153,0.4); }
     50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(52,211,153,0); }
+}
+
+/* Nav mode links — style st.radio as inline links */
+div[data-testid="stHorizontalBlock"]:has(> div .nav-radio) {
+    margin-left: auto;
+}
+.nav-radio [role="radiogroup"] {
+    gap: 0 !important;
+    flex-direction: row !important;
+}
+.nav-radio [role="radiogroup"] label {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.75rem !important;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #64748b !important;
+    padding: 4px 16px !important;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    background: transparent !important;
+}
+.nav-radio [role="radiogroup"] label[data-checked="true"],
+.nav-radio [role="radiogroup"] label:has(input:checked) {
+    color: #38bdf8 !important;
+    border-bottom-color: #38bdf8;
+}
+.nav-radio [role="radiogroup"] label p {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.75rem !important;
+    color: inherit !important;
+}
+/* Hide the radio circle */
+.nav-radio [role="radiogroup"] label > div:first-child {
+    display: none !important;
 }
 
 /* Trade row highlight on hover */
@@ -319,44 +352,53 @@ hr {
 # Header & Sidebar
 # ---------------------------------------------------------------------------
 
-mode = st.sidebar.radio("Mode", ["Live", "Paper"], index=0, key="mode")
 lookback_label = st.sidebar.selectbox(
     "Lookback", list(LOOKBACK_MAP.keys()), index=3, key="lookback"
 )
 hours = LOOKBACK_MAP[lookback_label]
 tags_data = _api("/tags", {"hours": hours})
 available_tags = sorted(tags_data.get("strategy_tags", {}).keys())
-st.sidebar.multiselect("Strategies", available_tags, key="strategies")
 
-mode_lower = st.session_state.get("mode", "Live").lower()
-live_dot = '<div class="live-dot"></div>' if mode_lower == "live" else ""
-st.markdown(
-    f'<div class="dash-header">'
-    f'<span class="logo">POLY</span>'
-    f'<span class="title">Portfolio Dashboard</span>'
-    f'{live_dot}'
-    f'</div>',
-    unsafe_allow_html=True,
-)
+nav_mode = st.session_state.get("nav_mode", "Live")
+mode_lower = "live" if nav_mode == "Live" else ("paper" if nav_mode == "Paper" else "live")
+
+if nav_mode != "ML":
+    st.sidebar.multiselect("Strategies", available_tags, key="strategies")
+
+# Header with nav links
+hdr_left, hdr_right = st.columns([3, 2])
+with hdr_left:
+    live_dot = '<div class="live-dot"></div>' if nav_mode == "Live" else ""
+    st.markdown(
+        f'<div class="dash-header">'
+        f'<span class="logo">POLY</span>'
+        f'<span class="title">Portfolio Dashboard</span>'
+        f'{live_dot}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+with hdr_right:
+    st.markdown('<div class="nav-radio">', unsafe_allow_html=True)
+    st.radio("nav", ["Live", "ML", "Paper"], key="nav_mode", horizontal=True, label_visibility="collapsed")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TABS
+# CONTENT
 # ═══════════════════════════════════════════════════════════════════════════
 
-tab_live, tab_analysis, tab_slot = st.tabs(["Live", "Strategy Analysis", "Slot ML"])
+if nav_mode in ("Live", "Paper"):
+    tab_live, tab_analysis = st.tabs(["Live", "Strategy Analysis"])
+else:
+    tab_live = tab_analysis = None
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 1: LIVE
-# ═══════════════════════════════════════════════════════════════════════════
-
-with tab_live:
+if tab_live is not None:
+  with tab_live:
 
     # -- KPIs --
     @st.fragment(run_every="15s")
     def kpi_section():
-        m = st.session_state.get("mode", "Live").lower()
+        m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
 
         balance_data = _api("/balance", {"mode": m})
@@ -387,7 +429,7 @@ with tab_live:
     # -- Cumulative PnL --
     @st.fragment(run_every="15s")
     def pnl_chart_section():
-        m = st.session_state.get("mode", "Live").lower()
+        m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
 
         st.markdown('<p class="section-label">Cumulative PnL</p>', unsafe_allow_html=True)
@@ -437,7 +479,7 @@ with tab_live:
     # -- Hourly PnL --
     @st.fragment(run_every="15s")
     def hourly_pnl_section():
-        m = st.session_state.get("mode", "Live").lower()
+        m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
 
         st.markdown('<p class="section-label">PnL by Hour</p>', unsafe_allow_html=True)
@@ -486,7 +528,7 @@ with tab_live:
     # -- Open Positions --
     @st.fragment(run_every="15s")
     def open_positions_section():
-        m = st.session_state.get("mode", "Live").lower()
+        m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
 
         st.markdown('<p class="section-label">Open Positions</p>', unsafe_allow_html=True)
 
@@ -517,7 +559,7 @@ with tab_live:
     # -- Recent Trades --
     @st.fragment(run_every="15s")
     def recent_trades_section():
-        m = st.session_state.get("mode", "Live").lower()
+        m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
 
         st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
@@ -601,11 +643,12 @@ with tab_live:
 # TAB 2: STRATEGY ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════════
 
-with tab_analysis:
+if tab_analysis is not None:
+  with tab_analysis:
 
     @st.fragment(run_every="30s")
     def analysis_tab_content():
-        m = st.session_state.get("mode", "Live").lower()
+        m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
         selected_tags = st.session_state.get("strategies", [])
 
@@ -852,14 +895,14 @@ with tab_analysis:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 3: SLOT ML
+# ML MODE
 # ═══════════════════════════════════════════════════════════════════════════
 
 _TIMING_ORDER = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12"]
 _MOVE_ORDER = ["< -0.2", "-0.2/-0.1", "-0.1/0", "0/0.1", "0.1/0.2", "> 0.2"]
 _DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-with tab_slot:
+if nav_mode == "ML":
 
     @st.fragment(run_every="60s")
     def slot_ml_content():
