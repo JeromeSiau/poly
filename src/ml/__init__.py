@@ -1,6 +1,5 @@
-"""Machine Learning module for esports prediction.
+"""ML module for TD maker entry/exit models.
 
-This module provides tools for collecting historical match data,
-training models to predict match outcomes, and replacing hardcoded
-event weights with learned parameters.
+Provides shared feature engineering, data loading, evaluation, and model
+utilities used by training scripts and the scenario tester.
 """

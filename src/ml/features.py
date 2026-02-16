@@ -1,120 +1,144 @@
-# src/ml/features.py
-"""Feature extraction for ML impact prediction.
+"""Feature engineering for TD maker ML models."""
 
-Converts raw event data into feature vectors for XGBoost.
-Features are team-agnostic to prevent overfitting to team names.
-"""
+from __future__ import annotations
 
 import pandas as pd
 
-from src.ml.data_collector import EventData
-
-
-# Event types to one-hot encode (per game)
-LOL_EVENT_TYPES = [
-    "kill",
-    "tower_destroyed",
-    "dragon_kill",
-    "baron_kill",
-    "elder_kill",
-    "inhibitor_destroyed",
-    "ace",
+# ---------------------------------------------------------------------------
+# Feature columns (order matters — saved models depend on column order)
+# ---------------------------------------------------------------------------
+FEATURE_COLS = [
+    # Book prices
+    "bid_up", "ask_up", "bid_down", "ask_down",
+    # Spreads
+    "spread_up", "spread_down",
+    # Book sizes
+    "bid_size_up", "ask_size_up", "bid_size_down", "ask_size_down",
+    # Chainlink move
+    "dir_move_pct", "abs_move_pct",
+    # Timing
+    "minutes_into_slot",
+    "hour_utc", "day_of_week",
+    # Derived
+    "spread_ratio",
+    "bid_imbalance",
+    "fav_bid",
+    "move_velocity",
+    "book_pressure",
+    # Trend (computed from consecutive snapshots within a slot)
+    "bid_trend_30s",
+    "bid_trend_2m",
+    "ask_trend_30s",
+    "spread_trend",
 ]
 
-CSGO_EVENT_TYPES = [
-    "kill",
-    "round_end",
-    "bomb_planted",
-    "bomb_defused",
-    "ace",
-    "clutch",
-]
-
-DOTA2_EVENT_TYPES = [
-    "kill",
-    "tower_destroyed",
-    "roshan_kill",
-    "barracks_destroyed",
-    "aegis_pickup",
-    "team_wipe",
+EXIT_FEATURE_COLS = [
+    *FEATURE_COLS,
+    # Exit-specific: position context
+    "entry_price",
+    "bid_max",           # highest bid since fill
+    "bid_drop",          # bid_max - current bid
+    "bid_drop_pct",      # bid_drop / bid_max
+    "minutes_remaining",
+    "minutes_held",
+    "pnl_unrealized",    # bid_up - entry_price (per share)
 ]
 
 
-class FeatureExtractor:
-    """Extracts ML features from game events."""
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived features to raw snapshot data."""
+    df = df.copy()
 
-    def __init__(self, game: str):
-        """Initialize extractor for a specific game."""
-        self.game = game.lower()
+    # spread_ratio: how skewed are spreads between Up and Down
+    df["spread_ratio"] = df["spread_up"] / df["spread_down"].clip(lower=0.001)
 
-        if self.game == "lol":
-            self.event_types = LOL_EVENT_TYPES
-        elif self.game == "csgo":
-            self.event_types = CSGO_EVENT_TYPES
-        elif self.game == "dota2":
-            self.event_types = DOTA2_EVENT_TYPES
-        else:
-            self.event_types = LOL_EVENT_TYPES
+    # bid_imbalance: which side the market favours
+    df["bid_imbalance"] = df["bid_up"] - df["bid_down"]
 
-    def extract_single(self, event: EventData) -> dict:
-        """Extract features from a single event."""
-        features = {}
+    # fav_bid: highest bid (the favourite side's price)
+    df["fav_bid"] = df[["bid_up", "bid_down"]].max(axis=1)
 
-        # Time features
-        features["game_time_minutes"] = event.game_time_minutes
+    # move_velocity: how fast price moved per minute
+    df["move_velocity"] = df["dir_move_pct"] / df["minutes_into_slot"].clip(lower=0.5)
 
-        # Normalized state features
-        if event.game_time_minutes > 0:
-            features["gold_diff_normalized"] = event.gold_diff / event.game_time_minutes
-            features["kill_diff_normalized"] = event.kill_diff / event.game_time_minutes
-        else:
-            features["gold_diff_normalized"] = 0.0
-            features["kill_diff_normalized"] = 0.0
+    # book_pressure: relative size advantage of Up vs Down bids
+    total_bid_sz = (df["bid_size_up"] + df["bid_size_down"]).clip(lower=0.01)
+    df["book_pressure"] = (df["bid_size_up"] - df["bid_size_down"]) / total_bid_sz
 
-        # Raw diff features
-        features["gold_diff"] = event.gold_diff
-        features["kill_diff"] = event.kill_diff
-        features["tower_diff"] = event.tower_diff
-        features["dragon_diff"] = event.dragon_diff
-        features["baron_diff"] = event.baron_diff
-
-        # Derived features
-        features["is_ahead"] = 1 if event.gold_diff > 0 else 0
-        features["is_late_game"] = 1 if event.game_time_minutes > 25 else 0
-
-        # One-hot encode event type
-        for et in self.event_types:
-            features[f"event_{et}"] = 1 if event.event_type == et else 0
-
-        # Label
-        features["label"] = 1 if event.team == event.winner else 0
-
-        return features
-
-    def extract_batch(self, events: list[EventData]) -> pd.DataFrame:
-        """Extract features from multiple events."""
-        rows = [self.extract_single(e) for e in events]
-        return pd.DataFrame(rows)
-
-    def get_feature_columns(self) -> list[str]:
-        """Get list of feature column names (excluding label)."""
-        dummy = EventData(
-            event_type="kill",
-            timestamp=0,
-            team="A",
-            game_time_minutes=1.0,
-            gold_diff=0,
-            kill_diff=0,
-            tower_diff=0,
-            dragon_diff=0,
-            baron_diff=0,
-            winner="A",
-        )
-        features = self.extract_single(dummy)
-        return [k for k in features.keys() if k != "label"]
+    return df
 
 
-def extract_features_from_events(events: list[EventData], game: str) -> pd.DataFrame:
-    """Convenience function to extract features."""
-    extractor = FeatureExtractor(game)
-    return extractor.extract_batch(events)
+def compute_trend_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute trend features from consecutive snapshots within each slot.
+
+    Snapshots are captured every ~30s.  For each snapshot we look back to
+    find the nearest measurement ~30s and ~120s ago (within the same slot)
+    and compute deltas for bid_up, ask_up, and spread_up.
+    """
+    df = df.copy()
+    df.sort_values(["symbol", "slot_ts", "captured_at"], inplace=True)
+
+    group = df.groupby(["symbol", "slot_ts"])
+
+    # shift(1) = previous snapshot (~30s ago), shift(4) = ~2min ago.
+    df["bid_trend_30s"] = df["bid_up"] - group["bid_up"].shift(1)
+    df["bid_trend_2m"] = df["bid_up"] - group["bid_up"].shift(4)
+    df["ask_trend_30s"] = df["ask_up"] - group["ask_up"].shift(1)
+    df["spread_trend"] = df["spread_up"] - group["spread_up"].shift(2)
+
+    return df
+
+
+def compute_exit_features(df: pd.DataFrame, entry_price: float = 0.75) -> pd.DataFrame:
+    """Compute position-specific features for exit model.
+
+    For each slot, identifies the simulated fill point (first snapshot
+    where bid_up >= entry_price) and computes running features for all
+    subsequent snapshots.
+    """
+    df = df.copy()
+    df.sort_values(["symbol", "slot_ts", "captured_at"], inplace=True)
+
+    results = []
+    for (sym, slot_ts), group in df.groupby(["symbol", "slot_ts"]):
+        rows = group.reset_index(drop=True)
+        resolved_up = rows["resolved_up"].iloc[0]
+
+        # Find fill point: first snapshot where bid_up >= entry_price.
+        fill_idx = None
+        for i, row in rows.iterrows():
+            if row["bid_up"] >= entry_price:
+                fill_idx = i
+                break
+
+        if fill_idx is None:
+            continue  # no fill in this slot
+
+        fill_price = rows.loc[fill_idx, "bid_up"]
+        fill_minutes = rows.loc[fill_idx, "minutes_into_slot"]
+
+        # Take all snapshots after fill (including fill itself for context).
+        post_fill = rows.loc[fill_idx:].copy()
+        if len(post_fill) < 2:
+            continue
+
+        # Running bid_max since fill.
+        post_fill["bid_max"] = post_fill["bid_up"].cummax()
+        post_fill["entry_price"] = fill_price
+        post_fill["bid_drop"] = post_fill["bid_max"] - post_fill["bid_up"]
+        post_fill["bid_drop_pct"] = post_fill["bid_drop"] / post_fill["bid_max"].clip(lower=0.01)
+        post_fill["minutes_remaining"] = 15.0 - post_fill["minutes_into_slot"]
+        post_fill["minutes_held"] = post_fill["minutes_into_slot"] - fill_minutes
+        post_fill["pnl_unrealized"] = post_fill["bid_up"] - fill_price
+
+        # Skip the fill snapshot itself (no exit decision at fill time).
+        post_fill = post_fill.iloc[1:]
+        if len(post_fill) == 0:
+            continue
+
+        results.append(post_fill)
+
+    if not results:
+        return pd.DataFrame()
+
+    return pd.concat(results, ignore_index=True)

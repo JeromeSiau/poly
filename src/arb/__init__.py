@@ -1,7 +1,6 @@
 # src/arb/__init__.py
 """Arbitrage Engines - Core trading logic."""
 
-from .reality_arb import RealityArbEngine, ArbOpportunity
 from .polymarket_executor import PolymarketExecutor
 from .cross_market_arb import CrossMarketArbEngine, CrossMarketOpportunity, EvaluationResult
 from .crypto_arb import CryptoArbEngine, CryptoArbOpportunity
@@ -13,8 +12,6 @@ from .fear_spike_detector import FearSpikeDetector, FearSpike
 from .fear_engine import FearSellingEngine, FearTradeSignal
 
 __all__ = [
-    "RealityArbEngine",
-    "ArbOpportunity",
     "PolymarketExecutor",
     "CrossMarketArbEngine",
     "CrossMarketOpportunity",

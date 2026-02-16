@@ -87,7 +87,7 @@ def build_dump_cmd(tables: list[str] | None) -> list[str]:
     # Use MYSQL_PWD env var on the remote side to hide password from `ps`
     mysqldump = (
         f"MYSQL_PWD='{settings.PROD_DB_PASS}'"
-        f" mysqldump --single-transaction --skip-lock-tables"
+        f" mysqldump --skip-lock-tables --no-tablespaces --set-gtid-purged=OFF"
         f" -h {settings.PROD_DB_HOST}"
         f" -u {settings.PROD_DB_USER}"
         f" {settings.PROD_DB_NAME}"

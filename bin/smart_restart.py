@@ -64,7 +64,7 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("src/api/rn1_compare",         ["run_rn1_compare_api"]),
     ("src/dashboard/",              ["run_dashboard", "streamlit"]),
     ("src/paper_trading/",          ["run_auto_redeem"]),
-    ("src/ml/",                     ["run_dashboard", "streamlit"]),
+    ("src/ml/",                     ["run_crypto_td_maker"]),
 
     # ── Scripts (entry points) ──────────────────────────────────────────
     ("scripts/run_fear_selling.py",      ["run_fear_selling"]),

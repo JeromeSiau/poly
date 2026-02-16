@@ -16,48 +16,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import glob
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 
-# Import feature engineering from training script
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_td_model import (
-    FEATURE_COLS,
-    compute_trend_features,
-    deduplicate_per_slot,
-    engineer_features,
-    load_data,
-    temporal_split,
-)
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-def find_latest_model(model_dir: str = "data/models") -> str:
-    """Return path to the most recent td_model_*.joblib file."""
-    pattern = str(Path(model_dir) / "td_model_*.joblib")
-    files = sorted(glob.glob(pattern))
-    if not files:
-        print(f"No model files found matching {pattern}")
-        sys.exit(1)
-    return files[-1]
-
-
-def load_model(path: str) -> dict:
-    """Load model payload from joblib."""
-    payload = joblib.load(path)
-    required_keys = {"model", "feature_cols"}
-    if not required_keys.issubset(payload.keys()):
-        print(f"Model file missing keys: {required_keys - payload.keys()}")
-        sys.exit(1)
-    return payload
+from src.ml.data import deduplicate_per_slot, load_snapshots, temporal_split
+from src.ml.features import FEATURE_COLS, engineer_features
+from src.ml.model import find_latest_model, load_model
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +139,7 @@ async def run(args: argparse.Namespace) -> None:
         print(f"  Trained:   {payload['trained_at']}")
 
     # Load data
-    df = await load_data(args.db_url)
+    df = await load_snapshots(args.db_url)
 
     if df.empty:
         print("\nNo resolved slot data found. Check your database connection.")
