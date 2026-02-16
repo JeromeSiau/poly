@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     --max-entry-minutes) MAX_ENTRY_MINUTES="$2"; shift 2 ;;
     --stoploss-peak)  STOPLOSS_PEAK="$2"; shift 2 ;;
     --stoploss-exit)  STOPLOSS_EXIT="$2"; shift 2 ;;
-    *)                shift ;;
+    *)                echo "WARNING: unknown arg '$1' — ignored" >&2; shift ;;
   esac
 done
 
