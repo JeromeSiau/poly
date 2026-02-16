@@ -175,6 +175,7 @@ class CryptoTDMaker:
         self.max_entry_minutes = max_entry_minutes
         self.stoploss_peak = stoploss_peak
         self.stoploss_exit = stoploss_exit
+        self.stoploss_fair_margin: float = 0.10  # override margin above stoploss_exit
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -623,7 +624,7 @@ class CryptoTDMaker:
                         and last_bid <= self.stoploss_exit
                         and prev_max >= self.stoploss_peak):
                     fair = self._estimate_fair_value(cid, pos.outcome, now)
-                    if fair is not None and fair > self.stoploss_exit + 0.10:
+                    if fair is not None and fair > self.stoploss_exit + self.stoploss_fair_margin:
                         logger.info("stoploss_chainlink_override_empty_book",
                                     cid=cid[:16], last_bid=last_bid,
                                     fair=round(fair, 3))
@@ -656,7 +657,7 @@ class CryptoTDMaker:
             if prev_max >= self.stoploss_peak and bid <= self.stoploss_exit:
                 # Fair value override: skip if Chainlink says position is still good.
                 fair = self._estimate_fair_value(cid, pos.outcome, now)
-                if fair is not None and fair > self.stoploss_exit + 0.10:
+                if fair is not None and fair > self.stoploss_exit + self.stoploss_fair_margin:
                     logger.info("stoploss_chainlink_override",
                                 cid=cid[:16], bid=bid, fair=round(fair, 3),
                                 exit_threshold=self.stoploss_exit)

@@ -654,3 +654,30 @@ class TestStopLossFairValue:
 
         # Should trigger normally without fair value override
         assert CID not in maker.positions
+
+    @pytest.mark.asyncio
+    async def test_stoploss_empty_book_skipped_when_fair_value_high(self):
+        """Empty book with last_bid below exit, but Chainlink says hold."""
+        # bid=None simulates an empty orderbook
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.34, ask=0.36)
+        feed._best_cache[TOK_UP] = (None, 0, None, 0)  # empty book
+        mock_chainlink = Mock()
+        mock_chainlink.get_price.return_value = 70000.0  # BTC up from ref
+        maker = _make_maker(feed, stoploss_peak=0.75, stoploss_exit=0.35,
+                            chainlink_feed=mock_chainlink)
+
+        now = time.time()
+        maker.positions[CID] = OpenPosition(
+            condition_id=CID, outcome="Up", token_id=TOK_UP,
+            entry_price=0.75, size_usd=10.0, shares=13.33, filled_at=now,
+        )
+        maker._position_bid_max[CID] = 0.80
+        maker._position_last_bid[CID] = 0.34  # below stoploss_exit
+        maker._ref_prices[CID] = 69500.0
+        maker._cid_chainlink_symbol[CID] = "btc/usd"
+        maker._cid_slot_ts[CID] = int(now - 600)
+
+        await maker._check_stop_losses(now)
+
+        # Override should fire — position kept
+        assert CID in maker.positions
