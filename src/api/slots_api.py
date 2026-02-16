@@ -239,19 +239,29 @@ async def slot_stoploss(
                     UNION SELECT 0.20 UNION SELECT 0.15 UNION SELECT 0.10
                     UNION SELECT 0.05
                 ),
+                peak_minute AS (
+                    SELECT ss.symbol, ss.slot_ts,
+                           MIN(ss.minutes_into_slot) AS first_peak_min
+                    FROM slot_snapshots ss
+                    WHERE ss.bid_up >= :peak
+                        AND ss.minutes_into_slot <= 13
+                        AND ss.slot_ts > :cutoff
+                    GROUP BY ss.symbol, ss.slot_ts
+                ),
                 peaked AS (
                     SELECT sr.symbol, sr.slot_ts, sr.resolved_up,
-                           MAX(ss.bid_up) AS max_bid,
-                           MIN(ss.bid_up) AS min_bid_after_peak
+                           MIN(CASE WHEN ss.minutes_into_slot >= pm.first_peak_min
+                                    THEN ss.bid_up END) AS min_bid_after_peak
                     FROM slot_resolutions sr
+                    JOIN peak_minute pm
+                        ON pm.symbol = sr.symbol AND pm.slot_ts = sr.slot_ts
                     JOIN slot_snapshots ss
                         ON ss.symbol = sr.symbol AND ss.slot_ts = sr.slot_ts
+                        AND ss.minutes_into_slot <= 13
                     WHERE sr.resolved_up IS NOT NULL
                         AND sr.slot_ts > :cutoff
                         AND ss.bid_up IS NOT NULL
-                        AND ss.minutes_into_slot BETWEEN 0 AND 13
                     GROUP BY sr.symbol, sr.slot_ts, sr.resolved_up
-                    HAVING MAX(ss.bid_up) >= :peak
                 )
                 SELECT
                     t.t AS threshold,

@@ -1131,6 +1131,10 @@ with tab_slot:
             sl_df = sl_df[sl_df["triggered"] > 0]
             if not sl_df.empty:
                 sl_df["threshold"] = sl_df["threshold"].apply(lambda x: f"{x:.2f}")
+                if "precision" not in sl_df.columns:
+                    sl_df["precision"] = sl_df.apply(
+                        lambda r: round(r["true_saves"] / r["triggered"] * 100, 1) if r["triggered"] else 0, axis=1
+                    )
                 sl_df["precision"] = sl_df["precision"].apply(lambda x: f"{x:.0f}%")
                 st.dataframe(
                     sl_df[["threshold", "triggered", "true_saves", "false_exits", "precision"]].rename(
