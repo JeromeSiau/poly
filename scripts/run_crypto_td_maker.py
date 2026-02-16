@@ -149,6 +149,7 @@ class CryptoTDMaker:
         hybrid_taker_above: float = 0.72,
         stoploss_peak: float = 0.0,
         stoploss_exit: float = 0.0,
+        stoploss_fair_margin: float = 0.10,
         entry_fair_margin: float = 0.0,
         exit_model_path: str = "",
         exit_threshold: float = 0.35,
@@ -176,7 +177,7 @@ class CryptoTDMaker:
         self.max_entry_minutes = max_entry_minutes
         self.stoploss_peak = stoploss_peak
         self.stoploss_exit = stoploss_exit
-        self.stoploss_fair_margin: float = 0.10  # override margin above stoploss_exit
+        self.stoploss_fair_margin = stoploss_fair_margin
         self.entry_fair_margin = entry_fair_margin
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
@@ -2068,8 +2069,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop-loss: sell when bid drops to this after peak (0=disabled)",
     )
     p.add_argument(
+        "--stoploss-fair-margin", type=float, default=0.10,
+        help="Override stop-loss when Chainlink fair value > exit + margin (default: 0.10)",
+    )
+    p.add_argument(
         "--entry-fair-margin", type=float, default=0.0,
-        help="Max overpay vs Chainlink fair value to enter (0=disabled, recommended: 0.25)",
+        help="Block entry when price > fair value + margin (0=disabled)",
     )
     p.add_argument(
         "--exit-model-path", type=str, default="",
@@ -2180,6 +2185,7 @@ async def main() -> None:
         hybrid_taker_above=args.hybrid_taker_above,
         stoploss_peak=args.stoploss_peak,
         stoploss_exit=args.stoploss_exit,
+        stoploss_fair_margin=args.stoploss_fair_margin,
         entry_fair_margin=args.entry_fair_margin,
         exit_model_path=args.exit_model_path,
         exit_threshold=args.exit_threshold,
@@ -2215,7 +2221,8 @@ async def main() -> None:
               f"maker {args.hybrid_skip_below}-{args.hybrid_taker_above} | "
               f"taker>{args.hybrid_taker_above}")
     if args.stoploss_peak > 0:
-        print(f"  Stop-loss:   peak>={args.stoploss_peak} & bid<={args.stoploss_exit} → sell FOK")
+        print(f"  Stop-loss:   peak>={args.stoploss_peak} & bid<={args.stoploss_exit} → sell FOK"
+              f" (fair override margin={args.stoploss_fair_margin})")
     if args.exit_model_path:
         print(f"  Exit model:  {args.exit_model_path}")
         print(f"  Exit thresh: P(win)<{args.exit_threshold} → sell FOK")

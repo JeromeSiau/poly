@@ -15,12 +15,13 @@ WALLET_USD=""
 ORDER_SIZE_OVERRIDE=""
 MAX_EXPOSURE_OVERRIDE=""
 LADDER_RUNGS="${LADDER_RUNGS:-1}"
-MIN_MOVE_PCT="${MIN_MOVE_PCT:-0}"
+MIN_MOVE_PCT="${MIN_MOVE_PCT:-0.20}"
 MAX_MOVE_PCT="${MAX_MOVE_PCT:-0}"
-MIN_ENTRY_MINUTES="${MIN_ENTRY_MINUTES:-0}"
+MIN_ENTRY_MINUTES="${MIN_ENTRY_MINUTES:-10}"
 MAX_ENTRY_MINUTES="${MAX_ENTRY_MINUTES:-0}"
-STOPLOSS_PEAK="${STOPLOSS_PEAK:-0}"
-STOPLOSS_EXIT="${STOPLOSS_EXIT:-0}"
+STOPLOSS_PEAK="${STOPLOSS_PEAK:-0.75}"
+STOPLOSS_EXIT="${STOPLOSS_EXIT:-0.35}"
+STOPLOSS_FAIR_MARGIN="${STOPLOSS_FAIR_MARGIN:-0.10}"
 ENTRY_FAIR_MARGIN="${ENTRY_FAIR_MARGIN:-0}"
 
 while [[ $# -gt 0 ]]; do
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --max-entry-minutes) MAX_ENTRY_MINUTES="$2"; shift 2 ;;
     --stoploss-peak)  STOPLOSS_PEAK="$2"; shift 2 ;;
     --stoploss-exit)  STOPLOSS_EXIT="$2"; shift 2 ;;
+    --stoploss-fair-margin) STOPLOSS_FAIR_MARGIN="$2"; shift 2 ;;
     --entry-fair-margin) ENTRY_FAIR_MARGIN="$2"; shift 2 ;;
     *)                echo "WARNING: unknown arg '$1' — ignored" >&2; shift ;;
   esac
@@ -79,6 +81,7 @@ exec "$PYTHON" "$BASE/scripts/run_crypto_td_maker.py" \
   --min-move-pct "$MIN_MOVE_PCT" --max-move-pct "$MAX_MOVE_PCT" \
   --min-entry-minutes "$MIN_ENTRY_MINUTES" --max-entry-minutes "$MAX_ENTRY_MINUTES" \
   --stoploss-peak "$STOPLOSS_PEAK" --stoploss-exit "$STOPLOSS_EXIT" \
+  --stoploss-fair-margin "$STOPLOSS_FAIR_MARGIN" \
   --entry-fair-margin "$ENTRY_FAIR_MARGIN" \
   "${SIZING_ARGS[@]}" \
   --discovery-interval "$DISCOVERY_INTERVAL" --maker-interval "$MAKER_INTERVAL" \
