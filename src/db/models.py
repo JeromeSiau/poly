@@ -367,13 +367,14 @@ class RiskState(Base):
 
 
 class SlotSnapshot(Base):
-    """Book + Chainlink snapshot captured every ~30s during each 15-min slot."""
+    """Book + Chainlink snapshot captured every ~30s during each active slot."""
 
     __tablename__ = "slot_snapshots"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     symbol = Column(String(10), nullable=False)
     slot_ts = Column(Integer, nullable=False)
+    slot_duration = Column(Integer, nullable=False, server_default="900")  # 300=5m, 900=15m
     captured_at = Column(Float, nullable=False)
     minutes_into_slot = Column(Float, nullable=False)
 
@@ -399,19 +400,20 @@ class SlotSnapshot(Base):
     day_of_week = Column(Integer)
 
     __table_args__ = (
-        Index("idx_snap_symbol_slot", "symbol", "slot_ts"),
+        Index("idx_snap_symbol_slot", "symbol", "slot_ts", "slot_duration"),
         Index("idx_snap_slot_ts", "slot_ts"),
     )
 
 
 class SlotResolution(Base):
-    """One row per slot per symbol, updated when resolution is known."""
+    """One row per slot per symbol per duration, updated when resolution is known."""
 
     __tablename__ = "slot_resolutions"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     symbol = Column(String(10), nullable=False)
     slot_ts = Column(Integer, nullable=False)
+    slot_duration = Column(Integer, nullable=False, server_default="900")  # 300=5m, 900=15m
     condition_id = Column(String(66), nullable=True)
 
     resolved_up = Column(Boolean, nullable=True)
@@ -419,5 +421,5 @@ class SlotResolution(Base):
     resolved_at = Column(Float, nullable=True)
 
     __table_args__ = (
-        Index("idx_res_symbol_slot", "symbol", "slot_ts", unique=True),
+        Index("idx_res_symbol_slot", "symbol", "slot_ts", "slot_duration", unique=True),
     )

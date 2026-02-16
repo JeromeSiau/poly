@@ -718,7 +718,7 @@ class CryptoTDMaker:
                 outcome=pos.outcome,
                 side="SELL",
                 price=max(sell_price - 0.01, 0.01),  # slightly below bid to ensure fill
-                size_usd=pos.shares * sell_price,
+                size_usd=pos.shares * (1.0 - max(sell_price - 0.01, 0.01)),
                 reason="stop_loss_exit",
                 title=slug,
                 timestamp=now,

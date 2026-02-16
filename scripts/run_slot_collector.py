@@ -1,11 +1,12 @@
-"""Passive slot data collector for crypto 15-min markets.
+"""Passive slot data collector for crypto binary markets (5m / 15m).
 
-Snapshots Polymarket book + Chainlink prices every ~30s for each active slot,
-then resolves outcome after the slot expires.  Data stored in MySQL for
-downstream ML training.
+Snapshots Polymarket book + Chainlink prices at regular intervals for each
+active slot, then resolves outcome after the slot expires.  Data stored in
+MySQL for downstream ML training.
 
 Usage:
     python scripts/run_slot_collector.py --symbols BTC,ETH,SOL,XRP
+    python scripts/run_slot_collector.py --symbols BTC --slot-duration 5m --snapshot-interval 15
 """
 
 from __future__ import annotations
@@ -61,6 +62,9 @@ def _slug_to_symbol(slug: str) -> Optional[str]:
     return None
 
 
+DURATION_MAP = {"5m": 300, "15m": 900}
+
+
 def _slug_to_slot_ts(slug: str) -> Optional[int]:
     """Extract slot timestamp from slug."""
     parts = slug.split("-")
@@ -82,10 +86,10 @@ def _slug_to_chainlink_sym(slug: str) -> Optional[str]:
 # ------------------------------------------------------------------
 
 class ActiveSlot:
-    """State for a single active 15-min slot."""
+    """State for a single active slot (5m or 15m)."""
 
     __slots__ = (
-        "symbol", "slot_ts", "condition_id", "chainlink_sym",
+        "symbol", "slot_ts", "slot_duration", "condition_id", "chainlink_sym",
         "ref_price", "outcomes", "token_ids",
     )
 
@@ -93,6 +97,7 @@ class ActiveSlot:
         self,
         symbol: str,
         slot_ts: int,
+        slot_duration: int,
         condition_id: str,
         chainlink_sym: str,
         ref_price: Optional[float],
@@ -101,6 +106,7 @@ class ActiveSlot:
     ) -> None:
         self.symbol = symbol
         self.slot_ts = slot_ts
+        self.slot_duration = slot_duration
         self.condition_id = condition_id
         self.chainlink_sym = chainlink_sym
         self.ref_price = ref_price
@@ -113,7 +119,7 @@ class ActiveSlot:
 # ------------------------------------------------------------------
 
 class SlotCollector:
-    """Passive data collector for crypto 15-min slots."""
+    """Passive data collector for crypto slots (5m or 15m)."""
 
     def __init__(
         self,
@@ -122,6 +128,7 @@ class SlotCollector:
         chainlink: ChainlinkFeed,
         symbols: list[str],
         db_url: str,
+        slot_duration: int = 900,
         discovery_interval: float = 60.0,
         snapshot_interval: float = 30.0,
         resolution_interval: float = 60.0,
@@ -129,6 +136,7 @@ class SlotCollector:
         self.polymarket = polymarket
         self.chainlink = chainlink
         self.symbols = symbols
+        self.slot_duration = slot_duration
         self.discovery_interval = discovery_interval
         self.snapshot_interval = snapshot_interval
         self.resolution_interval = resolution_interval
@@ -213,6 +221,7 @@ class SlotCollector:
         raw_markets = await fetch_crypto_markets(
             client=self._http_client,
             symbols=self.symbols,
+            slot_duration_sec=self.slot_duration,
         )
 
         new_count = 0
@@ -239,6 +248,7 @@ class SlotCollector:
             slot = ActiveSlot(
                 symbol=symbol,
                 slot_ts=slot_ts,
+                slot_duration=self.slot_duration,
                 condition_id=cid,
                 chainlink_sym=chainlink_sym,
                 ref_price=ref_price,
@@ -260,6 +270,7 @@ class SlotCollector:
             self._enqueue(SlotResolution(
                 symbol=symbol,
                 slot_ts=slot_ts,
+                slot_duration=self.slot_duration,
                 condition_id=cid,
                 prev_resolved_up=prev,
             ))
@@ -278,11 +289,12 @@ class SlotCollector:
                 active=len(self._active_slots),
             )
 
-        # Prune expired slots (> 20 min old)
+        # Prune expired slots (slot duration + 5 min grace)
         now = time.time()
+        prune_after = self.slot_duration + 5 * 60
         expired = [
             cid for cid, s in self._active_slots.items()
-            if now - s.slot_ts > 20 * 60
+            if now - s.slot_ts > prune_after
         ]
         for cid in expired:
             del self._active_slots[cid]
@@ -303,9 +315,11 @@ class SlotCollector:
         now = time.time()
         dt = datetime.fromtimestamp(now, tz=timezone.utc)
 
+        slot_max_min = self.slot_duration / 60 + 0.5
+
         for cid, slot in self._active_slots.items():
             minutes = (now - slot.slot_ts) / 60
-            if minutes < 0 or minutes > 15.5:
+            if minutes < 0 or minutes > slot_max_min:
                 continue
 
             # Book levels
@@ -339,6 +353,7 @@ class SlotCollector:
             self._enqueue(SlotSnapshot(
                 symbol=slot.symbol,
                 slot_ts=slot.slot_ts,
+                slot_duration=self.slot_duration,
                 captured_at=now,
                 minutes_into_slot=round(minutes, 2),
                 bid_up=bid_up,
@@ -377,10 +392,10 @@ class SlotCollector:
 
         now = time.time()
 
-        # Query DB for unresolved slots (at least 15 min old, give up after 2h)
+        # Query DB for unresolved slots (at least slot_duration old, give up after 2h)
         try:
             async with self._session_factory() as session:
-                cutoff = now - 15 * 60  # at least 15 min old
+                cutoff = now - self.slot_duration  # at least slot_duration old
                 max_age = now - 120 * 60  # give up after 2 hours
                 stmt = (
                     select(SlotResolution)
@@ -485,6 +500,7 @@ class SlotCollector:
             logger.info(
                 "slot_collector_started",
                 symbols=self.symbols,
+                slot_duration=self.slot_duration,
                 active_slots=len(self._active_slots),
                 discovery_interval=self.discovery_interval,
                 snapshot_interval=self.snapshot_interval,
@@ -513,6 +529,9 @@ class SlotCollector:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Passive slot data collector")
     p.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
+    p.add_argument("--slot-duration", type=str, default="15m",
+                    choices=list(DURATION_MAP.keys()),
+                    help="Slot duration: 5m or 15m (default: 15m)")
     p.add_argument("--db-url", type=str,
                     default=settings.DATABASE_URL,
                     help="Database URL (mysql+aiomysql:// or sqlite+aiosqlite://)")
@@ -526,6 +545,8 @@ def build_parser() -> argparse.ArgumentParser:
 async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    slot_duration = DURATION_MAP[args.slot_duration]
 
     symbols = [
         s if s.endswith("USDT") else s + "USDT"
@@ -546,14 +567,16 @@ async def main() -> None:
         chainlink=chainlink,
         symbols=symbols,
         db_url=db_url,
+        slot_duration=slot_duration,
         discovery_interval=args.discovery_interval,
         snapshot_interval=args.snapshot_interval,
         resolution_interval=args.resolution_interval,
     )
 
     sym_names = [s.replace("USDT", "") for s in symbols]
-    print(f"=== Slot Collector ===")
+    print(f"=== Slot Collector ({args.slot_duration}) ===")
     print(f"  Symbols:     {', '.join(sym_names)}")
+    print(f"  Duration:    {args.slot_duration} ({slot_duration}s)")
     print(f"  Database:    {db_url.split('@')[-1] if '@' in db_url else db_url[:40]}")
     print(f"  Snapshot:    every {args.snapshot_interval}s")
     print(f"  Discovery:   every {args.discovery_interval}s")

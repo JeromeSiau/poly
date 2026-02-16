@@ -18,7 +18,8 @@ from src.dashboard._shared import (
     plotly_layout,
 )
 
-_TIMING_ORDER = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12"]
+_TIMING_15M = ["0-2", "2-4", "4-6", "6-8", "8-10", "10-12"]
+_TIMING_5M = ["0-1", "1-2", "2-3", "3-4", "4-5"]
 _MOVE_ORDER = ["< -0.2", "-0.2/-0.1", "-0.1/0", "0/0.1", "0.1/0.2", "> 0.2"]
 _DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -27,14 +28,28 @@ _DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 def slot_ml_content():
     h = max(LOOKBACK_MAP[st.session_state.get("lookback", "24h")], 168)
 
-    sym_choice = st.radio(
-        "Symbol", ["All", "BTC", "ETH", "SOL", "XRP"],
-        horizontal=True, key="slot_symbol",
-    )
+    filter_left, filter_right = st.columns(2)
+    with filter_left:
+        dur_choice = st.radio(
+            "Duration", ["All", "15m", "5m"],
+            horizontal=True, key="slot_duration",
+        )
+    with filter_right:
+        # 5m markets only exist for BTC
+        sym_options = ["All", "BTC", "ETH", "SOL", "XRP"] if dur_choice != "5m" else ["BTC"]
+        sym_choice = st.radio(
+            "Symbol", sym_options,
+            horizontal=True, key="slot_symbol",
+        )
+
+    duration = dur_choice if dur_choice != "All" else None
+    timing_order = _TIMING_5M if duration == "5m" else _TIMING_15M
 
     params: dict = {"hours": h}
     if sym_choice != "All":
         params["symbol"] = sym_choice
+    if duration:
+        params["duration"] = duration
 
     data = api("/slots", params)
 
@@ -81,7 +96,7 @@ def slot_ml_content():
         for move in _MOVE_ORDER:
             row_z = []
             row_t = []
-            for timing in _TIMING_ORDER:
+            for timing in timing_order:
                 r = lookup.get((timing, move))
                 if r and r["total"] >= 3:
                     row_z.append(r["wr"])
@@ -94,7 +109,7 @@ def slot_ml_content():
 
         fig_hm = go.Figure(data=go.Heatmap(
             z=z,
-            x=_TIMING_ORDER,
+            x=timing_order,
             y=_MOVE_ORDER,
             text=text_arr,
             texttemplate="%{text}",
@@ -211,6 +226,8 @@ def slot_ml_content():
     sl_params: dict = {"hours": h, "peak": 0.75}
     if sym_choice != "All":
         sl_params["symbol"] = sym_choice
+    if duration:
+        sl_params["duration"] = duration
     sl_data = api("/slots/stoploss", sl_params)
 
     if sl_data.get("thresholds") and sl_data.get("total_peaked", 0) > 0:
