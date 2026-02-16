@@ -32,52 +32,9 @@ from train_td_model import (
     compute_trend_features,
     deduplicate_per_slot,
     engineer_features,
+    load_data,
+    temporal_split,
 )
-
-
-# ---------------------------------------------------------------------------
-# Data loading (mirrors train_td_model.load_data)
-# ---------------------------------------------------------------------------
-async def load_data(db_url: str, min_minutes: float = 4.0,
-                    max_minutes: float = 10.0) -> pd.DataFrame:
-    """Load all snapshots for resolved slots, compute trends, then filter."""
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    engine = create_async_engine(db_url, echo=False)
-    query = """
-        SELECT
-            s.symbol, s.slot_ts, s.minutes_into_slot, s.captured_at,
-            s.bid_up, s.ask_up, s.bid_down, s.ask_down,
-            s.bid_size_up, s.ask_size_up, s.bid_size_down, s.ask_size_down,
-            s.spread_up, s.spread_down,
-            s.chainlink_price, s.dir_move_pct, s.abs_move_pct,
-            s.hour_utc, s.day_of_week,
-            r.resolved_up
-        FROM slot_snapshots s
-        JOIN slot_resolutions r ON s.symbol = r.symbol AND s.slot_ts = r.slot_ts
-        WHERE r.resolved_up IS NOT NULL
-        ORDER BY s.symbol, s.slot_ts, s.captured_at
-    """
-
-    async with engine.connect() as conn:
-        result = await conn.execute(query)  # type: ignore[arg-type]
-        rows = result.fetchall()
-        cols = result.keys()
-
-    await engine.dispose()
-
-    df = pd.DataFrame(rows, columns=list(cols))
-    if df.empty:
-        return df
-
-    # Compute trend features from consecutive snapshots within each slot.
-    df = compute_trend_features(df)
-
-    # Filter to the target minute window.
-    df = df[(df["minutes_into_slot"] >= min_minutes) &
-            (df["minutes_into_slot"] <= max_minutes)]
-
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +191,8 @@ async def run(args: argparse.Namespace) -> None:
         print(f"\nOnly {len(df)} usable slots found. Need more data.")
         sys.exit(1)
 
-    # Temporal split: use last 20% as test set
-    df = df.sort_values("slot_ts").reset_index(drop=True)
-    split_idx = int(len(df) * 0.8)
-    test_df = df.iloc[split_idx:].copy()
+    # Temporal split: match training's temporal_split
+    _, test_df = temporal_split(df, val_days=args.val_days)
 
     # Optional symbol filter
     if args.symbol:
@@ -249,7 +204,7 @@ async def run(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     print(f"  Scenarios: {args.n}")
-    print(f"  Test set:  {len(test_df):,} slots (last 20%)")
+    print(f"  Test set:  {len(test_df):,} slots (last {args.val_days} days)")
 
     # Pick N random scenarios
     n = min(args.n, len(test_df))
@@ -300,6 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Press Enter between scenarios")
     p.add_argument("--symbol", type=str, default=None,
                    help="Filter by symbol (e.g. BTC, ETH)")
+    p.add_argument("--val-days", type=int, default=3,
+                   help="Days of data held out for test set (must match training)")
     p.add_argument("--db-url", type=str,
                    default=settings.DATABASE_URL,
                    help="Database connection string")
