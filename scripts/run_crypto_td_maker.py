@@ -221,6 +221,7 @@ class CryptoTDMaker:
         self.total_wins: int = 0
         self.total_losses: int = 0
         self.realized_pnl: float = 0.0
+        self.stoploss_overrides: int = 0  # fair value override count
 
         # ML entry model (optional)
         self._model = None
@@ -625,6 +626,7 @@ class CryptoTDMaker:
                         and prev_max >= self.stoploss_peak):
                     fair = self._estimate_fair_value(cid, pos.outcome, now)
                     if fair is not None and fair > self.stoploss_exit + self.stoploss_fair_margin:
+                        self.stoploss_overrides += 1
                         logger.info("stoploss_chainlink_override_empty_book",
                                     cid=cid[:16], last_bid=last_bid,
                                     fair=round(fair, 3))
@@ -658,6 +660,7 @@ class CryptoTDMaker:
                 # Fair value override: skip if Chainlink says position is still good.
                 fair = self._estimate_fair_value(cid, pos.outcome, now)
                 if fair is not None and fair > self.stoploss_exit + self.stoploss_fair_margin:
+                    self.stoploss_overrides += 1
                     logger.info("stoploss_chainlink_override",
                                 cid=cid[:16], bid=bid, fair=round(fair, 3),
                                 exit_threshold=self.stoploss_exit)
@@ -774,6 +777,7 @@ class CryptoTDMaker:
         if oid:
             self._db_fire(self._db_mark_settled(oid, pnl, now))
 
+        fair = self._estimate_fair_value(pos.condition_id, pos.outcome, now)
         logger.info(
             "td_stop_loss_exit",
             condition_id=pos.condition_id[:16],
@@ -783,6 +787,7 @@ class CryptoTDMaker:
             bid_max=round(bid_max, 3),
             pnl=round(pnl, 4),
             shares=round(pos.shares, 2),
+            fair_value=round(fair, 3) if fair else None,
             paper=self.paper_mode,
         )
 
@@ -1194,6 +1199,7 @@ class CryptoTDMaker:
                 f"pos={len(self.positions)} "
                 f"fills={self.total_fills} "
                 f"{self.total_wins}W-{self.total_losses}L "
+                f"sl_ovr={self.stoploss_overrides} "
                 f"pnl=${self.realized_pnl:+.2f} "
                 f"exp=${exposure:.0f} "
                 f"prices=[{' '.join(price_parts)}]"
