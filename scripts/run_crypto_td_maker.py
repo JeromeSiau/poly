@@ -671,11 +671,48 @@ class CryptoTDMaker:
     async def _execute_stop_loss(self, pos: OpenPosition, now: float) -> None:
         """Sell position at market (stop-loss early exit)."""
         bid, _, _, _ = self.polymarket.get_best_levels(pos.condition_id, pos.outcome)
-        sell_price = bid if bid is not None else self.stoploss_exit
         bid_max = self._position_bid_max.get(pos.condition_id, pos.entry_price)
+
+        # Re-check: if bid recovered above stoploss_exit, abort the sell.
+        # This prevents false triggers from momentary empty books.
+        if bid is not None and bid > self.stoploss_exit:
+            logger.info("stoploss_abort_recovered", cid=pos.condition_id[:16],
+                        bid=bid, exit_threshold=self.stoploss_exit)
+            return
+
+        sell_price = bid if bid is not None else self.stoploss_exit
 
         # PnL: we sell shares at sell_price instead of waiting for resolution.
         pnl = pos.shares * (sell_price - pos.entry_price)
+
+        # Live mode: sell FIRST, then clean up tracking only on success.
+        sell_ok = self.paper_mode  # paper always "succeeds"
+        if not self.paper_mode and self.manager:
+            slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
+            # FOK at 0.01 = "sell at any bid, fill-or-kill".
+            # FOK bypasses post_only (our executor fix), so it acts as taker.
+            sell_intent = TradeIntent(
+                condition_id=pos.condition_id,
+                token_id=pos.token_id,
+                outcome=pos.outcome,
+                side="SELL",
+                price=0.01,
+                size_usd=pos.shares * (1.0 - 0.01),
+                reason="stop_loss_exit",
+                title=slug,
+                timestamp=now,
+            )
+            try:
+                pending = await self.manager.place(sell_intent, order_type="FOK")
+                sell_ok = bool(pending.order_id)  # empty string = executor error
+            except Exception as exc:
+                logger.error("stop_loss_sell_failed",
+                             cid=pos.condition_id[:16], error=str(exc)[:80])
+
+        if not sell_ok:
+            logger.warning("stop_loss_sell_not_confirmed", cid=pos.condition_id[:16],
+                           bid=bid, sell_price=sell_price)
+            return  # keep position in tracking, will retry next tick
 
         # Remove position from all tracking.
         self.positions.pop(pos.condition_id, None)
@@ -701,33 +738,6 @@ class CryptoTDMaker:
         oid = self._position_order_ids.pop(pos.condition_id, None)
         if oid:
             self._db_fire(self._db_mark_settled(oid, pnl, now))
-
-        if self.guard:
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.guard.record_result(pnl=pnl, won=False))
-            except RuntimeError:
-                pass
-
-        # Live mode: actually sell the shares.
-        if not self.paper_mode and self.manager:
-            slug = _first_event_slug(self.known_markets.get(pos.condition_id, {}))
-            sell_intent = TradeIntent(
-                condition_id=pos.condition_id,
-                token_id=pos.token_id,
-                outcome=pos.outcome,
-                side="SELL",
-                price=max(sell_price - 0.01, 0.01),  # slightly below bid to ensure fill
-                size_usd=pos.shares * (1.0 - max(sell_price - 0.01, 0.01)),
-                reason="stop_loss_exit",
-                title=slug,
-                timestamp=now,
-            )
-            try:
-                await self.manager.place(sell_intent, order_type="FOK")
-            except Exception as exc:
-                logger.error("stop_loss_sell_failed",
-                             cid=pos.condition_id[:16], error=str(exc)[:80])
 
         logger.info(
             "td_stop_loss_exit",
