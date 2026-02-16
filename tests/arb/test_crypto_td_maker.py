@@ -681,3 +681,54 @@ class TestStopLossFairValue:
 
         # Override should fire — position kept
         assert CID in maker.positions
+
+
+class TestFairValueEntry:
+    """Fair value entry guard blocks overpaying on flash pumps."""
+
+    def test_entry_blocked_when_overpaying(self):
+        """BTC moved against us (-0.3%), fair value ~0.04, entry at 0.78 → blocked."""
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.78, ask=0.80)
+        mock_chainlink = Mock()
+        mock_chainlink.get_price.return_value = 69290.0  # BTC down ~0.3% from ref
+        maker = _make_maker(feed, entry_fair_margin=0.25,
+                            chainlink_feed=mock_chainlink)
+        now = time.time()
+        maker._ref_prices[CID] = 69500.0
+        maker._cid_chainlink_symbol[CID] = "btc/usd"
+        maker._cid_slot_ts[CID] = int(now - 600)  # 10 min into slot
+
+        result = maker._check_fair_value_entry(CID, "Up", 0.78, now)
+        assert result is False
+
+    def test_entry_allowed_when_price_consistent(self):
+        """Price 0.78, fair value 0.65, margin 0.25 → overpay 0.13 < 0.25 → allowed."""
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.78, ask=0.80)
+        mock_chainlink = Mock()
+        mock_chainlink.get_price.return_value = 70000.0  # BTC up from ref
+        maker = _make_maker(feed, entry_fair_margin=0.25,
+                            chainlink_feed=mock_chainlink)
+        now = time.time()
+        maker._ref_prices[CID] = 69500.0
+        maker._cid_chainlink_symbol[CID] = "btc/usd"
+        maker._cid_slot_ts[CID] = int(now - 300)
+
+        result = maker._check_fair_value_entry(CID, "Up", 0.78, now)
+        assert result is True
+
+    def test_entry_allowed_when_disabled(self):
+        """entry_fair_margin=0 → always allowed."""
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.82, ask=0.84)
+        maker = _make_maker(feed, entry_fair_margin=0.0)
+
+        result = maker._check_fair_value_entry(CID, "Up", 0.82, time.time())
+        assert result is True
+
+    def test_entry_allowed_when_no_chainlink(self):
+        """No Chainlink data → allow (graceful degradation)."""
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.82, ask=0.84)
+        maker = _make_maker(feed, entry_fair_margin=0.25)
+        # No chainlink_feed
+
+        result = maker._check_fair_value_entry(CID, "Up", 0.82, time.time())
+        assert result is True

@@ -149,6 +149,7 @@ class CryptoTDMaker:
         hybrid_taker_above: float = 0.72,
         stoploss_peak: float = 0.0,
         stoploss_exit: float = 0.0,
+        entry_fair_margin: float = 0.0,
         exit_model_path: str = "",
         exit_threshold: float = 0.35,
     ) -> None:
@@ -176,6 +177,7 @@ class CryptoTDMaker:
         self.stoploss_peak = stoploss_peak
         self.stoploss_exit = stoploss_exit
         self.stoploss_fair_margin: float = 0.10  # override margin above stoploss_exit
+        self.entry_fair_margin = entry_fair_margin
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -559,6 +561,25 @@ class CryptoTDMaker:
         if move is None:
             return True
         return move <= self.max_move_pct
+
+    def _check_fair_value_entry(self, cid: str, outcome: str,
+                                price: float, now: float) -> bool:
+        """Check if entry price is consistent with Chainlink fair value.
+
+        Returns True (allow) when data is unavailable or entry_fair_margin is 0.
+        Blocks entry if price exceeds fair value by more than entry_fair_margin.
+        """
+        if self.entry_fair_margin <= 0:
+            return True
+        fair = self._estimate_fair_value(cid, outcome, now)
+        if fair is None:
+            return True
+        if price > fair + self.entry_fair_margin:
+            logger.info("fair_value_entry_blocked", cid=cid[:16],
+                        outcome=outcome, price=price, fair=round(fair, 3),
+                        max_price=round(fair + self.entry_fair_margin, 3))
+            return False
+        return True
 
     def _estimate_fair_value(self, cid: str, outcome: str, now: float) -> Optional[float]:
         """Estimate fair value from Chainlink price and time remaining."""
@@ -1166,6 +1187,10 @@ class CryptoTDMaker:
                     continue
 
             if budget_left < self.order_size_usd:
+                continue
+
+            # Fair value entry guard: don't buy if price >> Chainlink fair value.
+            if not self._check_fair_value_entry(cid, outcome, price, now):
                 continue
 
             order_id = await self._place_order(
@@ -2043,6 +2068,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop-loss: sell when bid drops to this after peak (0=disabled)",
     )
     p.add_argument(
+        "--entry-fair-margin", type=float, default=0.0,
+        help="Max overpay vs Chainlink fair value to enter (0=disabled, recommended: 0.25)",
+    )
+    p.add_argument(
         "--exit-model-path", type=str, default="",
         help="Path to trained exit model (.joblib). Replaces rule-based stop-loss.",
     )
@@ -2151,6 +2180,7 @@ async def main() -> None:
         hybrid_taker_above=args.hybrid_taker_above,
         stoploss_peak=args.stoploss_peak,
         stoploss_exit=args.stoploss_exit,
+        entry_fair_margin=args.entry_fair_margin,
         exit_model_path=args.exit_model_path,
         exit_threshold=args.exit_threshold,
     )
