@@ -599,7 +599,15 @@ class CryptoTDMaker:
         exits: list[str] = []
         for cid, pos in self.positions.items():
             bid, _, _, _ = self.polymarket.get_best_levels(cid, pos.outcome)
+
+            # Empty book = worst case for stoploss purposes.
             if bid is None:
+                prev_max = self._position_bid_max.get(cid, pos.entry_price)
+                if prev_max >= self.stoploss_peak:
+                    logger.warning("stoploss_bid_none_trigger", cid=cid[:16],
+                                   bid_max=round(prev_max, 3),
+                                   peak=self.stoploss_peak, exit=self.stoploss_exit)
+                    exits.append(cid)
                 continue
 
             # Update bid max.
@@ -620,6 +628,9 @@ class CryptoTDMaker:
 
             # Rule-based trigger.
             if prev_max >= self.stoploss_peak and bid <= self.stoploss_exit:
+                logger.info("stoploss_rule_trigger", cid=cid[:16],
+                            bid=bid, bid_max=round(prev_max, 3),
+                            peak=self.stoploss_peak, exit=self.stoploss_exit)
                 exits.append(cid)
 
         for cid in exits:
