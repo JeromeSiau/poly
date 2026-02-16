@@ -2,6 +2,10 @@
 
 Lookup table maps (dir_move_bucket, minutes_remaining) -> P(win).
 Calibrated from Binance BTC+ETH 1-min klines Oct 2025 - Feb 2026.
+
+Reference price = close of the 1st 1-min candle in the 15-min slot.
+Ties (final == open) count as losses, matching Polymarket UP resolution
+(strict greater-than).
 """
 
 import bisect

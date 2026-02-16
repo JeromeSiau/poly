@@ -30,8 +30,8 @@ KLINE_LIMIT = 1000  # max per Binance request
 START_TS_MS = int(datetime(2025, 10, 1, tzinfo=timezone.utc).timestamp() * 1000)
 END_TS_MS = int(datetime(2026, 2, 16, tzinfo=timezone.utc).timestamp() * 1000)
 
-# Bucket edges for directional move (%)
-MOVE_EDGES = [-0.50, -0.30, -0.20, -0.10, -0.05, 0.00, 0.05, 0.10, 0.20, 0.30, 0.50]
+# Bucket edges for directional move (%) — must match src/utils/fair_value._MOVE_EDGES
+from src.utils.fair_value import _MOVE_EDGES as MOVE_EDGES
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 

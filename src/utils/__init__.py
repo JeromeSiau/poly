@@ -5,6 +5,7 @@ Sub-modules:
 - team_matching: team name normalisation and fuzzy matching
 - parsing: JSON/float/datetime helpers (import directly from src.utils.parsing)
 - crypto_markets: Polymarket crypto market discovery (import directly from src.utils.crypto_markets)
+- fair_value: empirical P(win) estimator for crypto binary markets (import directly from src.utils.fair_value)
 """
 
 from .logging import configure_logging
