@@ -39,7 +39,7 @@ def slot_ml_content():
     filter_left, filter_right = st.columns(2)
     with filter_left:
         dur_choice = st.radio(
-            "Duration", ["All", "15m", "5m"],
+            "Duration", ["15m", "5m"],
             horizontal=True, key="slot_duration",
         )
     with filter_right:
@@ -82,7 +82,7 @@ def slot_ml_content():
         # "All" — use max lookback
         h = 2160
 
-    duration = dur_choice if dur_choice != "All" else None
+    duration = dur_choice
     timing_order = _TIMING_5M if duration == "5m" else _TIMING_15M
 
     params: dict = {"hours": h}
