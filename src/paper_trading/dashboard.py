@@ -941,7 +941,7 @@ with tab_slot:
                 colorscale=[
                     [0, "#fca5a5"], [0.35, "#dc2626"],
                     [0.5, "#1e293b"],
-                    [0.65, "#16a34a"], [1, "#4ade80"],
+                    [0.65, "#16a34a"], [1, "#22c55e"],
                 ],
                 zmid=50, zmin=25, zmax=75,
                 colorbar=dict(
