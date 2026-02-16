@@ -120,13 +120,15 @@ def discover_daemons() -> list[dict]:
     for conf_path in sorted(glob.glob("/etc/supervisor/conf.d/worker-*.conf")):
         name = conf_path.rsplit("/", 1)[-1].replace(".conf", "")
         command = ""
+        directory = ""
         with open(conf_path) as f:
             for line in f:
                 if line.strip().startswith("command="):
                     command = line.strip().split("=", 1)[1]
-                    break
-        # Only include daemons that belong to our site
-        if SITE_DIR in command:
+                if line.strip().startswith("directory="):
+                    directory = line.strip().split("=", 1)[1].rstrip("/")
+        # Include daemons that belong to our site (match command or directory)
+        if SITE_DIR in command or directory == SITE_DIR:
             daemons.append({"name": name, "command": command})
     return daemons
 
