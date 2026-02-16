@@ -212,6 +212,7 @@ class CryptoTDMaker:
 
         # Stop-loss: track highest bid seen per position.
         self._position_bid_max: dict[str, float] = {}  # cid -> highest bid since fill
+        self._position_last_bid: dict[str, float] = {}  # cid -> most recent non-None bid
 
         # Stats
         self.total_fills: int = 0
@@ -600,13 +601,24 @@ class CryptoTDMaker:
         for cid, pos in self.positions.items():
             bid, _, _, _ = self.polymarket.get_best_levels(cid, pos.outcome)
 
-            # Empty book: skip — a momentary empty book is almost always a
-            # websocket gap, not a real crash.  Real crashes have low bids,
-            # not empty books, so the rule-based trigger catches them.
+            # Empty book: use last known bid to decide.
+            # If last bid was already below stoploss_exit, the position was
+            # in trouble before the book emptied — trigger stoploss.
+            # Otherwise skip (momentary websocket gap).
             if bid is None:
+                last_bid = self._position_last_bid.get(cid)
+                prev_max = self._position_bid_max.get(cid, pos.entry_price)
+                if (last_bid is not None
+                        and last_bid <= self.stoploss_exit
+                        and prev_max >= self.stoploss_peak):
+                    logger.warning("stoploss_bid_none_trigger", cid=cid[:16],
+                                   last_bid=last_bid, bid_max=round(prev_max, 3),
+                                   peak=self.stoploss_peak, exit=self.stoploss_exit)
+                    exits.append(cid)
                 continue
 
-            # Update bid max.
+            # Track last known bid and update bid max.
+            self._position_last_bid[cid] = bid
             prev_max = self._position_bid_max.get(cid, pos.entry_price)
             if bid > prev_max:
                 self._position_bid_max[cid] = bid
@@ -712,6 +724,7 @@ class CryptoTDMaker:
         # Remove position from all tracking.
         self.positions.pop(pos.condition_id, None)
         self._position_bid_max.pop(pos.condition_id, None)
+        self._position_last_bid.pop(pos.condition_id, None)
 
         # Cancel any remaining orders for this market.
         oids_to_cancel = [oid for oid, o in self.active_orders.items()
@@ -1652,6 +1665,7 @@ class CryptoTDMaker:
             self._cid_fill_analytics.pop(cid, None)
             self._book_history.pop(cid, None)
             self._position_bid_max.pop(cid, None)
+            self._position_last_bid.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -1784,6 +1798,7 @@ class CryptoTDMaker:
         won = token_resolved_1
         pnl = pos.shares * (1.0 - pos.entry_price) if won else -pos.size_usd
         self._position_bid_max.pop(pos.condition_id, None)
+        self._position_last_bid.pop(pos.condition_id, None)
 
         if won:
             self.total_wins += 1
