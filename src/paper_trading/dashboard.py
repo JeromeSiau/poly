@@ -359,6 +359,10 @@ hours = LOOKBACK_MAP[lookback_label]
 tags_data = _api("/tags", {"hours": hours})
 available_tags = sorted(tags_data.get("strategy_tags", {}).keys())
 
+_NAV_OPTIONS = ["Live", "ML", "Paper"]
+_initial_nav = st.query_params.get("mode", "Live")
+if _initial_nav in _NAV_OPTIONS and "nav_mode" not in st.session_state:
+    st.session_state["nav_mode"] = _initial_nav
 nav_mode = st.session_state.get("nav_mode", "Live")
 mode_lower = "live" if nav_mode == "Live" else ("paper" if nav_mode == "Paper" else "live")
 
@@ -380,6 +384,7 @@ with hdr_left:
 with hdr_right:
     st.markdown('<div class="nav-radio">', unsafe_allow_html=True)
     st.radio("nav", ["Live", "ML", "Paper"], key="nav_mode", horizontal=True, label_visibility="collapsed")
+    st.query_params["mode"] = st.session_state.get("nav_mode", "Live")
     st.markdown('</div>', unsafe_allow_html=True)
 
 
