@@ -79,6 +79,7 @@ dmypy.json
 # Database
 data/*.db
 data/*.sqlite
+data/*.sql
 
 # Logs
 logs/

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,19 @@ from urllib.parse import urlparse
 from config.settings import settings
 
 
-DUMP_PATH = Path("data/prod_dump.sql")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DUMP_PATH = PROJECT_ROOT / "data" / "prod_dump.sql"
+
+_TABLE_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_PASSWORD_RE = re.compile(r"-p'[^']*'")
+_MYSQL_PWD_RE = re.compile(r"MYSQL_PWD='[^']*'")
+
+
+def _redact(cmd_str: str) -> str:
+    """Replace password values in a command string for safe display."""
+    s = _PASSWORD_RE.sub("-p'***'", cmd_str)
+    s = _MYSQL_PWD_RE.sub("MYSQL_PWD='***'", s)
+    return s
 
 
 def parse_mysql_url(url: str) -> dict[str, str]:
@@ -39,7 +52,7 @@ def parse_mysql_url(url: str) -> dict[str, str]:
     parsed = urlparse(url)
 
     if parsed.scheme != "mysql":
-        print(f"ERROR: DATABASE_URL is not MySQL: {settings.DATABASE_URL}",
+        print(f"ERROR: DATABASE_URL is not MySQL (scheme={parsed.scheme})",
               file=sys.stderr)
         sys.exit(1)
 
@@ -71,14 +84,19 @@ def validate_settings() -> None:
 
 def build_dump_cmd(tables: list[str] | None) -> list[str]:
     """Build the SSH + mysqldump command."""
+    # Use MYSQL_PWD env var on the remote side to hide password from `ps`
     mysqldump = (
-        f"mysqldump --single-transaction --skip-lock-tables"
+        f"MYSQL_PWD='{settings.PROD_DB_PASS}'"
+        f" mysqldump --single-transaction --skip-lock-tables"
         f" -h {settings.PROD_DB_HOST}"
         f" -u {settings.PROD_DB_USER}"
-        f" -p'{settings.PROD_DB_PASS}'"
         f" {settings.PROD_DB_NAME}"
     )
     if tables:
+        for t in tables:
+            if not _TABLE_NAME_RE.match(t):
+                print(f"ERROR: Invalid table name: {t!r}", file=sys.stderr)
+                sys.exit(1)
         mysqldump += " " + " ".join(tables)
 
     return [
@@ -103,7 +121,7 @@ def run_cmd(cmd: list[str] | str, description: str, *,
     """Run a command, printing progress and handling errors."""
     cmd_str = cmd if isinstance(cmd, str) else " ".join(cmd)
     print(f"\n>> {description}")
-    print(f"   {cmd_str}")
+    print(f"   {_redact(cmd_str)}")
 
     if dry_run:
         print("   [dry-run] skipped")
@@ -187,6 +205,13 @@ def main() -> None:
     # --- Validate ---------------------------------------------------------
     validate_settings()
     local = parse_mysql_url(settings.DATABASE_URL)
+
+    # Safety: refuse to import into the production database
+    if (local["host"] == settings.PROD_DB_HOST
+            and local["database"] == settings.PROD_DB_NAME):
+        print("ERROR: DATABASE_URL points to the production database — aborting.",
+              file=sys.stderr)
+        sys.exit(1)
 
     print("=" * 60)
     print("  Production DB Dump")
