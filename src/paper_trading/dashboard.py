@@ -939,9 +939,9 @@ with tab_slot:
                 texttemplate="%{text}",
                 textfont=dict(size=11, color=C_TEXT),
                 colorscale=[
-                    [0, "#991b1b"], [0.35, "#dc2626"],
+                    [0, "#fca5a5"], [0.35, "#dc2626"],
                     [0.5, "#1e293b"],
-                    [0.65, "#16a34a"], [1, "#14532d"],
+                    [0.65, "#16a34a"], [1, "#86efac"],
                 ],
                 zmid=50, zmin=25, zmax=75,
                 colorbar=dict(
