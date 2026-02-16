@@ -97,6 +97,7 @@ class PolymarketFeed(BaseFeed):
     PING_INTERVAL = 10.0  # seconds
     RECONNECT_BASE = 1.0  # initial backoff seconds
     RECONNECT_MAX = 30.0  # max backoff seconds
+    STALE_THRESHOLD = 60.0  # force reconnect if no book update for this long
 
     def __init__(self) -> None:
         super().__init__()
@@ -357,12 +358,30 @@ class PolymarketFeed(BaseFeed):
     # ------------------------------------------------------------------
 
     async def _keepalive_loop(self) -> None:
-        """Send periodic ping to keep the connection alive."""
+        """Send periodic ping to keep the connection alive.
+
+        Also detects zombie connections: if the WS responds to pings but
+        Polymarket stopped pushing book updates, force a reconnect so we
+        get fresh snapshots on re-subscribe.
+        """
         while self._connected and self._ws:
             try:
                 await asyncio.sleep(self.PING_INTERVAL)
-                if self._ws:
-                    await self._ws.ping()
+                if not self._ws:
+                    return
+                # Detect zombie: WS alive but no book data flowing.
+                if (
+                    self.last_update_ts > 0
+                    and time.time() - self.last_update_ts > self.STALE_THRESHOLD
+                ):
+                    logger.warning(
+                        "polymarket_ws_stale",
+                        seconds_since_update=round(
+                            time.time() - self.last_update_ts, 1
+                        ),
+                    )
+                    return  # exit so _connection_loop reconnects
+                await self._ws.ping()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
