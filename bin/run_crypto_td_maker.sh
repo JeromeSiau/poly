@@ -19,6 +19,8 @@ MIN_MOVE_PCT="${MIN_MOVE_PCT:-0}"
 MAX_MOVE_PCT="${MAX_MOVE_PCT:-0}"
 MIN_ENTRY_MINUTES="${MIN_ENTRY_MINUTES:-0}"
 MAX_ENTRY_MINUTES="${MAX_ENTRY_MINUTES:-0}"
+STOPLOSS_PEAK="${STOPLOSS_PEAK:-0}"
+STOPLOSS_EXIT="${STOPLOSS_EXIT:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,6 +37,8 @@ while [[ $# -gt 0 ]]; do
     --max-move-pct)   MAX_MOVE_PCT="$2"; shift 2 ;;
     --min-entry-minutes) MIN_ENTRY_MINUTES="$2"; shift 2 ;;
     --max-entry-minutes) MAX_ENTRY_MINUTES="$2"; shift 2 ;;
+    --stoploss-peak)  STOPLOSS_PEAK="$2"; shift 2 ;;
+    --stoploss-exit)  STOPLOSS_EXIT="$2"; shift 2 ;;
     *)                shift ;;
   esac
 done
@@ -72,6 +76,7 @@ exec "$PYTHON" "$BASE/scripts/run_crypto_td_maker.py" \
   --ladder-rungs "$LADDER_RUNGS" \
   --min-move-pct "$MIN_MOVE_PCT" --max-move-pct "$MAX_MOVE_PCT" \
   --min-entry-minutes "$MIN_ENTRY_MINUTES" --max-entry-minutes "$MAX_ENTRY_MINUTES" \
+  --stoploss-peak "$STOPLOSS_PEAK" --stoploss-exit "$STOPLOSS_EXIT" \
   "${SIZING_ARGS[@]}" \
   --discovery-interval "$DISCOVERY_INTERVAL" --maker-interval "$MAKER_INTERVAL" \
   --strategy-tag "$TAG" --db-url "$DB_URL" \
