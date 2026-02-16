@@ -54,6 +54,7 @@ from src.feeds.polymarket import PolymarketFeed, PolymarketUserFeed, UserTradeEv
 # Crypto market discovery and parsing utilities.
 from src.feeds.chainlink import ChainlinkFeed
 from src.utils.crypto_markets import SLUG_TO_CHAINLINK, fetch_crypto_markets
+from src.utils.fair_value import estimate_fair_value
 from src.utils.parsing import parse_json_list, _to_float, _first_event_slug
 from src.execution import TradeManager, TradeIntent, FillResult
 from src.risk.guard import RiskGuard
@@ -557,6 +558,16 @@ class CryptoTDMaker:
             return True
         return move <= self.max_move_pct
 
+    def _estimate_fair_value(self, cid: str, outcome: str, now: float) -> Optional[float]:
+        """Estimate fair value from Chainlink price and time remaining."""
+        dir_move = self._get_dir_move(cid, outcome)
+        slot_ts = self._cid_slot_ts.get(cid)
+        if dir_move is None or slot_ts is None:
+            return None
+        minutes_into = (now - slot_ts) / 60
+        minutes_remaining = max(15.0 - minutes_into, 1.0)
+        return estimate_fair_value(dir_move, minutes_remaining)
+
     def _check_min_entry_time(self, cid: str) -> bool:
         """Return True if enough time has elapsed since slot start.
 
@@ -611,8 +622,15 @@ class CryptoTDMaker:
                 if (last_bid is not None
                         and last_bid <= self.stoploss_exit
                         and prev_max >= self.stoploss_peak):
+                    fair = self._estimate_fair_value(cid, pos.outcome, now)
+                    if fair is not None and fair > self.stoploss_exit + 0.10:
+                        logger.info("stoploss_chainlink_override_empty_book",
+                                    cid=cid[:16], last_bid=last_bid,
+                                    fair=round(fair, 3))
+                        continue
                     logger.warning("stoploss_bid_none_trigger", cid=cid[:16],
                                    last_bid=last_bid, bid_max=round(prev_max, 3),
+                                   fair=round(fair, 3) if fair else None,
                                    peak=self.stoploss_peak, exit=self.stoploss_exit)
                     exits.append(cid)
                 continue
@@ -636,8 +654,16 @@ class CryptoTDMaker:
 
             # Rule-based trigger.
             if prev_max >= self.stoploss_peak and bid <= self.stoploss_exit:
+                # Fair value override: skip if Chainlink says position is still good.
+                fair = self._estimate_fair_value(cid, pos.outcome, now)
+                if fair is not None and fair > self.stoploss_exit + 0.10:
+                    logger.info("stoploss_chainlink_override",
+                                cid=cid[:16], bid=bid, fair=round(fair, 3),
+                                exit_threshold=self.stoploss_exit)
+                    continue
                 logger.info("stoploss_rule_trigger", cid=cid[:16],
                             bid=bid, bid_max=round(prev_max, 3),
+                            fair=round(fair, 3) if fair else None,
                             peak=self.stoploss_peak, exit=self.stoploss_exit)
                 exits.append(cid)
 

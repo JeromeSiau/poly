@@ -3,6 +3,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -577,3 +578,79 @@ class TestPartialFillPhantom:
         # Should match via condition_id fallback.
         assert order_id not in maker.active_orders
         assert CID in maker.positions
+
+
+# ---------------------------------------------------------------------------
+# Stop loss: Chainlink fair value override
+# ---------------------------------------------------------------------------
+
+
+class TestStopLossFairValue:
+    """Stop loss should be skipped when Chainlink fair value contradicts low bid."""
+
+    @pytest.mark.asyncio
+    async def test_stoploss_skipped_when_fair_value_high(self):
+        """Bid at 0.34 but underlying still in our favor -> don't exit."""
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.34, ask=0.36)
+        mock_chainlink = Mock()
+        mock_chainlink.get_price.return_value = 70000.0  # BTC up from ref
+        maker = _make_maker(feed, stoploss_peak=0.75, stoploss_exit=0.35,
+                            chainlink_feed=mock_chainlink)
+
+        now = time.time()
+        maker.positions[CID] = OpenPosition(
+            condition_id=CID, outcome="Up", token_id=TOK_UP,
+            entry_price=0.75, size_usd=10.0, shares=13.33, filled_at=now,
+        )
+        maker._position_bid_max[CID] = 0.80
+        maker._ref_prices[CID] = 69500.0       # ref price at slot start
+        maker._cid_chainlink_symbol[CID] = "btc/usd"
+        maker._cid_slot_ts[CID] = int(now - 600)  # 10 min into slot -> 5 min remaining
+
+        await maker._check_stop_losses(now)
+
+        # Position should still exist -- stop loss was overridden
+        assert CID in maker.positions
+
+    @pytest.mark.asyncio
+    async def test_stoploss_triggers_when_fair_value_confirms(self):
+        """Bid at 0.34 and underlying moved against us -> exit."""
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.34, ask=0.36)
+        mock_chainlink = Mock()
+        mock_chainlink.get_price.return_value = 69000.0  # BTC down from ref
+        maker = _make_maker(feed, stoploss_peak=0.75, stoploss_exit=0.35,
+                            chainlink_feed=mock_chainlink)
+
+        now = time.time()
+        maker.positions[CID] = OpenPosition(
+            condition_id=CID, outcome="Up", token_id=TOK_UP,
+            entry_price=0.75, size_usd=10.0, shares=13.33, filled_at=now,
+        )
+        maker._position_bid_max[CID] = 0.80
+        maker._ref_prices[CID] = 69500.0
+        maker._cid_chainlink_symbol[CID] = "btc/usd"
+        maker._cid_slot_ts[CID] = int(now - 600)
+
+        await maker._check_stop_losses(now)
+
+        # Position should be gone -- stop loss confirmed by fair value
+        assert CID not in maker.positions
+
+    @pytest.mark.asyncio
+    async def test_stoploss_triggers_when_no_chainlink_data(self):
+        """No Chainlink data -> fall back to normal stop loss behavior."""
+        feed = _make_feed_with_book(CID, "Up", TOK_UP, bid=0.34, ask=0.36)
+        maker = _make_maker(feed, stoploss_peak=0.75, stoploss_exit=0.35)
+        # No chainlink_feed set -> _estimate_fair_value returns None
+
+        now = time.time()
+        maker.positions[CID] = OpenPosition(
+            condition_id=CID, outcome="Up", token_id=TOK_UP,
+            entry_price=0.75, size_usd=10.0, shares=13.33, filled_at=now,
+        )
+        maker._position_bid_max[CID] = 0.80
+
+        await maker._check_stop_losses(now)
+
+        # Should trigger normally without fair value override
+        assert CID not in maker.positions
