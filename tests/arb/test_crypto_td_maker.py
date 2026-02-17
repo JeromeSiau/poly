@@ -732,3 +732,160 @@ class TestFairValueEntry:
 
         result = maker._check_fair_value_entry(CID, "Up", 0.82, time.time())
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for refactor-safe bug fixes
+# ---------------------------------------------------------------------------
+
+
+class TestModelSizingConsistency:
+    """Model-scaled sizes must stay consistent across order lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_place_order_keeps_scaled_size(self):
+        """Scaled size should propagate to active order (not reset to base size)."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        manager = TradeManager(
+            strategy="test_model_sizing",
+            paper=True,
+            notify_bids=False,
+            notify_fills=False,
+            notify_closes=False,
+        )
+        maker = _make_maker(feed, manager=manager, order_size_usd=10.0)
+        maker.known_markets[CID] = {"events": [{"slug": "btc-updown-1700000000"}]}
+        maker.market_outcomes[CID] = ["Up", "Down"]
+        maker.market_tokens[(CID, "Down")] = TOK_DOWN
+
+        maker._model = object()
+        maker._last_p_win[(CID, "Down")] = 0.90  # 1.6x -> 16 USD
+
+        oid = await maker._place_order(
+            CID, "Down", TOK_DOWN, price=0.80, now=time.time(), order_type="maker"
+        )
+
+        assert oid is not None
+        assert oid in maker.active_orders
+        assert maker.active_orders[oid].size_usd == pytest.approx(16.0, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_budget_checks_scaled_size_not_base(self):
+        """If scaled size exceeds budget, order must not be placed."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=1, order_size_usd=10.0,
+                                   max_total_exposure_usd=12.0)
+        maker._model = object()
+
+        def _fake_check_model(cid: str, outcome: str, bid: float) -> float:
+            maker._last_order_type[(cid, outcome)] = "maker"
+            return 0.90  # 1.6x -> 16 USD
+
+        maker._check_model = _fake_check_model  # type: ignore[method-assign]
+
+        await maker._maker_tick()
+
+        assert len(maker.active_orders) == 0
+
+
+class TestDbRestoreLadder:
+    """DB restore should rebuild ladder fills without losing legs."""
+
+    @pytest.mark.asyncio
+    async def test_load_db_state_aggregates_multi_leg_position(self, monkeypatch):
+        now = time.time()
+        rows = [
+            SimpleNamespace(
+                order_id="oid_1",
+                condition_id=CID,
+                outcome="Down",
+                token_id=TOK_DOWN,
+                price=0.75,
+                size_usd=5.0,
+                shares=6.6666667,
+                status="filled",
+                placed_at=now - 60,
+                filled_at=now - 55,
+            ),
+            SimpleNamespace(
+                order_id="oid_2",
+                condition_id=CID,
+                outcome="Down",
+                token_id=TOK_DOWN,
+                price=0.85,
+                size_usd=8.0,
+                shares=9.4117647,
+                status="filled",
+                placed_at=now - 50,
+                filled_at=now - 45,
+            ),
+        ]
+
+        async def _fake_load_orders(**kwargs):
+            return rows
+
+        async def _fake_delete_order(**kwargs):
+            return True
+
+        monkeypatch.setattr("src.db.td_orders.load_orders", _fake_load_orders)
+        monkeypatch.setattr("src.db.td_orders.delete_order", _fake_delete_order)
+
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_maker(feed, db_url="sqlite+aiosqlite:///tmp/test_td.sqlite")
+
+        await maker._load_db_state()
+
+        assert CID in maker.positions
+        pos = maker.positions[CID]
+        assert pos.size_usd == pytest.approx(13.0, abs=1e-6)
+        assert pos.shares == pytest.approx(16.0784314, abs=1e-5)
+        expected_entry = (
+            (6.6666667 * 0.75 + 9.4117647 * 0.85) / (6.6666667 + 9.4117647)
+        )
+        assert pos.entry_price == pytest.approx(expected_entry, abs=1e-6)
+        assert maker._cid_fill_count[CID] == 2
+        assert set(maker._position_order_legs[CID]) == {"oid_1", "oid_2"}
+
+    def test_settlement_splits_pnl_across_legs(self):
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_maker(feed, db_url="sqlite+aiosqlite:///tmp/test_td.sqlite")
+        maker._position_order_legs[CID] = {"oid_small": 5.0, "oid_big": 15.0}
+
+        calls = []
+
+        def _capture_db_fire(job, *args, **kwargs):
+            calls.append((job, args, kwargs))
+
+        maker._db_fire = _capture_db_fire  # type: ignore[method-assign]
+        maker._mark_position_settled_in_db(CID, pnl=20.0, now=1234567890.0)
+
+        assert len(calls) == 2
+        # 5/20 and 15/20 split
+        leg_pnls = {args[0]: args[1] for _, args, _ in calls}
+        assert leg_pnls["oid_small"] == pytest.approx(5.0, abs=1e-6)
+        assert leg_pnls["oid_big"] == pytest.approx(15.0, abs=1e-6)
+
+
+class TestModelFilterInLadder:
+    """With model enabled, ladder should honor ML skip decisions."""
+
+    @pytest.mark.asyncio
+    async def test_ladder_respects_model_skip(self):
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        maker = _make_ladder_maker(feed, ladder_rungs=2)
+        maker._model = object()
+
+        def _fake_check_model(cid: str, outcome: str, bid: float) -> float:
+            maker._last_order_type[(cid, outcome)] = "skip"
+            return 0.40
+
+        maker._check_model = _fake_check_model  # type: ignore[method-assign]
+
+        await maker._maker_tick()
+
+        assert len(maker.active_orders) == 0

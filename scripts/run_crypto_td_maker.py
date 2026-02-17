@@ -33,7 +33,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Callable, Awaitable
 
 import httpx
 import structlog
@@ -196,8 +196,8 @@ class CryptoTDMaker:
         self._last_status_time: float = 0.0
         # Last known bid per (cid, outcome) — fallback for settlement when book empties.
         self._last_bids: dict[tuple[str, str], float] = {}
-        # Map condition_id -> order_id for DB settlement tracking.
-        self._position_order_ids: dict[str, str] = {}
+        # Map condition_id -> {order_id -> size_usd} for DB settlement tracking.
+        self._position_order_legs: dict[str, dict[str, float]] = {}
         # Per-cid fill count — blocks re-ordering when >= ladder_rungs.
         self._cid_fill_count: dict[str, int] = {}  # cid -> number of fills
         # Rung-level dedup: (cid, outcome, price_cents) of placed/active rungs.
@@ -240,6 +240,62 @@ class CryptoTDMaker:
         self._exit_threshold = exit_threshold
         if exit_model_path:
             self._load_exit_model(exit_model_path)
+
+    @staticmethod
+    def _is_placeholder_order_id(order_id: str) -> bool:
+        """True when order_id is a temporary in-flight placement marker."""
+        return order_id.startswith("_placing_")
+
+    @staticmethod
+    def _model_size_scale(p_win: float) -> float:
+        """Convert model confidence to size multiplier."""
+        return max(0.2, min(2.0, (p_win - 0.5) / 0.25))
+
+    def _compute_order_size_usd(self, p_win: Optional[float]) -> float:
+        """Effective order size after optional model scaling."""
+        if p_win is None or not self._model:
+            return self.order_size_usd
+        return round(self.order_size_usd * self._model_size_scale(p_win), 2)
+
+    def _track_position_order_leg(self, cid: str, order_id: str, size_usd: float) -> None:
+        """Track one DB order leg for settlement fan-out."""
+        if not order_id:
+            return
+        legs = self._position_order_legs.setdefault(cid, {})
+        legs[order_id] = size_usd
+
+    def _replace_position_order_leg(
+        self, cid: str, old_order_id: str, new_order_id: str, size_usd: float
+    ) -> None:
+        """Replace placeholder order id with the real exchange order id."""
+        legs = self._position_order_legs.setdefault(cid, {})
+        leg_size = legs.pop(old_order_id, size_usd)
+        legs[new_order_id] = leg_size
+
+    def _mark_position_settled_in_db(self, cid: str, pnl: float, now: float) -> None:
+        """Mark all tracked order legs as settled, splitting PnL by leg size."""
+        legs = self._position_order_legs.pop(cid, {})
+        if not legs:
+            return
+
+        real_legs = [
+            (order_id, size_usd)
+            for order_id, size_usd in legs.items()
+            if not self._is_placeholder_order_id(order_id)
+        ]
+        if not real_legs:
+            return
+
+        total_size = sum(max(size_usd, 0.0) for _, size_usd in real_legs)
+        if total_size <= 0:
+            split = pnl / len(real_legs)
+            for order_id, _ in real_legs:
+                self._db_fire(self._db_mark_settled, order_id, split, now)
+            return
+
+        for order_id, size_usd in real_legs:
+            leg_weight = max(size_usd, 0.0) / total_size
+            self._db_fire(self._db_mark_settled, order_id, pnl * leg_weight, now)
 
     def _load_model(self, path: str) -> None:
         """Load trained XGBoost entry model from joblib file."""
@@ -423,12 +479,13 @@ class CryptoTDMaker:
         now = time.time()
         stale_cutoff = now - 1800  # 30 min
         stale_count = 0
+        loaded_fill_counts: dict[str, int] = {}
         for row in rows:
             # Skip and clean up stale orders from previous sessions.
             row_ts = row.filled_at or row.placed_at or 0.0
             if row_ts > 0 and row_ts < stale_cutoff:
                 stale_count += 1
-                self._db_fire(delete_order(db_url=self._db_url, order_id=row.order_id))
+                self._db_fire(delete_order, db_url=self._db_url, order_id=row.order_id)
                 continue
 
             if row.status == "pending":
@@ -441,23 +498,54 @@ class CryptoTDMaker:
                 self.active_orders[row.order_id] = order
                 self._orders_by_cid_outcome[(row.condition_id, row.outcome)] = row.order_id
             elif row.status == "filled":
-                pos = OpenPosition(
-                    condition_id=row.condition_id, outcome=row.outcome,
-                    token_id=row.token_id, entry_price=row.price,
-                    size_usd=row.size_usd,
-                    shares=row.shares or row.size_usd / row.price,
-                    filled_at=row.filled_at or 0.0,
+                row_shares = row.shares or row.size_usd / row.price
+                existing = self.positions.get(row.condition_id)
+                if existing:
+                    # Defensive guard: one market position should stay on one outcome.
+                    if existing.outcome != row.outcome or existing.token_id != row.token_id:
+                        logger.warning(
+                            "td_db_restore_conflict",
+                            condition_id=row.condition_id[:16],
+                            existing_outcome=existing.outcome,
+                            row_outcome=row.outcome,
+                        )
+                        continue
+                    total_shares = existing.shares + row_shares
+                    existing.entry_price = (
+                        (existing.shares * existing.entry_price + row_shares * row.price)
+                        / max(total_shares, 1e-9)
+                    )
+                    existing.shares = total_shares
+                    existing.size_usd += row.size_usd
+                    if row.filled_at:
+                        if existing.filled_at <= 0:
+                            existing.filled_at = row.filled_at
+                        else:
+                            existing.filled_at = min(existing.filled_at, row.filled_at)
+                else:
+                    pos = OpenPosition(
+                        condition_id=row.condition_id,
+                        outcome=row.outcome,
+                        token_id=row.token_id,
+                        entry_price=row.price,
+                        size_usd=row.size_usd,
+                        shares=row_shares,
+                        filled_at=row.filled_at or 0.0,
+                    )
+                    self.positions[row.condition_id] = pos
+
+                self._track_position_order_leg(row.condition_id, row.order_id, row.size_usd)
+                self._position_bid_max[row.condition_id] = max(
+                    self._position_bid_max.get(row.condition_id, row.price),
+                    row.price,
                 )
-                self.positions[row.condition_id] = pos
-                self._position_order_ids[row.condition_id] = row.order_id
-                self._position_bid_max[row.condition_id] = row.price
+                loaded_fill_counts[row.condition_id] = loaded_fill_counts.get(row.condition_id, 0) + 1
         if stale_count:
             logger.info("td_stale_orders_cleaned", count=stale_count)
 
-        # Restore ladder state from loaded DB rows.
-        for cid, pos in self.positions.items():
-            # Each restored filled position counts as one ladder fill.
-            self._cid_fill_count[cid] = self._cid_fill_count.get(cid, 0) + 1
+        # Restore ladder fill count from filled DB rows (not just one per position).
+        for cid, count in loaded_fill_counts.items():
+            self._cid_fill_count[cid] = self._cid_fill_count.get(cid, 0) + count
         for oid, order in self.active_orders.items():
             # Restore rung dedup for pending orders.
             self._rung_placed.add(
@@ -471,14 +559,19 @@ class CryptoTDMaker:
                 fill_counts=dict(self._cid_fill_count),
             )
 
-    def _db_fire(self, coro) -> None:
+    def _db_fire(
+        self, job: Callable[..., Awaitable[Any]] | Awaitable[Any], *args: Any, **kwargs: Any
+    ) -> None:
         """Schedule a DB coroutine as fire-and-forget."""
         if not self._db_url:
             return
         try:
-            asyncio.get_running_loop().create_task(coro)
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            pass
+            return
+
+        coro = job if asyncio.iscoroutine(job) else job(*args, **kwargs)
+        loop.create_task(coro)
 
     async def _db_save_order(self, order: PassiveOrder) -> None:
         from src.db.td_orders import save_order
@@ -789,15 +882,13 @@ class CryptoTDMaker:
             if not self.paper_mode and self.executor:
                 asyncio.create_task(self._async_cancel(oid))
             else:
-                self._db_fire(self._db_delete_order(oid))
+                self._db_fire(self._db_delete_order, oid)
 
         self.total_losses += 1
         self.realized_pnl += pnl
 
         # DB settlement.
-        oid = self._position_order_ids.pop(pos.condition_id, None)
-        if oid:
-            self._db_fire(self._db_mark_settled(oid, pnl, now))
+        self._mark_position_settled_in_db(pos.condition_id, pnl, now)
 
         fair = self._estimate_fair_value(pos.condition_id, pos.outcome, now)
         logger.info(
@@ -989,7 +1080,7 @@ class CryptoTDMaker:
         ]
         for oid in stale_cancel_ids:
             order = self._pending_cancels.pop(oid)
-            self._db_fire(self._db_delete_order(oid))
+            self._db_fire(self._db_delete_order, oid)
             logger.debug("td_pending_cancel_expired", order_id=oid[:16])
 
         # Circuit breaker gate
@@ -1045,22 +1136,20 @@ class CryptoTDMaker:
                     self._last_book_update = now
                 existing_key = (cid, outcome)
 
+                model_p_win: Optional[float] = None
+                model_order_type = "maker"
+
                 # BUY signal: bid in [target_bid, max_bid] + filters
                 if self._model:
                     # ML model replaces manual move/timing filters
-                    p_win = self._check_model(cid, outcome, bid) if bid is not None else None
-                    order_type = self._last_order_type.pop((cid, outcome), "skip")
+                    model_p_win = self._check_model(cid, outcome, bid) if bid is not None else None
+                    model_order_type = self._last_order_type.pop((cid, outcome), "skip")
                     bid_in_range = (
                         bid is not None
                         and self.target_bid <= bid <= self.max_bid
-                        and p_win is not None
-                        and order_type != "skip"
+                        and model_p_win is not None
+                        and model_order_type != "skip"
                     )
-                    if bid_in_range and p_win is not None:
-                        self._last_p_win[(cid, outcome)] = p_win
-                        # For taker orders, buy at the ask instead of bidding
-                        if order_type == "taker" and ask is not None:
-                            self._last_order_type[(cid, outcome)] = "taker"
                 else:
                     # Manual filters fallback
                     bid_in_range = (
@@ -1074,6 +1163,10 @@ class CryptoTDMaker:
 
                 if self.ladder_rungs > 1 and bid is not None and bid >= self.target_bid:
                     # ---- Sequential ladder: place only the next rung ----
+                    if self._model:
+                        # In ladder mode, ML is treated as an entry filter.
+                        if model_p_win is None or model_order_type == "skip":
+                            continue
                     if not self._check_min_entry_time(cid):
                         continue
                     if not self._check_max_entry_time(cid):
@@ -1091,6 +1184,8 @@ class CryptoTDMaker:
                             continue
                         rung_key = (cid, outcome, int(round(rung_price * 100)))
                         if rung_key not in self._rung_placed:
+                            if model_p_win is not None:
+                                self._last_p_win[(cid, outcome)] = model_p_win
                             place_intents.append((cid, outcome, token_id, rung_price, "maker"))
                 else:
                     # ---- Single-order mode (original logic) ----
@@ -1114,8 +1209,10 @@ class CryptoTDMaker:
                         # else: order still at correct price, do nothing.
                     else:
                         # No existing order — place if in range
-                        if bid_in_range and budget_left >= self.order_size_usd:
-                            ot = self._last_order_type.get((cid, outcome), "maker")
+                        if bid_in_range:
+                            if model_p_win is not None:
+                                self._last_p_win[(cid, outcome)] = model_p_win
+                            ot = model_order_type if self._model else "maker"
                             if ot == "taker" and ask is not None:
                                 place_intents.append((cid, outcome, token_id, ask, "taker"))
                             else:
@@ -1140,7 +1237,7 @@ class CryptoTDMaker:
                         del self._orders_by_cid_outcome[key]
                     self._rung_placed.discard(
                         (order.condition_id, order.outcome, int(round(order.price * 100))))
-                    self._db_fire(self._db_delete_order(oid))
+                    self._db_fire(self._db_delete_order, oid)
                 except Exception as exc:
                     # Cancel request failed — order likely still live.
                     # Keep in both active_orders AND _pending_cancels.
@@ -1157,7 +1254,7 @@ class CryptoTDMaker:
                     del self._orders_by_cid_outcome[key]
                 self._rung_placed.discard(
                     (order.condition_id, order.outcome, int(round(order.price * 100))))
-                self._db_fire(self._db_delete_order(oid))
+                self._db_fire(self._db_delete_order, oid)
 
         # Execute placements.
         placed = 0
@@ -1187,7 +1284,9 @@ class CryptoTDMaker:
                 if any(o.condition_id == cid for o in self.active_orders.values()):
                     continue
 
-            if budget_left < self.order_size_usd:
+            p_win_for_size = self._last_p_win.get((cid, outcome))
+            intent_size_usd = self._compute_order_size_usd(p_win_for_size)
+            if budget_left < intent_size_usd:
                 continue
 
             # Fair value entry guard: don't buy if price >> Chainlink fair value.
@@ -1200,7 +1299,7 @@ class CryptoTDMaker:
             if order_id:
                 placed += 1
                 placed_cids_this_tick.add(cid)
-                budget_left -= self.order_size_usd
+                budget_left -= intent_size_usd
 
         # Periodic status (every 30s wall-clock).
         if now - self._last_status_time >= 30.0:
@@ -1246,12 +1345,10 @@ class CryptoTDMaker:
         is_taker = order_type == "taker"
 
         # Model-based sizing: scale order_size by confidence
-        size_usd = self.order_size_usd
         p_win = self._last_p_win.pop((cid, outcome), None)
+        size_usd = self._compute_order_size_usd(p_win)
         if p_win is not None and self._model:
-            # Scale: 0.55 -> 0.2x, 0.75 -> 1.0x, 1.0 -> 2.0x (linear)
-            confidence_scale = max(0.2, min(2.0, (p_win - 0.5) / 0.25))
-            size_usd = round(self.order_size_usd * confidence_scale, 2)
+            confidence_scale = self._model_size_scale(p_win)
             logger.debug("model_sizing", cid=cid[:12], outcome=outcome,
                          p_win=round(p_win, 3), scale=round(confidence_scale, 2),
                          size_usd=size_usd, order_type=order_type)
@@ -1309,10 +1406,7 @@ class CryptoTDMaker:
             )
             self._process_fill(order, now)
             self._cancel_other_side(cid, outcome)
-            self._db_fire(self._db_save_order(order))
-            self._db_fire(self._db_mark_filled(
-                pending.order_id, size_usd / price, now,
-            ))
+            self._db_fire(self._db_save_order, order)
             logger.info("td_taker_fok_filled", order_id=pending.order_id[:16],
                          outcome=outcome, price=price)
             return pending.order_id
@@ -1324,14 +1418,14 @@ class CryptoTDMaker:
         if temp_id not in self.active_orders:
             if self._orders_by_cid_outcome.get((cid, outcome)) == temp_id:
                 del self._orders_by_cid_outcome[(cid, outcome)]
-            self._position_order_ids[cid] = pending.order_id
+            self._replace_position_order_leg(cid, temp_id, pending.order_id, size_usd)
             order = PassiveOrder(
                 order_id=pending.order_id, condition_id=cid, outcome=outcome,
-                token_id=token_id, price=price, size_usd=self.order_size_usd,
+                token_id=token_id, price=price, size_usd=size_usd,
                 placed_at=now,
             )
-            self._db_fire(self._db_save_order(order))
-            self._db_fire(self._db_mark_filled(pending.order_id, self.positions[cid].shares, now))
+            self._db_fire(self._db_save_order, order)
+            self._db_fire(self._db_mark_filled, pending.order_id, size_usd / price, now)
             logger.info("td_fill_caught_during_placement", order_id=pending.order_id[:16])
             return pending.order_id
 
@@ -1339,12 +1433,12 @@ class CryptoTDMaker:
         self.active_orders.pop(temp_id, None)
         order = PassiveOrder(
             order_id=pending.order_id, condition_id=cid, outcome=outcome,
-            token_id=token_id, price=price, size_usd=self.order_size_usd,
+            token_id=token_id, price=price, size_usd=size_usd,
             placed_at=now,
         )
         self.active_orders[pending.order_id] = order
         self._orders_by_cid_outcome[(cid, outcome)] = pending.order_id
-        self._db_fire(self._db_save_order(order))
+        self._db_fire(self._db_save_order, order)
         return pending.order_id
 
     # ------------------------------------------------------------------
@@ -1423,13 +1517,14 @@ class CryptoTDMaker:
             )
             self.positions[order.condition_id] = pos
 
-        self._position_order_ids[order.condition_id] = order.order_id
+        self._track_position_order_leg(order.condition_id, order.order_id, order.size_usd)
         self._cid_fill_count[order.condition_id] = self._cid_fill_count.get(order.condition_id, 0) + 1
         # Initialize bid_max tracking for stop-loss.
         if order.condition_id not in self._position_bid_max:
             self._position_bid_max[order.condition_id] = order.price
         self.total_fills += 1
-        self._db_fire(self._db_mark_filled(order.order_id, new_shares, now))
+        if not self._is_placeholder_order_id(order.order_id):
+            self._db_fire(self._db_mark_filled, order.order_id, new_shares, now)
 
         # Underlying move at fill time (reuses shared helper).
         dir_move = self._get_dir_move(order.condition_id, order.outcome)
@@ -1513,7 +1608,7 @@ class CryptoTDMaker:
                     self._pending_cancels[oid] = order
                     asyncio.create_task(self._async_cancel(oid))
                 else:
-                    self._db_fire(self._db_delete_order(oid))
+                    self._db_fire(self._db_delete_order, oid)
                 logger.debug("td_other_side_cancelled", outcome=outcome)
 
     async def _async_cancel(self, order_id: str) -> None:
@@ -1544,7 +1639,7 @@ class CryptoTDMaker:
                 self._pending_cancels[oid] = order
                 asyncio.create_task(self._async_cancel(oid))
             else:
-                self._db_fire(self._db_delete_order(oid))
+                self._db_fire(self._db_delete_order, oid)
         logger.warning("td_all_orders_cancelled", reason=reason, count=count)
 
     async def _fill_listener(self) -> None:
@@ -1689,7 +1784,7 @@ class CryptoTDMaker:
                 order = self.active_orders.pop(oid)
                 self._rung_placed.discard(
                     (cid, order.outcome, int(round(order.price * 100))))
-                self._db_fire(self._db_delete_order(oid))
+                self._db_fire(self._db_delete_order, oid)
                 if not self.paper_mode and self.executor:
                     try:
                         await self.executor.cancel_order(oid)
@@ -1725,6 +1820,7 @@ class CryptoTDMaker:
             self._book_history.pop(cid, None)
             self._position_bid_max.pop(cid, None)
             self._position_last_bid.pop(cid, None)
+            self._position_order_legs.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -1865,10 +1961,8 @@ class CryptoTDMaker:
             self.total_losses += 1
         self.realized_pnl += pnl
 
-        # Mark settled in DB.
-        oid = self._position_order_ids.pop(pos.condition_id, None)
-        if oid:
-            self._db_fire(self._db_mark_settled(oid, pnl, now))
+        # Mark settled in DB for every tracked ladder leg.
+        self._mark_position_settled_in_db(pos.condition_id, pnl, now)
 
         if self.guard:
             try:
