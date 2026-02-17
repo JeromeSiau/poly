@@ -2,7 +2,9 @@
 
 import streamlit as st
 
-from src.dashboard._shared import DASHBOARD_CSS, LOOKBACK_MAP, api
+from datetime import date, timedelta
+
+from src.dashboard._shared import DASHBOARD_CSS, PERIOD_PRESETS, api
 
 # -- Page config (must be first st call) --
 st.set_page_config(page_title="Poly", page_icon="P", layout="wide")
@@ -30,13 +32,21 @@ elif "nav_mode" not in st.session_state or st.session_state["nav_mode"] == "ML":
 nav_mode = st.session_state["nav_mode"]
 
 # -- Sidebar --
-lookback_label = st.sidebar.selectbox(
-    "Lookback", list(LOOKBACK_MAP.keys()), index=3, key="lookback",
-)
-hours = LOOKBACK_MAP[lookback_label]
-
 if not is_ml:
-    tags_data = api("/tags", {"hours": hours})
+    st.sidebar.radio("Period", list(PERIOD_PRESETS.keys()), index=0, key="period", horizontal=True)
+    preset_days = PERIOD_PRESETS.get(st.session_state.get("period", "24h"), 1)
+    if preset_days == -1:
+        today = date.today()
+        st.sidebar.date_input(
+            "Date range",
+            value=(today - timedelta(days=14), today),
+            max_value=today,
+            key="period_dates",
+        )
+
+    from src.dashboard._shared import period_params
+    pp = period_params()
+    tags_data = api("/tags", pp)
     available_tags = sorted(tags_data.get("strategy_tags", {}).keys())
     st.sidebar.multiselect("Strategies", available_tags, key="strategies")
 

@@ -57,8 +57,13 @@ def resolve_open_markets(markets: list[dict[str, Any]]) -> None:
 # Polymarket Data API fetcher
 # ---------------------------------------------------------------------------
 
-def fetch_activity(wallet: str, hours: float) -> list[dict[str, Any]]:
-    cutoff_ts = int(
+def fetch_activity(
+    wallet: str,
+    hours: float,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> list[dict[str, Any]]:
+    cutoff_ts = start_ts if start_ts is not None else int(
         (datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp()
     )
     rows: list[dict[str, Any]] = []
@@ -87,6 +92,8 @@ def fetch_activity(wallet: str, hours: float) -> list[dict[str, Any]]:
                     continue
                 if ts < cutoff_ts:
                     stop = True
+                    continue
+                if end_ts is not None and ts > end_ts:
                     continue
                 rows.append(_normalize(raw, ts))
 

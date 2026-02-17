@@ -38,9 +38,15 @@ def list_trades(
     is_open: Optional[bool] = Query(default=None, description="true=open positions only, false=closed only."),
     hours: float = Query(default=24.0, ge=0.1, le=720.0, description="Lookback window in hours."),
     limit: int = Query(default=200, ge=1, le=2000, description="Max rows returned."),
+    start_ts: Optional[int] = Query(default=None, description="Absolute start unix timestamp (overrides hours)."),
+    end_ts: Optional[int] = Query(default=None, description="Absolute end unix timestamp."),
 ) -> dict:
     """Return trades joined with their observations, newest first."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    if start_ts is not None:
+        cutoff = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc) if end_ts is not None else None
     session = get_sync_session(settings.DATABASE_URL)
     try:
         # Use INNER JOIN when is_open is set (we need PT.is_open to filter)
@@ -59,6 +65,9 @@ def list_trades(
                 .where(LO.timestamp >= cutoff)
                 .order_by(LO.timestamp.desc())
             )
+
+        if end_dt is not None:
+            q = q.where(LO.timestamp <= end_dt)
 
         if event_type:
             q = q.where(LO.event_type == event_type)
@@ -324,16 +333,27 @@ def positions(
 # /winrate — on-chain (live) or DB-based (paper)
 # ---------------------------------------------------------------------------
 
-def _winrate_paper(hours: float) -> dict:
+def _winrate_paper(
+    hours: float,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> dict:
     """Compute paper-mode win rate from the internal DB."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    if start_ts is not None:
+        cutoff = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc) if end_ts is not None else None
     session = get_sync_session(settings.DATABASE_URL)
     try:
-        rows = session.execute(
+        q = (
             select(LO, PT)
             .join(PT, PT.observation_id == LO.id)
             .where(LO.timestamp >= cutoff)
-        ).all()
+        )
+        if end_dt is not None:
+            q = q.where(LO.timestamp <= end_dt)
+        rows = session.execute(q).all()
 
         # Filter to paper-mode observations only
         paper_rows = []
@@ -380,16 +400,18 @@ def winrate(
     hours: float = Query(default=24.0, ge=0.1, le=720.0, description="Lookback window in hours."),
     wallet: Optional[str] = Query(default=None, description="Wallet address (default: from settings)."),
     mode: Optional[str] = Query(default="live", description="'live' (on-chain) or 'paper' (DB)."),
+    start_ts: Optional[int] = Query(default=None, description="Absolute start unix timestamp (overrides hours)."),
+    end_ts: Optional[int] = Query(default=None, description="Absolute end unix timestamp."),
 ) -> dict:
     """Win rate from on-chain Polymarket wallet activity or paper DB."""
     if mode == "paper":
-        return _winrate_paper(hours)
+        return _winrate_paper(hours, start_ts=start_ts, end_ts=end_ts)
 
     addr = wallet or settings.POLYMARKET_WALLET_ADDRESS
     if not addr:
         return {"error": "No wallet configured"}
 
-    rows = fetch_activity(addr, hours)
+    rows = fetch_activity(addr, hours, start_ts=start_ts, end_ts=end_ts)
     markets = analyse(rows)
     resolve_open_markets(markets)
 
@@ -438,15 +460,20 @@ def winrate(
 @app.get("/tags")
 def list_tags(
     hours: float = Query(default=24.0, ge=0.1, le=720.0, description="Lookback window in hours."),
+    start_ts: Optional[int] = Query(default=None, description="Absolute start unix timestamp (overrides hours)."),
+    end_ts: Optional[int] = Query(default=None, description="Absolute end unix timestamp."),
 ) -> dict:
     """Return all distinct strategy_tags and event_types seen recently."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    if start_ts is not None:
+        cutoff = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     session = get_sync_session(settings.DATABASE_URL)
     try:
-        rows = session.execute(
-            select(LO.event_type, LO.game_state)
-            .where(LO.timestamp >= cutoff)
-        ).all()
+        q = select(LO.event_type, LO.game_state).where(LO.timestamp >= cutoff)
+        if end_ts is not None:
+            q = q.where(LO.timestamp <= datetime.fromtimestamp(end_ts, tz=timezone.utc))
+        rows = session.execute(q).all()
 
         tags: dict[str, int] = {}
         event_types: dict[str, int] = {}

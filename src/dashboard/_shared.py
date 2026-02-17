@@ -10,6 +10,16 @@ API_BASE = "http://localhost:8788"
 
 LOOKBACK_MAP = {"1h": 1, "4h": 4, "12h": 12, "24h": 24, "48h": 48, "7d": 168}
 
+PERIOD_PRESETS = {
+    "24h": 1,
+    "48h": 2,
+    "7d": 7,
+    "14d": 14,
+    "30d": 30,
+    "All": None,
+    "Custom": -1,
+}
+
 # -- Colors --
 C_BG = "#0b0e17"
 C_CARD = "#111827"
@@ -20,6 +30,25 @@ C_MUTED = "#64748b"
 C_TEXT = "#e2e8f0"
 C_ACCENT = "#38bdf8"
 C_GRID = "rgba(148,163,184,0.06)"
+
+
+def period_params() -> dict:
+    """Build API params dict from the current period session state."""
+    from datetime import date, timedelta
+    preset_days = PERIOD_PRESETS.get(st.session_state.get("period", "24h"), 1)
+    if preset_days == -1:
+        # Custom date range
+        dates = st.session_state.get("period_dates")
+        if isinstance(dates, (list, tuple)) and len(dates) == 2:
+            d_start, d_end = dates
+            s = int(datetime.combine(d_start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+            e = int(datetime.combine(d_end, datetime.max.time(), tzinfo=timezone.utc).timestamp())
+            return {"hours": 720, "start_ts": s, "end_ts": e}
+        return {"hours": 24}
+    elif preset_days is None:
+        return {"hours": 720}
+    else:
+        return {"hours": preset_days * 24}
 
 
 def api(endpoint: str, params: dict | None = None) -> dict:

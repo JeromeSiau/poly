@@ -7,7 +7,6 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.dashboard._shared import (
-    LOOKBACK_MAP,
     C_ACCENT,
     C_GREEN,
     C_GRID,
@@ -17,6 +16,7 @@ from src.dashboard._shared import (
     api,
     parse_asset,
     parse_slot_ts,
+    period_params,
     plotly_layout,
     style_pnl,
     style_result,
@@ -33,10 +33,10 @@ with tab_live:
     @st.fragment(run_every="15s")
     def kpi_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
-        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+        pp = period_params()
 
         balance_data = api("/balance", {"mode": m})
-        winrate_data = api("/winrate", {"mode": m, "hours": h})
+        winrate_data = api("/winrate", {"mode": m, **pp})
 
         bal = balance_data.get("balance", 0.0)
         pnl = winrate_data.get("total_pnl", 0.0)
@@ -64,11 +64,11 @@ with tab_live:
     @st.fragment(run_every="15s")
     def pnl_chart_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
-        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+        pp = period_params()
 
         st.markdown('<p class="section-label">Cumulative PnL</p>', unsafe_allow_html=True)
 
-        winrate_data = api("/winrate", {"mode": m, "hours": h})
+        winrate_data = api("/winrate", {"mode": m, **pp})
         markets = winrate_data.get("markets", [])
 
         if not markets:
@@ -114,11 +114,11 @@ with tab_live:
     @st.fragment(run_every="15s")
     def hourly_pnl_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
-        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+        pp = period_params()
 
         st.markdown('<p class="section-label">PnL by Hour</p>', unsafe_allow_html=True)
 
-        winrate_data = api("/winrate", {"mode": m, "hours": h})
+        winrate_data = api("/winrate", {"mode": m, **pp})
         markets = winrate_data.get("markets", [])
 
         if not markets:
@@ -194,12 +194,12 @@ with tab_live:
     @st.fragment(run_every="15s")
     def recent_trades_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
-        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+        pp = period_params()
 
         st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
 
         if m == "live":
-            winrate_data = api("/winrate", {"mode": "live", "hours": h})
+            winrate_data = api("/winrate", {"mode": "live", **pp})
             markets = winrate_data.get("markets", [])
             if not markets:
                 st.caption("No trades in this period")
@@ -231,7 +231,7 @@ with tab_live:
             l = sum(1 for p in pnls if p <= 0)
             st.caption(f"{len(markets)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
         else:
-            data = api("/trades", {"mode": "paper", "hours": h, "limit": 200})
+            data = api("/trades", {"mode": "paper", **pp, "limit": 200})
             trades = data.get("trades", [])
             if not trades:
                 st.caption("No trades in this period")
@@ -282,10 +282,10 @@ with tab_analysis:
     @st.fragment(run_every="30s")
     def analysis_tab_content():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
-        h = LOOKBACK_MAP[st.session_state.get("lookback", "24h")]
+        pp = period_params()
         selected_tags = st.session_state.get("strategies", [])
 
-        data = api("/trades", {"mode": m, "hours": h, "limit": 2000})
+        data = api("/trades", {"mode": m, **pp, "limit": 2000})
         trades = data.get("trades", [])
 
         if selected_tags:
