@@ -1703,33 +1703,16 @@ class CryptoTDMaker:
         logger.warning("td_all_orders_cancelled", reason=reason, count=count)
 
     async def _cancel_orphaned_orders(self) -> None:
-        """Cancel orders left on the CLOB by a previous process.
+        """Cancel ALL open orders on the CLOB at startup.
 
-        Fetches all open orders from the CLOB API and cancels any that
-        are not tracked in our active_orders dict.  This prevents ghost
-        orders from causing double fills after a restart.
+        Prevents ghost orders from previous runs causing double fills.
+        Uses the SDK cancel_all() for a single atomic API call.
         """
         try:
-            live_orders = await self.executor.get_open_orders()
+            result = await self.executor.cancel_all_orders()
+            logger.info("startup_cancel_all", result=str(result)[:200])
         except Exception as exc:
-            logger.warning("orphan_cancel_fetch_failed", error=str(exc)[:80])
-            return
-
-        known_oids = set(self.active_orders) | set(self._pending_cancels)
-        orphans = [o for o in live_orders if o.get("id") not in known_oids]
-        if not orphans:
-            return
-
-        cancelled = 0
-        for order in orphans:
-            oid = order.get("id", "")
-            try:
-                await self.executor.cancel_order(oid)
-                cancelled += 1
-            except Exception:
-                pass
-        logger.warning("orphan_orders_cancelled", found=len(orphans),
-                       cancelled=cancelled)
+            logger.warning("startup_cancel_all_failed", error=str(exc)[:80])
 
     async def _fill_listener(self) -> None:
         """Drain fills from WS User channel (live mode real-time detection)."""

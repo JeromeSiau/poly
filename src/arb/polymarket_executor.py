@@ -224,6 +224,18 @@ class PolymarketExecutor:
             logger.error("polymarket_cancel_failed", order_id=order_id, error=str(e))
             return {"status": "ERROR", "message": str(e)}
 
+    def _cancel_all_sync(self) -> list:
+        self._ensure_creds()
+        try:
+            return self._client.cancel_all()
+        except Exception as exc:
+            logger.warning("polymarket_cancel_all_failed", error=str(exc))
+            return []
+
+    async def cancel_all_orders(self) -> list:
+        """Cancel ALL open orders on the CLOB for this wallet."""
+        return await asyncio.to_thread(self._cancel_all_sync)
+
     def _get_open_orders_sync(self, market: str = "") -> list[dict[str, Any]]:
         self._ensure_creds()
         try:
