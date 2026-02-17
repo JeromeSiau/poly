@@ -1116,3 +1116,144 @@ async def test_fetcher_single_model_fallback():
     fc = forecasts[0]
     assert fc.temp_max == 66.0
     assert fc.model_temps == {}  # no model-specific data
+
+
+# ---------------------------------------------------------------------------
+# Multi-model consensus tests (Task 3)
+# ---------------------------------------------------------------------------
+
+def test_consensus_blocks_yield_no_when_models_disagree():
+    """Yield NO should NOT fire when models disagree on direction."""
+    market = WeatherMarket(
+        condition_id="0xcons1", slug="test", title="test",
+        city="Dallas", target_date=_future_target_date(),
+        outcomes={"45°F or below": "tok1"},
+        outcome_prices={"45°F or below": 0.01},  # YES at 1% -> NO at 99%
+        end_date=_future_end_date(), resolution_source="",
+    )
+
+    # Models disagree: best_match says 66 (NO confident), gfs says 43 (YES possible!)
+    forecast = ForecastData(
+        city="Dallas", date=_future_target_date(),
+        temp_max=55.0, temp_min=40.0, unit="fahrenheit", fetched_at=time.time(),
+        model_temps={"best_match": 66.0, "ecmwf_ifs025": 65.0, "gfs_seamless": 43.0},
+    )
+
+    engine = _make_engine(no_enabled=True)
+    signals = engine.evaluate_market(market, forecast)
+    yield_no = [s for s in signals if s.trade_type == "yield_no"]
+    assert len(yield_no) == 0  # blocked by disagreement
+
+
+def test_consensus_allows_yield_no_when_all_models_agree():
+    """Yield NO should fire when all models agree outcome is unlikely."""
+    market = WeatherMarket(
+        condition_id="0xcons2", slug="test", title="test",
+        city="Dallas", target_date=_future_target_date(),
+        outcomes={"45°F or below": "tok1"},
+        outcome_prices={"45°F or below": 0.01},
+        end_date=_future_end_date(), resolution_source="",
+    )
+
+    # All models agree: temp well above 45°F
+    forecast = ForecastData(
+        city="Dallas", date=_future_target_date(),
+        temp_max=66.0, temp_min=50.0, unit="fahrenheit", fetched_at=time.time(),
+        model_temps={"best_match": 66.0, "ecmwf_ifs025": 64.0, "gfs_seamless": 68.0},
+    )
+
+    engine = _make_engine(no_enabled=True)
+    signals = engine.evaluate_market(market, forecast)
+    yield_no = [s for s in signals if s.trade_type == "yield_no"]
+    assert len(yield_no) == 1
+
+
+def test_consensus_allows_lottery_yes_with_majority():
+    """Lottery YES should fire when 2/3 models agree (majority)."""
+    market = WeatherMarket(
+        condition_id="0xcons3", slug="test", title="test",
+        city="Dallas", target_date=_future_target_date(),
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.03},
+        end_date=_future_end_date(), resolution_source="",
+    )
+
+    # 2/3 models agree (best_match=66 + ecmwf=65 above 58, gfs=55 below)
+    forecast = ForecastData(
+        city="Dallas", date=_future_target_date(),
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+        model_temps={"best_match": 66.0, "ecmwf_ifs025": 65.0, "gfs_seamless": 55.0},
+    )
+
+    engine = _make_engine()
+    signals = engine.evaluate_market(market, forecast)
+    lottery = [s for s in signals if s.trade_type == "lottery"]
+    assert len(lottery) == 1  # 2/3 consensus is enough for lottery
+
+
+def test_consensus_blocks_lottery_yes_when_no_model_agrees():
+    """Lottery YES should NOT fire when no model supports it confidently."""
+    market = WeatherMarket(
+        condition_id="0xcons4", slug="test", title="test",
+        city="Dallas", target_date=_future_target_date(),
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.03},
+        end_date=_future_end_date(), resolution_source="",
+    )
+
+    # All models below threshold — none are confident
+    forecast = ForecastData(
+        city="Dallas", date=_future_target_date(),
+        temp_max=56.0, temp_min=45.0, unit="fahrenheit", fetched_at=time.time(),
+        model_temps={"best_match": 56.0, "ecmwf_ifs025": 55.0, "gfs_seamless": 57.0},
+    )
+
+    engine = _make_engine()
+    signals = engine.evaluate_market(market, forecast)
+    lottery = [s for s in signals if s.trade_type == "lottery"]
+    assert len(lottery) == 0  # no model is confident
+
+
+def test_no_model_temps_skips_consensus():
+    """When model_temps is empty (single model), skip consensus check."""
+    market = WeatherMarket(
+        condition_id="0xcons5", slug="test", title="test",
+        city="Dallas", target_date=_future_target_date(),
+        outcomes={"45°F or below": "tok1"},
+        outcome_prices={"45°F or below": 0.01},
+        end_date=_future_end_date(), resolution_source="",
+    )
+
+    # No model_temps -> backward compat, no consensus filter
+    forecast = ForecastData(
+        city="Dallas", date=_future_target_date(),
+        temp_max=66.0, temp_min=50.0, unit="fahrenheit", fetched_at=time.time(),
+    )
+
+    engine = _make_engine(no_enabled=True)
+    signals = engine.evaluate_market(market, forecast)
+    yield_no = [s for s in signals if s.trade_type == "yield_no"]
+    assert len(yield_no) == 1  # no consensus check, passes
+
+
+def test_consensus_blocks_lottery_no_when_models_disagree():
+    """Lottery NO should NOT fire when one model thinks YES might happen."""
+    market = WeatherMarket(
+        condition_id="0xcons6", slug="test", title="test",
+        city="Dallas", target_date=_future_target_date(),
+        outcomes={"58°F or higher": "tok1"},
+        outcome_prices={"58°F or higher": 0.999},  # YES at 99.9% -> NO at 0.1%
+        end_date=_future_end_date(), resolution_source="",
+    )
+
+    # One model (gfs) says 60°F — above threshold, YES might happen
+    forecast = ForecastData(
+        city="Dallas", date=_future_target_date(),
+        temp_max=52.0, temp_min=35.0, unit="fahrenheit", fetched_at=time.time(),
+        model_temps={"best_match": 50.0, "ecmwf_ifs025": 48.0, "gfs_seamless": 60.0},
+    )
+
+    engine = _make_engine(lottery_no_enabled=True)
+    signals = engine.evaluate_market(market, forecast)
+    lottery_no = [s for s in signals if s.trade_type == "lottery_no"]
+    assert len(lottery_no) == 0  # gfs disagrees, blocked

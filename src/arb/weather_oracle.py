@@ -503,7 +503,11 @@ class WeatherOracleEngine:
             # --- Type 3: Lottery YES (cheap tail bet) ---
             if yes_price <= self.max_entry_price:
                 key = f"{market.condition_id}:BUY_YES:lottery:{outcome_label}"
-                if key not in self._entered_markets and confidence >= self.min_confidence:
+                if (
+                    key not in self._entered_markets
+                    and confidence >= self.min_confidence
+                    and self._check_consensus(forecast, outcome_label, self.min_confidence, require_all=False)
+                ):
                     signals.append(WeatherSignal(
                         market=market,
                         outcome=outcome_label,
@@ -529,6 +533,7 @@ class WeatherOracleEngine:
                     if (
                         key not in self._entered_markets
                         and no_confidence >= self.lottery_no_min_no_confidence
+                        and self._check_no_consensus(forecast, outcome_label)
                     ):
                         signals.append(WeatherSignal(
                             market=market,
@@ -549,7 +554,11 @@ class WeatherOracleEngine:
             if self.yield_enabled:
                 if self.yield_min_yes_price <= yes_price <= self.yield_max_yes_price:
                     key = f"{market.condition_id}:BUY_YES:yield_yes:{outcome_label}"
-                    if key not in self._entered_markets and confidence >= self.yield_min_confidence:
+                    if (
+                        key not in self._entered_markets
+                        and confidence >= self.yield_min_confidence
+                        and self._check_consensus(forecast, outcome_label, self.yield_min_confidence, require_all=True)
+                    ):
                         signals.append(WeatherSignal(
                             market=market,
                             outcome=outcome_label,
@@ -563,7 +572,11 @@ class WeatherOracleEngine:
 
             # --- Type 2: Yield NO (buy NO on unlikely outcomes) ---
             if self.no_enabled:
-                if yes_price <= self.no_max_yes_price and confidence <= self.no_max_confidence:
+                if (
+                    yes_price <= self.no_max_yes_price
+                    and confidence <= self.no_max_confidence
+                    and self._check_no_consensus(forecast, outcome_label)
+                ):
                     no_price = 1.0 - yes_price
                     key = f"{market.condition_id}:BUY_NO:yield_no:{outcome_label}"
                     if key not in self._entered_markets:
@@ -685,6 +698,58 @@ class WeatherOracleEngine:
             return min(0.99, 0.5 + 0.5 * min(z_score / 2.0, 1.0))
 
         return 0.0
+
+    def _check_consensus(
+        self,
+        forecast: ForecastData,
+        outcome_label: str,
+        min_confidence: float,
+        require_all: bool = True,
+    ) -> bool:
+        """Check model consensus that an outcome WILL happen.
+
+        Args:
+            forecast: Forecast with per-model temps.
+            outcome_label: The outcome to check confidence for.
+            min_confidence: Minimum confidence threshold per model.
+            require_all: If True, ALL models must meet threshold.
+                         If False, 2/3 majority is enough.
+        Returns:
+            True if consensus is met or no multi-model data available.
+        """
+        if not forecast.model_temps:
+            return True  # single model, skip consensus
+
+        confident_count = 0
+        for model_temp in forecast.model_temps.values():
+            conf = self._outcome_confidence(outcome_label, model_temp)
+            if conf >= min_confidence:
+                confident_count += 1
+
+        total = len(forecast.model_temps)
+        if require_all:
+            return confident_count == total
+        # Majority: at least 2/3
+        return confident_count >= (total * 2 / 3)
+
+    def _check_no_consensus(
+        self,
+        forecast: ForecastData,
+        outcome_label: str,
+    ) -> bool:
+        """Check that ALL models agree the outcome is unlikely (for NO trades).
+
+        Returns True if every model's confidence for this outcome is ≤ no_max_confidence.
+        Returns True if no multi-model data (backward compat).
+        """
+        if not forecast.model_temps:
+            return True
+
+        for model_temp in forecast.model_temps.values():
+            conf = self._outcome_confidence(outcome_label, model_temp)
+            if conf > self.no_max_confidence:
+                return False  # at least one model thinks YES might happen
+        return True
 
     def _size_for_signal(self, signal: WeatherSignal) -> float:
         """Return position size in USD based on trade type."""
