@@ -94,6 +94,9 @@ data/*.csv
 data/raw/
 reports/
 
+# Worktrees
+.worktrees/
+
 #AI
 .claude
 docs
