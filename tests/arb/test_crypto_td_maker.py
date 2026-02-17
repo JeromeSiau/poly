@@ -1050,3 +1050,42 @@ async def test_reconcile_handles_api_failure():
 
     assert reconciled == 0
     assert "order_unknown" in maker.active_orders
+
+
+@pytest.mark.asyncio
+async def test_reconcile_on_startup_recovers_filled_orders():
+    """Simulate startup: DB has pending orders that were actually filled on-chain."""
+    cid = "0xstartup"
+    token_id = "tok_startup"
+    feed = _make_feed_with_book(cid, "Up", token_id, bid=0.90, ask=0.91)
+    executor = _FakeExecutor(order_responses={
+        "startup_order": {
+            "id": "startup_order",
+            "status": "MATCHED",
+            "price": "0.80",
+            "original_size": "12.5",
+            "size_matched": "12.5",
+            "asset_id": token_id,
+            "market": cid,
+        },
+    })
+    maker = _make_maker(feed, executor=executor, paper_mode=False)
+    maker.manager = Mock(spec=TradeManager)
+    maker.manager.record_fill_direct = AsyncMock()
+    maker.manager._pending = {}
+
+    # Simulate what _load_db_state would produce: a pending order in active_orders
+    order = PassiveOrder(
+        order_id="startup_order", condition_id=cid, outcome="Up",
+        token_id=token_id, price=0.80, size_usd=10.0,
+        placed_at=time.time() - 120,
+    )
+    maker.active_orders["startup_order"] = order
+    maker._orders_by_cid_outcome[(cid, "Up")] = "startup_order"
+    maker.market_outcomes[cid] = ["Up", "Down"]
+
+    reconciled = await maker._reconcile_fills()
+
+    assert reconciled == 1
+    assert cid in maker.positions
+    assert maker.positions[cid].entry_price == 0.80

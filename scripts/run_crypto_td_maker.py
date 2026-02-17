@@ -2133,6 +2133,12 @@ class CryptoTDMaker:
                 logger.warning("user_ws_connect_failed", error=str(exc))
                 self.user_feed = None
 
+        # Reconcile fills for any pending orders that were filled while we were down.
+        if self.active_orders and not self.paper_mode:
+            recovered = await self._reconcile_fills()
+            if recovered:
+                logger.info("startup_reconcile_complete", recovered=recovered)
+
         timeout = httpx.Timeout(20.0, connect=10.0)
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
         async with httpx.AsyncClient(timeout=timeout, limits=limits, http2=True) as client:
