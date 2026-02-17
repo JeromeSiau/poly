@@ -218,6 +218,7 @@ class CryptoTDMaker:
         # Stop-loss: track highest bid seen per position.
         self._position_bid_max: dict[str, float] = {}  # cid -> highest bid since fill
         self._position_last_bid: dict[str, float] = {}  # cid -> most recent non-None bid
+        self._position_bid_below_exit_since: dict[str, float] = {}  # cid -> timestamp when bid first dropped below stoploss_exit
 
         # Stats
         self.total_fills: int = 0
@@ -731,31 +732,18 @@ class CryptoTDMaker:
         for cid, pos in self.positions.items():
             bid, _, _, _ = self.polymarket.get_best_levels(cid, pos.outcome)
 
-            # Empty book: use fair value + last known bid to decide.
-            # Two cases:
-            # A) last_bid <= stoploss_exit: position was in trouble before
-            #    book emptied — trigger unless Chainlink overrides.
-            # B) last_bid > stoploss_exit: book emptied from a higher level.
-            #    Use fair value as ground truth — if fair < stoploss_exit
-            #    the position is losing despite the stale last_bid.
+            # Empty book: trigger stoploss if conditions met.
+            # No Chainlink override here — an empty book means market makers
+            # pulled liquidity, not a flash crash (flash crashes still have bids).
             if bid is None:
                 last_bid = self._position_last_bid.get(cid)
                 prev_max = self._position_bid_max.get(cid, pos.entry_price)
-                fair = self._estimate_fair_value(cid, pos.outcome, now)
 
                 # Case A: last bid was already below exit threshold.
                 if (last_bid is not None
                         and last_bid <= self.stoploss_exit
                         and prev_max >= self.stoploss_peak):
-                    if fair is not None and fair > self.stoploss_exit + self.stoploss_fair_margin:
-                        self.stoploss_overrides += 1
-                        last_log = self._stoploss_override_log_ts.get(cid, 0)
-                        if now - last_log >= 30.0:
-                            self._stoploss_override_log_ts[cid] = now
-                            logger.info("stoploss_chainlink_override_empty_book",
-                                        cid=cid[:16], last_bid=last_bid,
-                                        fair=round(fair, 3))
-                        continue
+                    fair = self._estimate_fair_value(cid, pos.outcome, now)
                     logger.warning("stoploss_bid_none_trigger", cid=cid[:16],
                                    last_bid=last_bid, bid_max=round(prev_max, 3),
                                    fair=round(fair, 3) if fair else None,
@@ -765,6 +753,7 @@ class CryptoTDMaker:
 
                 # Case B: book emptied while last_bid was still above exit.
                 # Use fair value to catch positions losing despite stale bid.
+                fair = self._estimate_fair_value(cid, pos.outcome, now)
                 if (fair is not None
                         and fair < self.stoploss_exit
                         and prev_max >= self.stoploss_peak):
@@ -782,6 +771,13 @@ class CryptoTDMaker:
                 self._position_bid_max[cid] = bid
                 prev_max = bid
 
+            # Track how long bid has been below stoploss_exit.
+            if bid <= self.stoploss_exit:
+                if cid not in self._position_bid_below_exit_since:
+                    self._position_bid_below_exit_since[cid] = now
+            else:
+                self._position_bid_below_exit_since.pop(cid, None)
+
             # ML exit model takes priority.
             if self._exit_model:
                 p_win = self._check_exit_model(cid, pos, bid, now)
@@ -794,20 +790,28 @@ class CryptoTDMaker:
 
             # Rule-based trigger.
             if prev_max >= self.stoploss_peak and bid <= self.stoploss_exit:
-                # Fair value override: skip if Chainlink says position is still good.
+                # Fair value override: skip if Chainlink says position is still good
+                # BUT only for the first 30s — a flash crash recovers in seconds,
+                # anything longer is a real adverse move.
                 fair = self._estimate_fair_value(cid, pos.outcome, now)
-                if fair is not None and fair > self.stoploss_exit + self.stoploss_fair_margin:
+                below_since = self._position_bid_below_exit_since.get(cid, now)
+                seconds_below = now - below_since
+                if (fair is not None
+                        and fair > self.stoploss_exit + self.stoploss_fair_margin
+                        and seconds_below < 30.0):
                     self.stoploss_overrides += 1
                     last_log = self._stoploss_override_log_ts.get(cid, 0)
                     if now - last_log >= 30.0:
                         self._stoploss_override_log_ts[cid] = now
                         logger.info("stoploss_chainlink_override",
                                     cid=cid[:16], bid=bid, fair=round(fair, 3),
+                                    seconds_below=round(seconds_below, 1),
                                     exit_threshold=self.stoploss_exit)
                     continue
                 logger.info("stoploss_rule_trigger", cid=cid[:16],
                             bid=bid, bid_max=round(prev_max, 3),
                             fair=round(fair, 3) if fair else None,
+                            seconds_below=round(seconds_below, 1),
                             peak=self.stoploss_peak, exit=self.stoploss_exit)
                 exits.append(cid)
 
@@ -895,6 +899,7 @@ class CryptoTDMaker:
         self.positions.pop(pos.condition_id, None)
         self._position_bid_max.pop(pos.condition_id, None)
         self._position_last_bid.pop(pos.condition_id, None)
+        self._position_bid_below_exit_since.pop(pos.condition_id, None)
         self._stoploss_override_log_ts.pop(pos.condition_id, None)
 
         # Cancel any remaining orders for this market.
@@ -1697,6 +1702,35 @@ class CryptoTDMaker:
                 self._db_fire(self._db_delete_order, oid)
         logger.warning("td_all_orders_cancelled", reason=reason, count=count)
 
+    async def _cancel_orphaned_orders(self) -> None:
+        """Cancel orders left on the CLOB by a previous process.
+
+        Fetches all open orders from the CLOB API and cancels any that
+        are not tracked in our active_orders dict.  This prevents ghost
+        orders from causing double fills after a restart.
+        """
+        try:
+            live_orders = await self.executor.get_open_orders()
+        except Exception as exc:
+            logger.warning("orphan_cancel_fetch_failed", error=str(exc)[:80])
+            return
+
+        known_oids = set(self.active_orders) | set(self._pending_cancels)
+        orphans = [o for o in live_orders if o.get("id") not in known_oids]
+        if not orphans:
+            return
+
+        cancelled = 0
+        for order in orphans:
+            oid = order.get("id", "")
+            try:
+                await self.executor.cancel_order(oid)
+                cancelled += 1
+            except Exception:
+                pass
+        logger.warning("orphan_orders_cancelled", found=len(orphans),
+                       cancelled=cancelled)
+
     async def _fill_listener(self) -> None:
         """Drain fills from WS User channel (live mode real-time detection)."""
         if not self.user_feed:
@@ -1941,6 +1975,7 @@ class CryptoTDMaker:
             self._book_history.pop(cid, None)
             self._position_bid_max.pop(cid, None)
             self._position_last_bid.pop(cid, None)
+            self._position_bid_below_exit_since.pop(cid, None)
             self._stoploss_override_log_ts.pop(cid, None)
             self._position_order_legs.pop(cid, None)
             for outcome in self.market_outcomes.pop(cid, []):
@@ -2076,6 +2111,7 @@ class CryptoTDMaker:
         pnl = pos.shares * (1.0 - pos.entry_price) if won else -pos.size_usd
         self._position_bid_max.pop(pos.condition_id, None)
         self._position_last_bid.pop(pos.condition_id, None)
+        self._position_bid_below_exit_since.pop(pos.condition_id, None)
         self._stoploss_override_log_ts.pop(pos.condition_id, None)
 
         if won:
@@ -2169,6 +2205,10 @@ class CryptoTDMaker:
             except Exception as exc:
                 logger.warning("user_ws_connect_failed", error=str(exc))
                 self.user_feed = None
+
+        # Cancel orphaned orders from previous runs before placing new ones.
+        if not self.paper_mode and self.executor:
+            await self._cancel_orphaned_orders()
 
         # Reconcile fills for any pending orders that were filled while we were down.
         if self.active_orders and not self.paper_mode:
