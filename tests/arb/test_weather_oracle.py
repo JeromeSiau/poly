@@ -10,6 +10,7 @@ from src.arb.weather_oracle import (
     OpenMeteoFetcher,
     ForecastData,
     CITY_STATIONS,
+    FORECAST_MODELS,
     WeatherMarketScanner,
     WeatherMarket,
 )
@@ -1015,3 +1016,103 @@ def test_days_to_resolution_passes_sweet_spot():
     signals = engine.evaluate_market(market, forecast)
     lottery = [s for s in signals if s.trade_type == "lottery"]
     assert len(lottery) == 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-model forecast tests (Tasks 1 & 2)
+# ---------------------------------------------------------------------------
+
+def test_forecast_data_has_model_temps():
+    """ForecastData should support per-model temperature storage."""
+    fc = ForecastData(
+        city="Dallas", date="2026-02-15",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit",
+        fetched_at=1000.0,
+        model_temps={"best_match": 66.0, "ecmwf_ifs025": 65.0, "gfs_seamless": 67.0},
+    )
+    assert fc.model_temps["ecmwf_ifs025"] == 65.0
+    assert len(fc.model_temps) == 3
+
+
+def test_forecast_data_defaults_empty_model_temps():
+    """ForecastData model_temps should default to empty dict."""
+    fc = ForecastData(
+        city="Dallas", date="2026-02-15",
+        temp_max=66.0, temp_min=45.0, unit="fahrenheit",
+        fetched_at=1000.0,
+    )
+    assert fc.model_temps == {}
+
+
+@pytest.mark.asyncio
+async def test_fetcher_multi_model_response():
+    """Fetcher should parse multi-model Open-Meteo response into ForecastData with model_temps."""
+    mock_response = {
+        "daily": {
+            "time": ["2026-02-15"],
+            "temperature_2m_max": [66.0],
+            "temperature_2m_min": [45.0],
+            "temperature_2m_max_best_match": [66.0],
+            "temperature_2m_max_ecmwf_ifs025": [65.0],
+            "temperature_2m_max_gfs_seamless": [67.0],
+        },
+    }
+
+    fetcher = OpenMeteoFetcher()
+
+    with patch("aiohttp.ClientSession") as mock_session_cls:
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=mock_response)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.get = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        forecasts = await fetcher.fetch_city("Dallas")
+
+    assert len(forecasts) == 1
+    fc = forecasts[0]
+    assert fc.model_temps["best_match"] == 66.0
+    assert fc.model_temps["ecmwf_ifs025"] == 65.0
+    assert fc.model_temps["gfs_seamless"] == 67.0
+    # temp_max should be the average of all models
+    assert fc.temp_max == pytest.approx(66.0, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_fetcher_single_model_fallback():
+    """Fetcher should still work if API returns no model-specific keys."""
+    mock_response = {
+        "daily": {
+            "time": ["2026-02-15"],
+            "temperature_2m_max": [66.0],
+            "temperature_2m_min": [45.0],
+        },
+    }
+
+    fetcher = OpenMeteoFetcher()
+
+    with patch("aiohttp.ClientSession") as mock_session_cls:
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=mock_response)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.get = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        forecasts = await fetcher.fetch_city("Dallas")
+
+    assert len(forecasts) == 1
+    fc = forecasts[0]
+    assert fc.temp_max == 66.0
+    assert fc.model_temps == {}  # no model-specific data

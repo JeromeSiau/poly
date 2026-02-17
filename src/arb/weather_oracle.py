@@ -82,6 +82,8 @@ CITY_STATIONS: dict[str, dict[str, Any]] = {
     },
 }
 
+FORECAST_MODELS = ["best_match", "ecmwf_ifs025", "gfs_seamless"]
+
 
 @dataclass
 class WeatherMarket:
@@ -106,6 +108,7 @@ class ForecastData:
     temp_min: float
     unit: str  # "fahrenheit" or "celsius"
     fetched_at: float  # unix timestamp
+    model_temps: dict[str, float] = field(default_factory=dict)  # model_name -> temp_max
 
 
 @dataclass
@@ -170,6 +173,7 @@ class OpenMeteoFetcher:
             "temperature_unit": station["unit"],
             "timezone": station["tz"],
             "forecast_days": settings.WEATHER_ORACLE_FORECAST_DAYS,
+            "models": ",".join(FORECAST_MODELS),
         }
 
         try:
@@ -198,17 +202,37 @@ class OpenMeteoFetcher:
         maxes = daily.get("temperature_2m_max", [])
         mins = daily.get("temperature_2m_min", [])
 
+        # Collect per-model temp_max arrays
+        model_maxes: dict[str, list[float]] = {}
+        for model in FORECAST_MODELS:
+            key = f"temperature_2m_max_{model}"
+            if key in daily:
+                model_maxes[model] = daily[key]
+
         now = time.time()
         forecasts = []
         for i, date_str in enumerate(dates):
             if i < len(maxes) and i < len(mins):
+                # Build per-model temps for this day
+                model_temps: dict[str, float] = {}
+                for model, model_vals in model_maxes.items():
+                    if i < len(model_vals) and model_vals[i] is not None:
+                        model_temps[model] = model_vals[i]
+
+                # Use average of models if available, otherwise the default
+                if model_temps:
+                    avg_max = sum(model_temps.values()) / len(model_temps)
+                else:
+                    avg_max = maxes[i]
+
                 forecasts.append(ForecastData(
                     city=city,
                     date=date_str,
-                    temp_max=maxes[i],
+                    temp_max=avg_max,
                     temp_min=mins[i],
                     unit=unit,
                     fetched_at=now,
+                    model_temps=model_temps,
                 ))
 
         self._cache[city] = forecasts
