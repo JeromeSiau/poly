@@ -20,6 +20,17 @@ Legacy strategies (code exists but not actively running):
 - **Crypto Arb**: CEX vs Polymarket price mismatches
 - **No-Bet Scanner**: Hype bias detection
 
+## Setup
+
+Python 3.13+. Install dependencies:
+
+```bash
+uv sync
+cp .env.example .env  # then fill in API keys
+```
+
+No linting or formatting tooling is configured (no ruff, black, mypy).
+
 ## Development Commands
 
 ```bash
@@ -94,6 +105,8 @@ Legacy modules (not actively used):
 - All prices are 0.0-1.0 (probability space); binary markets: YES + NO = 1.0
 - Scripts default to `--paper` (simulated fills); `--autopilot` or `--live` required for real orders
 - Strategy tags are mandatory for two-sided experiments (used for filtering in API and dashboards)
+- Logging via `structlog` — call `configure_logging()` from `src/utils/logging.py` at script startup
+- All strategy shell scripts source `bin/_common.sh` which sets PYTHONPATH, proxy from `.env`, and circuit breaker defaults: `CB_MAX_LOSSES=5`, `CB_MAX_DRAWDOWN=-50`, `CB_STALE_SECONDS=30`, `CB_DAILY_LIMIT=-200` (override via env vars)
 
 ## Trades API (Production Stats)
 
@@ -176,7 +189,7 @@ Key risk parameters (configurable via env):
 Production: MySQL via `DATABASE_URL=mysql+aiomysql://user:pass@host/db`
 Development/tests: SQLite via `DATABASE_URL=sqlite+aiosqlite:///data/arb.db` (default)
 
-All tables (trades, risk_state, slot_snapshots, slot_resolutions) live in a single database. RiskGuard uses SQLAlchemy ORM (no raw SQL).
+All tables (trades, risk_state, slot_snapshots, slot_resolutions) live in a single database. RiskGuard uses SQLAlchemy ORM (no raw SQL). No Alembic — schema migration is manual via `_migrate_add_columns()` in `src/db/database.py` (adds missing columns on init). Models split across `src/db/models.py` (legacy), `src/db/td_orders.py` (maker orders), `src/db/slot_models.py` (slot snapshots/resolutions).
 
 ## Historical Dataset (Backtesting)
 
