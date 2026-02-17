@@ -1000,6 +1000,7 @@ class WeatherOracleEngine:
             lottery_no_min_no_conf=self.lottery_no_min_no_confidence,
             yield_yes_enabled=self.yield_enabled,
             yield_no_enabled=self.no_enabled,
+            forecast_models=FORECAST_MODELS,
         )
 
         while True:
@@ -1047,6 +1048,7 @@ class WeatherOracleEngine:
                             price=signal.entry_price,
                             confidence=round(signal.confidence, 3),
                             forecast_max=signal.forecast.temp_max,
+                            model_temps=signal.forecast.model_temps if signal.forecast.model_temps else None,
                         )
                         trade = await self.enter_paper_trade(signal)
                         if trade:

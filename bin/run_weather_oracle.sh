@@ -25,8 +25,12 @@ export WEATHER_ORACLE_PAPER_SIZE_USD="$PAPER_SIZE_USD"
 export WEATHER_ORACLE_MAX_DAILY_SPEND="$MAX_DAILY_SPEND"
 export WEATHER_ORACLE_FORECAST_DAYS="$FORECAST_DAYS"
 
+# Yield NO settings (buy NO at 95c+ on unlikely outcomes)
+export WEATHER_ORACLE_NO_ENABLED="${NO_ENABLED:-true}"
+export WEATHER_ORACLE_NO_SIZE_USD="${NO_SIZE_USD:-5.0}"
+
 exec >> "$LOG_FILE" 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start mode=$MODE interval=$SCAN_INTERVAL max_entry=$MAX_ENTRY_PRICE min_conf=$MIN_CONFIDENCE paper_size=$PAPER_SIZE_USD max_daily=$MAX_DAILY_SPEND"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] start mode=$MODE interval=$SCAN_INTERVAL max_entry=$MAX_ENTRY_PRICE min_conf=$MIN_CONFIDENCE paper_size=$PAPER_SIZE_USD max_daily=$MAX_DAILY_SPEND yield_no=$WEATHER_ORACLE_NO_ENABLED"
 
 exec "$PYTHON" "$BASE/scripts/run_weather_oracle.py" \
   "$MODE" \

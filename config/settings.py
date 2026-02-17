@@ -230,9 +230,9 @@ class Settings(BaseSettings):
     WEATHER_ORACLE_YIELD_MIN_YES_PRICE: float = 0.80
     WEATHER_ORACLE_YIELD_MAX_YES_PRICE: float = 0.97
 
-    # Type 2 – Yield NO (buy NO at 95¢+ when outcome is unlikely — low edge)
-    WEATHER_ORACLE_NO_ENABLED: bool = False
-    WEATHER_ORACLE_NO_SIZE_USD: float = 10.0  # $10 per NO trade
+    # Type 2 – Yield NO (buy NO at 95¢+ when outcome is unlikely, multi-model consensus required)
+    WEATHER_ORACLE_NO_ENABLED: bool = True
+    WEATHER_ORACLE_NO_SIZE_USD: float = 5.0  # $5 per NO trade
     WEATHER_ORACLE_NO_MAX_CONFIDENCE: float = 0.10  # outcome must be unlikely
     WEATHER_ORACLE_NO_MAX_YES_PRICE: float = 0.05  # YES must be ≤5¢ (NO ≥95¢)
 
