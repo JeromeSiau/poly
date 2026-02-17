@@ -1821,9 +1821,7 @@ class CryptoTDMaker:
                 key = (order.condition_id, order.outcome)
                 if self._orders_by_cid_outcome.get(key) == oid:
                     del self._orders_by_cid_outcome[key]
-                self._rung_placed.discard(
-                    (order.condition_id, order.outcome, int(round(order.price * 100)))
-                )
+                # Keep _rung_placed — filled rung should stay marked (matches _fill_listener).
                 if self._cid_fill_count.get(order.condition_id, 0) <= 1:
                     self._cancel_other_side(order.condition_id, order.outcome)
                 recovered += 1
@@ -2138,6 +2136,9 @@ class CryptoTDMaker:
             recovered = await self._reconcile_fills()
             if recovered:
                 logger.info("startup_reconcile_complete", recovered=recovered)
+        # Clear reconnect signal from initial connect to avoid redundant re-check.
+        if self.user_feed:
+            self.user_feed.reconnected.clear()
 
         timeout = httpx.Timeout(20.0, connect=10.0)
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
