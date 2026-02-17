@@ -630,13 +630,14 @@ class CryptoTDMaker:
         At 0.85 one loss wipes ~5.7 wins vs ~3 at 0.75, so expensive rungs
         demand proportionally more confirmation.
 
-        Returns True (allow) when min_move_pct is 0 or data is unavailable.
+        Returns True (allow) when min_move_pct is 0.
+        Returns False (block) when min_move_pct > 0 but data is unavailable.
         """
         if self.min_move_pct <= 0:
             return True
         move = self._get_dir_move(cid, outcome)
         if move is None:
-            return True
+            return False
         if price > 0 and price < 1.0:
             base_ratio = self.target_bid / (1 - self.target_bid)
             rung_ratio = price / (1 - price)
@@ -1163,6 +1164,17 @@ class CryptoTDMaker:
             outcomes = self.market_outcomes.get(cid, [])
             if len(outcomes) < 2:
                 continue
+
+            # Retry ref price capture if it was missed at discovery time.
+            if (cid not in self._ref_prices
+                    and cid in self._cid_chainlink_symbol
+                    and self.chainlink_feed):
+                sym = self._cid_chainlink_symbol[cid]
+                ref = self.chainlink_feed.snapshot_price(sym)
+                if ref:
+                    self._ref_prices[cid] = ref
+                    logger.info("td_ref_price_retry_ok", cid=cid[:16],
+                                symbol=sym, ref_price=ref)
 
             # Record book snapshot for trend features (once per cid per tick).
             if self._model:
