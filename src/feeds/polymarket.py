@@ -600,6 +600,8 @@ class PolymarketUserFeed:
         self.fills: asyncio.Queue[UserTradeEvent] = asyncio.Queue()
         # Event signaled on every new fill.
         self.fill_received: asyncio.Event = asyncio.Event()
+        # Event signaled on WS reconnect (so consumers can reconcile missed fills).
+        self.reconnected: asyncio.Event = asyncio.Event()
 
     @property
     def is_connected(self) -> bool:
@@ -643,6 +645,7 @@ class PolymarketUserFeed:
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("user_ws_connected")
+                self.reconnected.set()
 
                 # Re-authenticate and re-subscribe.
                 await self._resubscribe_all()

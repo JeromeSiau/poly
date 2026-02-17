@@ -1103,6 +1103,24 @@ class CryptoTDMaker:
         if self.stoploss_peak > 0:
             await self._check_stop_losses(now)
 
+        # Immediate reconciliation on user WS reconnect.
+        if (
+            not self.paper_mode
+            and self.user_feed
+            and self.user_feed.reconnected.is_set()
+        ):
+            self.user_feed.reconnected.clear()
+            logger.info("reconcile_triggered_by_ws_reconnect")
+            await self._reconcile_fills()
+
+        # Periodic fill reconciliation (live mode only, every ~60s).
+        if (
+            not self.paper_mode
+            and self.executor
+            and self._cycle_count % max(1, int(60.0 / self.maker_loop_interval)) == 0
+        ):
+            await self._reconcile_fills()
+
         # Check exposure budget.
         current_exposure = sum(p.size_usd for p in self.positions.values())
         pending_exposure = sum(o.size_usd for o in self.active_orders.values())
