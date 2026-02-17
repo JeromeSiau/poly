@@ -791,14 +791,14 @@ class CryptoTDMaker:
             # Rule-based trigger.
             if prev_max >= self.stoploss_peak and bid <= self.stoploss_exit:
                 # Fair value override: skip if Chainlink says position is still good
-                # BUT only for the first 30s — a flash crash recovers in seconds,
+                # BUT only for the first 10s — a flash crash recovers in seconds,
                 # anything longer is a real adverse move.
                 fair = self._estimate_fair_value(cid, pos.outcome, now)
                 below_since = self._position_bid_below_exit_since.get(cid, now)
                 seconds_below = now - below_since
                 if (fair is not None
                         and fair > self.stoploss_exit + self.stoploss_fair_margin
-                        and seconds_below < 30.0):
+                        and seconds_below < 10.0):
                     self.stoploss_overrides += 1
                     last_log = self._stoploss_override_log_ts.get(cid, 0)
                     if now - last_log >= 30.0:
