@@ -240,6 +240,18 @@ class PolymarketExecutor:
         """Get open/live orders, optionally filtered by market (condition_id)."""
         return await asyncio.to_thread(self._get_open_orders_sync, market)
 
+    def _get_order_sync(self, order_id: str) -> dict[str, Any] | None:
+        self._ensure_creds()
+        try:
+            return self._client.get_order(order_id)
+        except Exception as exc:
+            logger.warning("polymarket_get_order_failed", order_id=order_id[:16], error=str(exc))
+            return None
+
+    async def get_order(self, order_id: str) -> dict[str, Any] | None:
+        """Fetch a single order by ID (any status: LIVE, MATCHED, CANCELLED)."""
+        return await asyncio.to_thread(self._get_order_sync, order_id)
+
     # USDC.e on Polygon (PoS-bridged, 6 decimals) — used by Polymarket
     _USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     _BALANCE_OF_SELECTOR = "0x70a08231"

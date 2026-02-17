@@ -1759,6 +1759,74 @@ class CryptoTDMaker:
                 self._cancel_other_side(matched_order.condition_id, matched_order.outcome)
 
     # ------------------------------------------------------------------
+    # Fill reconciliation (catch fills missed during WS downtime)
+    # ------------------------------------------------------------------
+
+    async def _reconcile_fills(self) -> int:
+        """Query CLOB API for each active order; process any that were filled.
+
+        Returns the number of fills recovered.
+        """
+        if not self.executor or self.paper_mode:
+            return 0
+
+        recovered = 0
+        # Snapshot keys — dict may mutate during iteration.
+        order_ids = list(self.active_orders.keys())
+        for oid in order_ids:
+            order = self.active_orders.get(oid)
+            if not order:
+                continue
+
+            try:
+                resp = await self.executor.get_order(oid)
+            except Exception as exc:
+                logger.warning("reconcile_get_order_error", order_id=oid[:16], error=str(exc))
+                continue
+
+            if resp is None:
+                continue
+
+            status = resp.get("status", "").upper()
+
+            if status in ("MATCHED", "FILLED"):
+                logger.warning(
+                    "reconcile_fill_recovered",
+                    order_id=oid[:16],
+                    condition_id=order.condition_id[:16],
+                    outcome=order.outcome,
+                    price=order.price,
+                )
+                now = time.time()
+                self._process_fill(order, now)
+                self.active_orders.pop(oid, None)
+                key = (order.condition_id, order.outcome)
+                if self._orders_by_cid_outcome.get(key) == oid:
+                    del self._orders_by_cid_outcome[key]
+                self._rung_placed.discard(
+                    (order.condition_id, order.outcome, int(round(order.price * 100)))
+                )
+                if self._cid_fill_count.get(order.condition_id, 0) <= 1:
+                    self._cancel_other_side(order.condition_id, order.outcome)
+                recovered += 1
+
+            elif status == "CANCELLED":
+                logger.info("reconcile_order_cancelled", order_id=oid[:16])
+                self.active_orders.pop(oid, None)
+                key = (order.condition_id, order.outcome)
+                if self._orders_by_cid_outcome.get(key) == oid:
+                    del self._orders_by_cid_outcome[key]
+                self._rung_placed.discard(
+                    (order.condition_id, order.outcome, int(round(order.price * 100)))
+                )
+                self._db_fire(self._db_delete_order, oid)
+            # else: LIVE / OPEN — leave in active_orders
+
+        if recovered:
+            logger.info("reconcile_summary", recovered=recovered, checked=len(order_ids))
+        return recovered
+
+    # ------------------------------------------------------------------
     # Settlement
     # ------------------------------------------------------------------
 

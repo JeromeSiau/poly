@@ -3,7 +3,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -889,3 +889,164 @@ class TestModelFilterInLadder:
         await maker._maker_tick()
 
         assert len(maker.active_orders) == 0
+
+
+# ---------------------------------------------------------------------------
+# Fill reconciliation: recover fills missed during WS downtime
+# ---------------------------------------------------------------------------
+
+
+class _FakeExecutor:
+    """Minimal executor stub returning canned get_order responses."""
+
+    def __init__(self, order_responses: dict[str, dict] | None = None):
+        self._order_responses = order_responses or {}
+        self.cancelled: list[str] = []
+
+    async def get_order(self, order_id: str) -> dict | None:
+        return self._order_responses.get(order_id)
+
+    async def cancel_order(self, order_id: str) -> dict:
+        self.cancelled.append(order_id)
+        return {"status": "OK"}
+
+    async def get_open_orders(self, market: str = "") -> list[dict]:
+        return []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_detects_filled_order():
+    """Reconciliation should detect an order filled while WS was down."""
+    cid = "0xabc123"
+    token_id = "tok_btc_up"
+    feed = _make_feed_with_book(cid, "Up", token_id, bid=0.90, ask=0.91)
+    executor = _FakeExecutor(order_responses={
+        "order_123": {
+            "id": "order_123",
+            "status": "MATCHED",
+            "side": "BUY",
+            "price": "0.78",
+            "original_size": "12.82",
+            "size_matched": "12.82",
+            "asset_id": token_id,
+            "market": cid,
+            "outcome": "Up",
+        },
+    })
+    maker = _make_maker(feed, executor=executor, paper_mode=False)
+    maker.manager = Mock(spec=TradeManager)
+    maker.manager._pending = {}
+    maker.manager.record_fill_direct = AsyncMock()
+
+    # Inject a pending order the bot thinks is still active
+    oid = "order_123"
+    order = PassiveOrder(
+        order_id=oid, condition_id=cid, outcome="Up",
+        token_id=token_id, price=0.78, size_usd=10.0,
+        placed_at=time.time() - 60,
+    )
+    maker.active_orders[oid] = order
+    maker._orders_by_cid_outcome[(cid, "Up")] = oid
+    maker.market_outcomes[cid] = ["Up", "Down"]
+
+    reconciled = await maker._reconcile_fills()
+
+    assert reconciled == 1
+    assert oid not in maker.active_orders
+    assert cid in maker.positions
+    pos = maker.positions[cid]
+    assert pos.outcome == "Up"
+    assert pos.entry_price == 0.78
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_live_orders():
+    """Orders still LIVE on the book should not be touched."""
+    cid = "0xdef456"
+    token_id = "tok_sol_up"
+    feed = _make_feed_with_book(cid, "Up", token_id, bid=0.80, ask=0.81)
+    executor = _FakeExecutor(order_responses={
+        "order_live": {
+            "id": "order_live",
+            "status": "LIVE",
+            "price": "0.80",
+            "original_size": "12.5",
+            "size_matched": "0",
+            "asset_id": token_id,
+            "market": cid,
+        },
+    })
+    maker = _make_maker(feed, executor=executor, paper_mode=False)
+
+    order = PassiveOrder(
+        order_id="order_live", condition_id=cid, outcome="Up",
+        token_id=token_id, price=0.80, size_usd=10.0,
+        placed_at=time.time() - 30,
+    )
+    maker.active_orders["order_live"] = order
+    maker._orders_by_cid_outcome[(cid, "Up")] = "order_live"
+    maker.market_outcomes[cid] = ["Up", "Down"]
+
+    reconciled = await maker._reconcile_fills()
+
+    assert reconciled == 0
+    assert "order_live" in maker.active_orders
+    assert cid not in maker.positions
+
+
+@pytest.mark.asyncio
+async def test_reconcile_handles_cancelled_order():
+    """CANCELLED orders should be cleaned up from active_orders."""
+    cid = "0xghi789"
+    token_id = "tok_xrp_up"
+    feed = _make_feed_with_book(cid, "Up", token_id, bid=0.70, ask=0.71)
+    executor = _FakeExecutor(order_responses={
+        "order_cancel": {
+            "id": "order_cancel",
+            "status": "CANCELLED",
+            "price": "0.76",
+            "original_size": "13.16",
+            "size_matched": "0",
+            "asset_id": token_id,
+            "market": cid,
+        },
+    })
+    maker = _make_maker(feed, executor=executor, paper_mode=False)
+
+    order = PassiveOrder(
+        order_id="order_cancel", condition_id=cid, outcome="Up",
+        token_id=token_id, price=0.76, size_usd=10.0,
+        placed_at=time.time() - 30,
+    )
+    maker.active_orders["order_cancel"] = order
+    maker._orders_by_cid_outcome[(cid, "Up")] = "order_cancel"
+    maker.market_outcomes[cid] = ["Up", "Down"]
+
+    reconciled = await maker._reconcile_fills()
+
+    assert reconciled == 0
+    assert "order_cancel" not in maker.active_orders
+    assert cid not in maker.positions
+
+
+@pytest.mark.asyncio
+async def test_reconcile_handles_api_failure():
+    """If the API returns None (error), the order stays as-is."""
+    cid = "0xjkl012"
+    token_id = "tok_eth_up"
+    feed = _make_feed_with_book(cid, "Up", token_id, bid=0.80, ask=0.81)
+    executor = _FakeExecutor(order_responses={})  # returns None for unknown orders
+    maker = _make_maker(feed, executor=executor, paper_mode=False)
+
+    order = PassiveOrder(
+        order_id="order_unknown", condition_id=cid, outcome="Up",
+        token_id=token_id, price=0.80, size_usd=10.0,
+        placed_at=time.time() - 30,
+    )
+    maker.active_orders["order_unknown"] = order
+    maker._orders_by_cid_outcome[(cid, "Up")] = "order_unknown"
+
+    reconciled = await maker._reconcile_fills()
+
+    assert reconciled == 0
+    assert "order_unknown" in maker.active_orders
