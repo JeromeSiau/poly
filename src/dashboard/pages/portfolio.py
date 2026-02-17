@@ -1,6 +1,6 @@
 """Portfolio page — Live + Paper mode with internal toggle."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -13,6 +13,7 @@ from src.dashboard._shared import (
     C_MUTED,
     C_RED,
     C_TEXT,
+    PERIOD_PRESETS,
     api,
     parse_asset,
     parse_slot_ts,
@@ -21,6 +22,21 @@ from src.dashboard._shared import (
     style_pnl,
     style_result,
 )
+
+# -- Period filter (inline, same position as ML page) --
+period_col, date_col = st.columns([1, 2])
+with period_col:
+    st.radio("Period", list(PERIOD_PRESETS.keys()), index=0, horizontal=True, key="period")
+preset_days = PERIOD_PRESETS.get(st.session_state.get("period", "24h"), 1)
+if preset_days == -1:
+    with date_col:
+        today = date.today()
+        st.date_input(
+            "Date range",
+            value=(today - timedelta(days=14), today),
+            max_value=today,
+            key="period_dates",
+        )
 
 # ---------------------------------------------------------------------------
 # Tab 1: Live
