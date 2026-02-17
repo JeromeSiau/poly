@@ -76,16 +76,17 @@ with tab_live:
     kpi_section()
     st.markdown('<div style="height: 8px"></div>', unsafe_allow_html=True)
 
-    # -- Cumulative PnL --
+    # -- Cumulative PnL + Balance curves --
     @st.fragment(run_every="15s")
     def pnl_chart_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
 
-        st.markdown('<p class="section-label">Cumulative PnL</p>', unsafe_allow_html=True)
-
+        balance_data = api("/balance", {"mode": m})
         winrate_data = api("/winrate", {"mode": m, **pp})
         markets = winrate_data.get("markets", [])
+        current_bal = balance_data.get("balance", 0.0)
+        total_pnl = winrate_data.get("total_pnl", 0.0)
 
         if not markets:
             st.caption("No resolved trades yet")
@@ -107,22 +108,50 @@ with tab_live:
 
         df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
         df["cum_pnl"] = df["pnl"].cumsum()
+        start_bal = current_bal - total_pnl
+        df["balance"] = start_bal + df["cum_pnl"]
 
-        final_pnl = df["cum_pnl"].iloc[-1]
-        color = C_GREEN if final_pnl >= 0 else C_RED
-        fill = "rgba(52,211,153,0.08)" if final_pnl >= 0 else "rgba(248,113,113,0.08)"
+        col_pnl, col_bal = st.columns(2)
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df["time"], y=df["cum_pnl"],
-            mode="lines",
-            line=dict(color=color, width=1.5),
-            fill="tozeroy", fillcolor=fill,
-            hovertemplate="%{x|%H:%M}<br>$%{y:+.2f}<extra></extra>",
-        ))
-        fig.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
-        fig.update_layout(**plotly_layout(height=300))
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        # -- Cumulative PnL --
+        with col_pnl:
+            st.markdown('<p class="section-label">Cumulative PnL</p>', unsafe_allow_html=True)
+            final_pnl = df["cum_pnl"].iloc[-1]
+            pnl_up = final_pnl >= 0
+            pnl_color = C_GREEN if pnl_up else C_RED
+            pnl_fill = "rgba(52,211,153,0.08)" if pnl_up else "rgba(248,113,113,0.08)"
+
+            fig_pnl = go.Figure()
+            fig_pnl.add_trace(go.Scatter(
+                x=df["time"], y=df["cum_pnl"],
+                mode="lines",
+                line=dict(color=pnl_color, width=1.5),
+                fill="tozeroy", fillcolor=pnl_fill,
+                hovertemplate="%{x|%H:%M}<br>$%{y:+,.2f}<extra></extra>",
+            ))
+            fig_pnl.add_hline(y=0, line=dict(color="#334155", width=0.5, dash="dot"))
+            fig_pnl.update_layout(**plotly_layout(height=280))
+            st.plotly_chart(fig_pnl, use_container_width=True, config={"displayModeBar": False})
+
+        # -- Balance --
+        with col_bal:
+            st.markdown('<p class="section-label">Balance</p>', unsafe_allow_html=True)
+            final_bal = df["balance"].iloc[-1]
+            bal_up = final_bal >= start_bal
+            bal_color = C_GREEN if bal_up else C_RED
+            bal_fill = "rgba(52,211,153,0.08)" if bal_up else "rgba(248,113,113,0.08)"
+
+            fig_bal = go.Figure()
+            fig_bal.add_trace(go.Scatter(
+                x=df["time"], y=df["balance"],
+                mode="lines",
+                line=dict(color=bal_color, width=1.5),
+                fill="tozeroy", fillcolor=bal_fill,
+                hovertemplate="%{x|%H:%M}<br>$%{y:,.2f}<extra></extra>",
+            ))
+            fig_bal.add_hline(y=start_bal, line=dict(color="#334155", width=0.5, dash="dot"))
+            fig_bal.update_layout(**plotly_layout(height=280))
+            st.plotly_chart(fig_bal, use_container_width=True, config={"displayModeBar": False})
 
     pnl_chart_section()
 
