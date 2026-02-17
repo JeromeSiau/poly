@@ -199,41 +199,61 @@ class OpenMeteoFetcher:
         """Parse Open-Meteo daily response into ForecastData list."""
         daily = data.get("daily", {})
         dates = daily.get("time", [])
+
+        # Collect per-model temp arrays (max and min)
+        model_maxes: dict[str, list[float]] = {}
+        model_mins: dict[str, list[float]] = {}
+        for model in FORECAST_MODELS:
+            max_key = f"temperature_2m_max_{model}"
+            min_key = f"temperature_2m_min_{model}"
+            if max_key in daily:
+                model_maxes[model] = daily[max_key]
+            if min_key in daily:
+                model_mins[model] = daily[min_key]
+
+        # Fallback: plain keys (when models param not used or API returns them)
         maxes = daily.get("temperature_2m_max", [])
         mins = daily.get("temperature_2m_min", [])
-
-        # Collect per-model temp_max arrays
-        model_maxes: dict[str, list[float]] = {}
-        for model in FORECAST_MODELS:
-            key = f"temperature_2m_max_{model}"
-            if key in daily:
-                model_maxes[model] = daily[key]
 
         now = time.time()
         forecasts = []
         for i, date_str in enumerate(dates):
-            if i < len(maxes) and i < len(mins):
-                # Build per-model temps for this day
-                model_temps: dict[str, float] = {}
-                for model, model_vals in model_maxes.items():
-                    if i < len(model_vals) and model_vals[i] is not None:
-                        model_temps[model] = model_vals[i]
+            # Build per-model temps for this day
+            model_temps: dict[str, float] = {}
+            for model, model_vals in model_maxes.items():
+                if i < len(model_vals) and model_vals[i] is not None:
+                    model_temps[model] = model_vals[i]
 
-                # Use average of models if available, otherwise the default
-                if model_temps:
-                    avg_max = sum(model_temps.values()) / len(model_temps)
-                else:
-                    avg_max = maxes[i]
+            # Compute temp_max: average of models, or fallback to plain key
+            if model_temps:
+                avg_max = sum(model_temps.values()) / len(model_temps)
+            elif i < len(maxes):
+                avg_max = maxes[i]
+            else:
+                continue  # no data for this day
 
-                forecasts.append(ForecastData(
-                    city=city,
-                    date=date_str,
-                    temp_max=avg_max,
-                    temp_min=mins[i],
-                    unit=unit,
-                    fetched_at=now,
-                    model_temps=model_temps,
-                ))
+            # Compute temp_min: average of model mins, or fallback to plain key
+            model_min_vals = [
+                model_mins[m][i]
+                for m in model_mins
+                if i < len(model_mins[m]) and model_mins[m][i] is not None
+            ]
+            if model_min_vals:
+                avg_min = sum(model_min_vals) / len(model_min_vals)
+            elif i < len(mins):
+                avg_min = mins[i]
+            else:
+                avg_min = avg_max - 15.0  # rough fallback
+
+            forecasts.append(ForecastData(
+                city=city,
+                date=date_str,
+                temp_max=avg_max,
+                temp_min=avg_min,
+                unit=unit,
+                fetched_at=now,
+                model_temps=model_temps,
+            ))
 
         self._cache[city] = forecasts
         self._last_fetch[city] = now
