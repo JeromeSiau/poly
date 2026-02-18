@@ -1105,12 +1105,37 @@ class CryptoTDMaker:
             self._last_book_update = feed_ts
 
         # Expire stale pending cancels (>30s since cancel was sent).
+        # IMPORTANT: before deleting, check CLOB status — the order may have
+        # been filled on-chain despite our cancel request (e.g. cancel arrived
+        # too late, or WS fill notification was lost during stale period).
         stale_cancel_ids = [
             oid for oid, order in self._pending_cancels.items()
             if order.cancelled_at > 0 and now - order.cancelled_at > 30.0
         ]
         for oid in stale_cancel_ids:
-            order = self._pending_cancels.pop(oid)
+            order = self._pending_cancels[oid]
+            # Query CLOB for final order status before discarding.
+            if not self.paper_mode and self.executor:
+                try:
+                    resp = await self.executor.get_order(oid)
+                    status = (resp or {}).get("status", "").upper()
+                    if status in ("MATCHED", "FILLED"):
+                        logger.warning(
+                            "pending_cancel_was_filled",
+                            order_id=oid[:16],
+                            condition_id=order.condition_id[:16],
+                            outcome=order.outcome,
+                            price=order.price,
+                        )
+                        self._pending_cancels.pop(oid)
+                        self._process_fill(order, now)
+                        if self._cid_fill_count.get(order.condition_id, 0) <= 1:
+                            self._cancel_other_side(order.condition_id, order.outcome)
+                        continue
+                except Exception as exc:
+                    logger.warning("pending_cancel_check_failed",
+                                   order_id=oid[:16], error=str(exc)[:80])
+            self._pending_cancels.pop(oid)
             self._db_fire(self._db_delete_order, oid)
             logger.debug("td_pending_cancel_expired", order_id=oid[:16])
 
@@ -1835,7 +1860,11 @@ class CryptoTDMaker:
     # ------------------------------------------------------------------
 
     async def _reconcile_fills(self) -> int:
-        """Query CLOB API for each active order; process any that were filled.
+        """Query CLOB API for each active/pending-cancel order; process fills.
+
+        Checks both active_orders AND _pending_cancels to catch fills that
+        arrived while an order was being cancelled (e.g. stale escalation
+        cancelled the order but it was already filled on-chain).
 
         Returns the number of fills recovered.
         """
@@ -1843,7 +1872,9 @@ class CryptoTDMaker:
             return 0
 
         recovered = 0
-        # Snapshot keys — dict may mutate during iteration.
+        now = time.time()
+
+        # Check active orders.
         order_ids = list(self.active_orders.keys())
         for oid in order_ids:
             order = self.active_orders.get(oid)
@@ -1869,13 +1900,12 @@ class CryptoTDMaker:
                     outcome=order.outcome,
                     price=order.price,
                 )
-                now = time.time()
                 self._process_fill(order, now)
                 self.active_orders.pop(oid, None)
                 key = (order.condition_id, order.outcome)
                 if self._orders_by_cid_outcome.get(key) == oid:
                     del self._orders_by_cid_outcome[key]
-                # Keep _rung_placed — filled rung should stay marked (matches _fill_listener).
+                # Keep _rung_placed — filled rung should stay marked.
                 if self._cid_fill_count.get(order.condition_id, 0) <= 1:
                     self._cancel_other_side(order.condition_id, order.outcome)
                 recovered += 1
@@ -1891,6 +1921,41 @@ class CryptoTDMaker:
                 )
                 self._db_fire(self._db_delete_order, oid)
             # else: LIVE / OPEN — leave in active_orders
+
+        # Also check pending cancels — orders moved here during stale
+        # escalation may have been filled on-chain before the cancel arrived.
+        pending_ids = list(self._pending_cancels.keys())
+        for oid in pending_ids:
+            order = self._pending_cancels.get(oid)
+            if not order:
+                continue
+            # Skip if position already exists (fill listener already got it).
+            if order.condition_id in self.positions:
+                continue
+
+            try:
+                resp = await self.executor.get_order(oid)
+            except Exception as exc:
+                logger.warning("reconcile_pending_error", order_id=oid[:16], error=str(exc))
+                continue
+
+            if resp is None:
+                continue
+
+            status = resp.get("status", "").upper()
+            if status in ("MATCHED", "FILLED"):
+                logger.warning(
+                    "reconcile_pending_cancel_was_filled",
+                    order_id=oid[:16],
+                    condition_id=order.condition_id[:16],
+                    outcome=order.outcome,
+                    price=order.price,
+                )
+                self._pending_cancels.pop(oid, None)
+                self._process_fill(order, now)
+                if self._cid_fill_count.get(order.condition_id, 0) <= 1:
+                    self._cancel_other_side(order.condition_id, order.outcome)
+                recovered += 1
 
         if recovered:
             logger.info("reconcile_summary", recovered=recovered, checked=len(order_ids))

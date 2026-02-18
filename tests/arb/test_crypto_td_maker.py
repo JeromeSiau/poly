@@ -1091,3 +1091,80 @@ async def test_reconcile_on_startup_recovers_filled_orders():
     assert reconciled == 1
     assert cid in maker.positions
     assert maker.positions[cid].entry_price == 0.80
+
+
+@pytest.mark.asyncio
+async def test_reconcile_recovers_filled_pending_cancel():
+    """A cancelled order that was actually filled on-chain should be recovered."""
+    cid = "0xpending"
+    token_id = "tok_pending"
+    feed = _make_feed_with_book(cid, "Up", token_id, bid=0.90, ask=0.91)
+    executor = _FakeExecutor(order_responses={
+        "cancelled_order": {
+            "id": "cancelled_order",
+            "status": "MATCHED",
+            "price": "0.75",
+            "original_size": "13.33",
+            "size_matched": "13.33",
+            "asset_id": token_id,
+            "market": cid,
+        },
+    })
+    maker = _make_maker(feed, executor=executor, paper_mode=False)
+    maker.manager = Mock(spec=TradeManager)
+    maker.manager.record_fill_direct = AsyncMock()
+    maker.manager._pending = {}
+
+    # Simulate: order was cancelled (stale escalation) but actually filled.
+    order = PassiveOrder(
+        order_id="cancelled_order", condition_id=cid, outcome="Up",
+        token_id=token_id, price=0.75, size_usd=10.0,
+        placed_at=time.time() - 120,
+        cancelled_at=time.time() - 60,
+    )
+    maker._pending_cancels["cancelled_order"] = order
+    maker.market_outcomes[cid] = ["Up", "Down"]
+
+    reconciled = await maker._reconcile_fills()
+
+    assert reconciled == 1
+    assert cid in maker.positions
+    assert maker.positions[cid].entry_price == 0.75
+    assert "cancelled_order" not in maker._pending_cancels
+
+
+@pytest.mark.asyncio
+async def test_pending_cancel_not_recovered_when_truly_cancelled():
+    """A pending cancel that was truly cancelled should not create a position."""
+    cid = "0xtruly_cancelled"
+    token_id = "tok_cancelled"
+    feed = _make_feed_with_book(cid, "Up", token_id, bid=0.90, ask=0.91)
+    executor = _FakeExecutor(order_responses={
+        "cancelled_order": {
+            "id": "cancelled_order",
+            "status": "CANCELLED",
+            "price": "0.75",
+            "original_size": "13.33",
+            "size_matched": "0",
+            "asset_id": token_id,
+            "market": cid,
+        },
+    })
+    maker = _make_maker(feed, executor=executor, paper_mode=False)
+    maker.manager = Mock(spec=TradeManager)
+    maker.manager.record_fill_direct = AsyncMock()
+    maker.manager._pending = {}
+
+    order = PassiveOrder(
+        order_id="cancelled_order", condition_id=cid, outcome="Up",
+        token_id=token_id, price=0.75, size_usd=10.0,
+        placed_at=time.time() - 120,
+        cancelled_at=time.time() - 60,
+    )
+    maker._pending_cancels["cancelled_order"] = order
+    maker.market_outcomes[cid] = ["Up", "Down"]
+
+    reconciled = await maker._reconcile_fills()
+
+    assert reconciled == 0
+    assert cid not in maker.positions
