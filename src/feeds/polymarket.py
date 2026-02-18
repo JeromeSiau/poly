@@ -559,7 +559,11 @@ class PolymarketFeed(BaseFeed):
             asks[0][0] if asks else None,
             asks[0][1] if asks else None,
         )
-        self.last_update_ts = time.time()
+        # Only count as a real update if there's actual price data.
+        # Empty book snapshots must NOT reset the stale timer, otherwise
+        # the WS appears "alive" while sending only empty books.
+        if bids or asks:
+            self.last_update_ts = time.time()
         self.book_updated.set()
 
     def _merge_levels(

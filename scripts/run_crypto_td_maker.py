@@ -1445,9 +1445,17 @@ class CryptoTDMaker:
             exposure = sum(p.size_usd for p in self.positions.values())
             winrate = self.total_wins / self.total_fills * 100 if self.total_fills else 0
 
-            # Snapshot of current best bids per outcome (most recent markets first).
+            # Snapshot of best bids — prefer markets that have book data.
             price_parts: list[str] = []
-            for cid in list(self.known_markets)[-4:]:
+            all_cids = list(self.known_markets)
+            # Sort: markets with book data first, then most recent.
+            def _has_book(c: str) -> bool:
+                return any(
+                    self.polymarket.get_best_prices(c, o) != (None, None)
+                    for o in self.market_outcomes.get(c, [])
+                )
+            display_cids = sorted(all_cids, key=lambda c: (not _has_book(c), all_cids.index(c)))[:4]
+            for cid in display_cids:
                 for outcome in self.market_outcomes.get(cid, []):
                     bid, _, ask, _ = self.polymarket.get_best_levels(cid, outcome)
                     bid_s = f"{bid:.2f}" if bid else "?"
