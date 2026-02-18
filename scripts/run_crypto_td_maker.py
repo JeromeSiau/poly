@@ -1139,6 +1139,12 @@ class CryptoTDMaker:
             self._db_fire(self._db_delete_order, oid)
             logger.debug("td_pending_cancel_expired", order_id=oid[:16])
 
+        # Stop-loss MUST run before the circuit breaker gate — when the WS
+        # is stale the book data may still be valid enough to detect a crash,
+        # and skipping stop-loss during stale periods is the worst-case scenario.
+        if self.stoploss_peak > 0:
+            await self._check_stop_losses(now)
+
         # Circuit breaker gate
         if self.guard:
             await self.guard.heartbeat()
@@ -1154,10 +1160,6 @@ class CryptoTDMaker:
         # Check for paper fills every tick.
         if self.paper_mode:
             self._check_fills_paper(now)
-
-        # Stop-loss: exit positions where bid peaked then crashed.
-        if self.stoploss_peak > 0:
-            await self._check_stop_losses(now)
 
         # Immediate reconciliation on user WS reconnect.
         if (
