@@ -24,6 +24,7 @@ logger = structlog.get_logger()
 WS_URL = "wss://ws-live-data.polymarket.com"
 PING_INTERVAL = 10.0
 STALE_THRESHOLD = 60.0  # force reconnect if no price update for this long
+CONNECT_TIMEOUT = 10.0  # max seconds for WS handshake
 RECONNECT_BASE = 1.0
 RECONNECT_MAX = 30.0
 
@@ -49,6 +50,7 @@ class ChainlinkFeed:
         self._last_update_ts: float = 0.0
         self._connection_task: Optional[asyncio.Task] = None
         self._shutdown: bool = False
+        self._reconnect_count: int = 0
 
     @property
     def is_connected(self) -> bool:
@@ -99,23 +101,45 @@ class ChainlinkFeed:
         backoff = RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(WS_URL, proxy=None)
+                self._ws = await websockets.connect(
+                    WS_URL, proxy=None, open_timeout=CONNECT_TIMEOUT,
+                )
                 self._connected = True
+                self._reconnect_count = 0
                 backoff = RECONNECT_BASE
                 logger.info("chainlink_ws_connected")
 
                 await self._subscribe()
-                await asyncio.gather(
-                    self._keepalive_loop(),
-                    self._receive_loop(),
+                # Mark subscribe time so stale detection works even if
+                # we never receive a single price update.
+                self._last_update_ts = time.time()
+
+                # Use FIRST_COMPLETED so that when keepalive detects
+                # stale data and returns, we immediately break out
+                # instead of waiting for _receive_loop (which blocks
+                # on recv() forever when no data arrives).
+                tasks = [
+                    asyncio.create_task(self._keepalive_loop()),
+                    asyncio.create_task(self._receive_loop()),
+                ]
+                _done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED,
                 )
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                self._reconnect_count += 1
                 logger.warning(
                     "chainlink_ws_disconnected",
                     error=str(exc)[:120],
                     reconnect_in=backoff,
+                    attempt=self._reconnect_count,
                 )
 
             await self._close_ws()
