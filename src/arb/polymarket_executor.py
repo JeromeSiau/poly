@@ -267,7 +267,7 @@ class PolymarketExecutor:
     # USDC.e on Polygon (PoS-bridged, 6 decimals) — used by Polymarket
     _USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     _BALANCE_OF_SELECTOR = "0x70a08231"
-    _DEFAULT_RPC = "https://polygon-rpc.com"
+    _DEFAULT_RPC = "https://rpc.ankr.com/polygon"
 
     def _get_balance_sync(self) -> float:
         """Query on-chain USDC.e balance on Polygon for the funder wallet."""
