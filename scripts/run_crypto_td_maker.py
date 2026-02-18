@@ -190,6 +190,7 @@ class CryptoTDMaker:
         self.active_orders: dict[str, PassiveOrder] = {}  # order_id -> order
         self._orders_by_cid_outcome: dict[tuple[str, str], str] = {}
         self.positions: dict[str, OpenPosition] = {}  # cid -> position
+        self._awaiting_settlement: set[str] = set()  # cids where orderbook is gone
         # Orders being cancelled — kept for late fill detection.
         self._pending_cancels: dict[str, PassiveOrder] = {}  # order_id -> order
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -732,6 +733,9 @@ class CryptoTDMaker:
         """
         exits: list[str] = []
         for cid, pos in self.positions.items():
+            # Skip positions awaiting settlement (orderbook already gone).
+            if cid in self._awaiting_settlement:
+                continue
             bid, _, _, _ = self.polymarket.get_best_levels(cid, pos.outcome)
 
             # Empty book: trigger stoploss if conditions met.
@@ -889,8 +893,17 @@ class CryptoTDMaker:
                     sell_intent, order_type="GTC", force_taker=True)
                 sell_ok = bool(pending.order_id)  # empty string = executor error
             except Exception as exc:
+                err_str = str(exc)
                 logger.error("stop_loss_sell_failed",
-                             cid=pos.condition_id[:16], error=str(exc)[:80])
+                             cid=pos.condition_id[:16], error=err_str[:80])
+                # Orderbook gone = market resolved/expired. Don't retry,
+                # let _prune_expired settle via resolution query instead.
+                if "does not exist" in err_str:
+                    logger.warning("stop_loss_market_resolved",
+                                   cid=pos.condition_id[:16],
+                                   hint="orderbook gone, deferring to settlement")
+                    self._awaiting_settlement.add(pos.condition_id)
+                    return
 
         if not sell_ok:
             logger.warning("stop_loss_sell_not_confirmed", cid=pos.condition_id[:16],
@@ -2029,6 +2042,7 @@ class CryptoTDMaker:
             self._ref_prices.pop(cid, None)
             self._cid_chainlink_symbol.pop(cid, None)
             self._cid_slot_ts.pop(cid, None)
+            self._awaiting_settlement.discard(cid)
             self._cid_fill_analytics.pop(cid, None)
             self._book_history.pop(cid, None)
             self._position_bid_max.pop(cid, None)
