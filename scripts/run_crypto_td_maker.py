@@ -58,6 +58,7 @@ from src.utils.fair_value import estimate_fair_value
 from src.utils.parsing import parse_json_list, _to_float, _first_event_slug
 from src.execution import TradeManager, TradeIntent, FillResult
 from src.risk.guard import RiskGuard
+from src.shadow.taker_shadow import TakerShadow
 
 logger = structlog.get_logger()
 
@@ -227,6 +228,7 @@ class CryptoTDMaker:
         self.realized_pnl: float = 0.0
         self.stoploss_overrides: int = 0  # fair value override count
         self._stoploss_override_log_ts: dict[str, float] = {}  # cid -> last log ts
+        self.shadow = TakerShadow()
 
         # ML entry model (optional)
         self._model = None
@@ -1387,6 +1389,11 @@ class CryptoTDMaker:
                 placed += 1
                 placed_cids_this_tick.add(cid)
                 budget_left -= intent_size_usd
+                # Shadow taker: record what a taker would have done at the ask.
+                _, _, s_ask, _ = self.polymarket.get_best_levels(cid, outcome)
+                if s_ask is not None and not self.shadow.has(cid):
+                    self.shadow.record(cid, outcome, s_ask, intent_size_usd,
+                                       self._get_dir_move(cid, outcome))
 
         # Periodic status (every 30s wall-clock).
         if now - self._last_status_time >= 30.0:
@@ -1394,9 +1401,9 @@ class CryptoTDMaker:
             exposure = sum(p.size_usd for p in self.positions.values())
             winrate = self.total_wins / self.total_fills * 100 if self.total_fills else 0
 
-            # Snapshot of current best bids per outcome.
+            # Snapshot of current best bids per outcome (most recent markets first).
             price_parts: list[str] = []
-            for cid in list(self.known_markets)[:4]:
+            for cid in list(self.known_markets)[-4:]:
                 for outcome in self.market_outcomes.get(cid, []):
                     bid, _, ask, _ = self.polymarket.get_best_levels(cid, outcome)
                     bid_s = f"{bid:.2f}" if bid else "?"
@@ -1414,7 +1421,8 @@ class CryptoTDMaker:
                 f"sl_ovr={self.stoploss_overrides} "
                 f"pnl=${self.realized_pnl:+.2f} "
                 f"exp=${exposure:.0f} "
-                f"prices=[{' '.join(price_parts)}]"
+                f"prices=[{' '.join(price_parts)}] "
+                f"| {self.shadow.status_line()}"
             )
 
     # ------------------------------------------------------------------
@@ -2028,6 +2036,7 @@ class CryptoTDMaker:
             self._position_bid_below_exit_since.pop(cid, None)
             self._stoploss_override_log_ts.pop(cid, None)
             self._position_order_legs.pop(cid, None)
+            self.shadow.remove(cid)
             for outcome in self.market_outcomes.pop(cid, []):
                 self._last_bids.pop((cid, outcome), None)
 
@@ -2159,6 +2168,7 @@ class CryptoTDMaker:
 
         won = token_resolved_1
         pnl = pos.shares * (1.0 - pos.entry_price) if won else -pos.size_usd
+        self.shadow.settle(pos.condition_id, won)
         self._position_bid_max.pop(pos.condition_id, None)
         self._position_last_bid.pop(pos.condition_id, None)
         self._position_bid_below_exit_since.pop(pos.condition_id, None)
