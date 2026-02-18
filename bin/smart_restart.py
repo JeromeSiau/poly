@@ -47,7 +47,7 @@ RULES: list[tuple[str, list[str] | str]] = [
                                      "run_crypto_two_sided_maker"]),
     ("src/db/slot_",                ["run_slot_collector", "run_slot_collector_5m"]),
     ("src/db/",                     ["run_fear_selling", "run_trades_api",
-                                     "run_dashboard", "streamlit"]),
+                                     "trades_api", "run_dashboard", "streamlit"]),
 
     # ── Strategy-specific modules ───────────────────────────────────────
     ("src/arb/fear_",               ["run_fear_selling"]),
@@ -58,9 +58,9 @@ RULES: list[tuple[str, list[str] | str]] = [
     ("src/feeds/polymarket_scanner", ["run_sniper"]),
 
     # ── API / dashboard ─────────────────────────────────────────────────
-    ("src/api/trades_api",          ["run_trades_api"]),
-    ("src/api/slots_api",           ["run_trades_api"]),
-    ("src/api/winrate",             ["run_trades_api"]),
+    ("src/api/trades_api",          ["run_trades_api", "trades_api"]),
+    ("src/api/slots_api",           ["run_trades_api", "trades_api"]),
+    ("src/api/winrate",             ["run_trades_api", "trades_api"]),
     ("src/api/rn1_compare",         ["run_rn1_compare_api"]),
     ("src/dashboard/",              ["run_dashboard", "streamlit"]),
     ("src/paper_trading/",          ["run_auto_redeem"]),
