@@ -163,14 +163,18 @@ class PolymarketFeed(BaseFeed):
 
                 # Re-subscribe all tokens from previous session.
                 await self._resubscribe_all()
+                # Mark subscribe time so stale detection works even
+                # if no book snapshot arrives at all.
+                self.last_update_ts = time.time()
 
-                # Run keepalive + receive until one exits.
+                # Run keepalive + receive + subscription health check.
                 # FIRST_COMPLETED so stale detection in keepalive
                 # immediately triggers reconnect (instead of blocking
                 # on recv() forever in the receive loop).
                 tasks = [
                     asyncio.create_task(self._keepalive_loop()),
                     asyncio.create_task(self._receive_loop()),
+                    asyncio.create_task(self._subscription_health_check()),
                 ]
                 _done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED,
@@ -368,6 +372,50 @@ class PolymarketFeed(BaseFeed):
     # ------------------------------------------------------------------
     # Internal: WebSocket loops
     # ------------------------------------------------------------------
+
+    async def _subscription_health_check(self) -> None:
+        """Verify all subscribed tokens received book snapshots.
+
+        Runs once after (re)subscribe.  If some tokens have no data
+        after 10s, re-sends the subscribe for just those tokens.
+        """
+        await asyncio.sleep(10.0)
+        if not self._connected or not self._ws:
+            return
+        missing = [
+            tid for tid in self._subscribed_tokens
+            if tid not in self._best_cache
+            or self._best_cache[tid] == (None, None, None, None)
+        ]
+        if not missing:
+            return
+        logger.warning(
+            "polymarket_ws_missing_snapshots",
+            missing=len(missing),
+            total=len(self._subscribed_tokens),
+        )
+        # Re-subscribe just the missing tokens to trigger fresh snapshots.
+        msg = json.dumps({"assets_ids": missing, "type": "MARKET"})
+        try:
+            await self._ws.send(msg)
+            logger.info("polymarket_ws_resubscribed_missing", tokens=len(missing))
+        except Exception:
+            pass
+        # After another 10s, if still missing, just log — don't loop.
+        await asyncio.sleep(10.0)
+        if not self._connected:
+            return
+        still_missing = [
+            tid for tid in missing
+            if tid not in self._best_cache
+            or self._best_cache[tid] == (None, None, None, None)
+        ]
+        if still_missing:
+            logger.warning(
+                "polymarket_ws_tokens_no_book",
+                count=len(still_missing),
+                hint="these markets likely have empty order books",
+            )
 
     async def _keepalive_loop(self) -> None:
         """Send periodic ping to keep the connection alive.
