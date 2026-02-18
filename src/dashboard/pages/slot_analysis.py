@@ -25,9 +25,15 @@ _DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 _PERIOD_PRESETS = {
-    "7d": 7,
-    "14d": 14,
-    "30d": 30,
+    "1h": 1,
+    "4h": 4,
+    "8h": 8,
+    "12h": 12,
+    "24h": 24,
+    "48h": 48,
+    "7d": 168,
+    "14d": 336,
+    "30d": 720,
     "All": None,
     "Custom": -1,
 }
@@ -52,17 +58,18 @@ def slot_ml_content():
     # -- Filters row 2: period --
     period_col, date_col = st.columns([1, 2])
     with period_col:
-        period_choice = st.radio(
-            "Period", list(_PERIOD_PRESETS.keys()),
-            horizontal=True, key="slot_period",
+        _period_keys = list(_PERIOD_PRESETS.keys())
+        period_choice = st.selectbox(
+            "Period", _period_keys,
+            index=_period_keys.index("7d"), key="slot_period",
         )
-    preset_days = _PERIOD_PRESETS[period_choice]
+    preset_hours = _PERIOD_PRESETS[period_choice]
 
     start_ts = None
     end_ts = None
     h = 2160  # max fallback
 
-    if preset_days == -1:
+    if preset_hours == -1:
         # Custom date range
         with date_col:
             today = date.today()
@@ -76,8 +83,8 @@ def slot_ml_content():
                 d_start, d_end = dates
                 start_ts = int(datetime.combine(d_start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
                 end_ts = int(datetime.combine(d_end, datetime.max.time(), tzinfo=timezone.utc).timestamp())
-    elif preset_days is not None:
-        h = preset_days * 24
+    elif preset_hours is not None:
+        h = preset_hours
     else:
         # "All" — use max lookback
         h = 2160
@@ -453,8 +460,8 @@ def slot_ml_content():
         overall_wr = round(total_wins / total_res * 100, 1) if total_res else 0
         if start_ts is not None and end_ts is not None:
             period_label = f"{dates[0].strftime('%b %d')} - {dates[1].strftime('%b %d')}"
-        elif preset_days is not None and preset_days > 0:
-            period_label = f"{preset_days}d"
+        elif preset_hours is not None and preset_hours > 0:
+            period_label = period_choice
         else:
             period_label = "all"
         st.caption(

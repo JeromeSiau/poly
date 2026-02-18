@@ -26,9 +26,10 @@ from src.dashboard._shared import (
 # -- Period filter (inline, same position as ML page) --
 period_col, date_col = st.columns([1, 2])
 with period_col:
-    st.radio("Period", list(PERIOD_PRESETS.keys()), index=0, horizontal=True, key="period")
-preset_days = PERIOD_PRESETS.get(st.session_state.get("period", "24h"), 1)
-if preset_days == -1:
+    _period_keys = list(PERIOD_PRESETS.keys())
+    st.selectbox("Period", _period_keys, index=_period_keys.index("24h"), key="period")
+preset_hours = PERIOD_PRESETS.get(st.session_state.get("period", "24h"), 24)
+if preset_hours == -1:
     with date_col:
         today = date.today()
         st.date_input(
