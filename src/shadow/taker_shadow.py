@@ -15,7 +15,17 @@ import structlog
 
 logger = structlog.get_logger()
 
-TAKER_FEE_RATE = 0.02  # Polymarket taker fee: 2% * min(price, 1-price)
+def crypto_taker_fee(price: float) -> float:
+    """Per-share taker fee for crypto 15-min/5-min markets (feeRateBps=1000).
+
+    On-chain formula (CalculatorHelper.sol + docs):
+        fee_per_share = price * 0.25 * (price * (1 - price))^2
+
+    Effective rate on capital at various prices:
+        p=0.50 → 1.56%,  p=0.75 → 0.88%,  p=0.80 → 0.64%,
+        p=0.85 → 0.41%,  p=0.90 → 0.20%
+    """
+    return price * 0.25 * (price * (1.0 - price)) ** 2
 
 
 @dataclass(slots=True)
@@ -55,7 +65,7 @@ class TakerShadow:
         """Record a shadow taker entry at the current ask price."""
         if cid in self.positions:
             return
-        fee = TAKER_FEE_RATE * min(ask, 1.0 - ask)
+        fee = crypto_taker_fee(ask)
         effective = ask + fee
         shares = size_usd / effective
         self.positions[cid] = ShadowEntry(
