@@ -167,19 +167,23 @@ class PolymarketFeed(BaseFeed):
                 # if no book snapshot arrives at all.
                 self.last_update_ts = time.time()
 
-                # Run keepalive + receive + subscription health check.
+                # Fire-and-forget health check (not in the wait group
+                # because it returns after ~20s which would trigger
+                # a false reconnect via FIRST_COMPLETED).
+                health_task = asyncio.create_task(self._subscription_health_check())
+
+                # Run keepalive + receive until one exits.
                 # FIRST_COMPLETED so stale detection in keepalive
                 # immediately triggers reconnect (instead of blocking
                 # on recv() forever in the receive loop).
                 tasks = [
                     asyncio.create_task(self._keepalive_loop()),
                     asyncio.create_task(self._receive_loop()),
-                    asyncio.create_task(self._subscription_health_check()),
                 ]
                 _done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED,
                 )
-                for t in pending:
+                for t in [*pending, health_task]:
                     t.cancel()
                     try:
                         await t
