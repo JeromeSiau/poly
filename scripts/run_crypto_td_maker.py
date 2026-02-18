@@ -191,6 +191,7 @@ class CryptoTDMaker:
         self._orders_by_cid_outcome: dict[tuple[str, str], str] = {}
         self.positions: dict[str, OpenPosition] = {}  # cid -> position
         self._awaiting_settlement: set[str] = set()  # cids where orderbook is gone
+        self._all_blind_since: float = 0.0  # when all markets went ?/?
         # Orders being cancelled — kept for late fill detection.
         self._pending_cancels: dict[str, PassiveOrder] = {}  # order_id -> order
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -1118,6 +1119,36 @@ class CryptoTDMaker:
         feed_ts = self.polymarket.last_update_ts
         if feed_ts > self._last_book_update:
             self._last_book_update = feed_ts
+
+        # Watchdog: if ALL markets have empty books for >30s, force WS reset.
+        # The feed's own stale detection can miss cases where the WS is
+        # "connected" but subscriptions were lost (e.g. after restart race).
+        if self.known_markets and self._cycle_count % 20 == 0:  # check every ~10s
+            has_any_price = any(
+                self.polymarket.get_best_prices(cid, outcome) != (None, None)
+                for cid in self.known_markets
+                for outcome in self.market_outcomes.get(cid, [])
+            )
+            if not has_any_price:
+                if self._all_blind_since == 0:
+                    self._all_blind_since = now
+                elif now - self._all_blind_since > 30.0:
+                    logger.warning("watchdog_all_books_empty",
+                                   seconds=round(now - self._all_blind_since, 1))
+                    self._all_blind_since = now  # reset to avoid spamming
+                    # Force resubscribe all tokens on the existing connection.
+                    try:
+                        await self.polymarket.flush_subscriptions()
+                        logger.info("watchdog_resubscribed")
+                    except Exception as exc:
+                        logger.warning("watchdog_resubscribe_failed",
+                                       error=str(exc)[:80])
+                        # Nuclear option: disconnect to force full reconnect.
+                        await self.polymarket.disconnect()
+                        await self.polymarket.connect()
+                        logger.info("watchdog_ws_reset")
+            else:
+                self._all_blind_since = 0.0
 
         # Expire stale pending cancels (>30s since cancel was sent).
         # IMPORTANT: before deleting, check CLOB status — the order may have
