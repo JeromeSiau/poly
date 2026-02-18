@@ -156,7 +156,7 @@ class PolymarketFeed(BaseFeed):
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL, proxy=None)
+                self._ws = await websockets.connect(self.WS_URL, proxy=None, open_timeout=10)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("polymarket_ws_connected")
@@ -164,11 +164,23 @@ class PolymarketFeed(BaseFeed):
                 # Re-subscribe all tokens from previous session.
                 await self._resubscribe_all()
 
-                # Run keepalive + receive until one fails.
-                await asyncio.gather(
-                    self._keepalive_loop(),
-                    self._receive_loop(),
+                # Run keepalive + receive until one exits.
+                # FIRST_COMPLETED so stale detection in keepalive
+                # immediately triggers reconnect (instead of blocking
+                # on recv() forever in the receive loop).
+                tasks = [
+                    asyncio.create_task(self._keepalive_loop()),
+                    asyncio.create_task(self._receive_loop()),
+                ]
+                _done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED,
                 )
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -641,7 +653,7 @@ class PolymarketUserFeed:
         backoff = self.RECONNECT_BASE
         while not self._shutdown:
             try:
-                self._ws = await websockets.connect(self.WS_URL, proxy=None)
+                self._ws = await websockets.connect(self.WS_URL, proxy=None, open_timeout=10)
                 self._connected = True
                 backoff = self.RECONNECT_BASE
                 logger.info("user_ws_connected")
@@ -650,10 +662,21 @@ class PolymarketUserFeed:
                 # Re-authenticate and re-subscribe.
                 await self._resubscribe_all()
 
-                await asyncio.gather(
-                    self._keepalive_loop(),
-                    self._receive_loop(),
+                # FIRST_COMPLETED so stale detection triggers
+                # immediate reconnect instead of blocking on recv().
+                tasks = [
+                    asyncio.create_task(self._keepalive_loop()),
+                    asyncio.create_task(self._receive_loop()),
+                ]
+                _done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED,
                 )
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
             except asyncio.CancelledError:
                 break
             except Exception as exc:
