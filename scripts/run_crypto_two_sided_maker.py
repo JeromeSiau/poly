@@ -1353,15 +1353,18 @@ async def main() -> None:
             )
 
     wallet = args.wallet
-    if wallet <= 0 and not paper_mode:
-        wallet = await manager.get_wallet_balance()
-        if wallet <= 0:
-            logger.error("auto_wallet_failed", hint="pass --wallet explicitly")
-            return
-        logger.info("auto_wallet_detected", wallet_usd=round(wallet, 2))
-
-    order_size = args.order_size if args.order_size > 0 else max(wallet * 0.025, 5.0)
-    max_exposure = args.max_exposure if args.max_exposure > 0 else max(wallet * 0.50, 50.0)
+    if args.order_size > 0 and args.max_exposure > 0:
+        order_size = args.order_size
+        max_exposure = args.max_exposure
+    else:
+        if wallet <= 0 and not paper_mode:
+            wallet = await manager.get_wallet_balance()
+            if wallet <= 0:
+                logger.error("auto_wallet_failed", hint="pass --wallet explicitly")
+                return
+            logger.info("auto_wallet_detected", wallet_usd=round(wallet, 2))
+        order_size = args.order_size if args.order_size > 0 else max(wallet * 0.025, 5.0)
+        max_exposure = args.max_exposure if args.max_exposure > 0 else max(wallet * 0.50, 50.0)
 
     maker = CryptoTwoSidedMaker(
         executor=executor,

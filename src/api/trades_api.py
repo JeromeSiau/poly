@@ -196,7 +196,7 @@ def _fetch_live_balance() -> float:
 
     usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     selector = "0x70a08231"
-    rpc_url = settings.POLYGON_RPC_URL or "https://rpc.ankr.com/polygon"
+    rpc_url = settings.POLYGON_RPC_URL or "https://polygon-rpc.com"
     wallet = settings.POLYMARKET_WALLET_ADDRESS
     if not wallet:
         raise ValueError("POLYMARKET_WALLET_ADDRESS not configured")

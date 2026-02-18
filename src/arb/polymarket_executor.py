@@ -267,10 +267,31 @@ class PolymarketExecutor:
     # USDC.e on Polygon (PoS-bridged, 6 decimals) — used by Polymarket
     _USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     _BALANCE_OF_SELECTOR = "0x70a08231"
-    _DEFAULT_RPC = "https://rpc.ankr.com/polygon"
+    _DEFAULT_RPC = "https://polygon-rpc.com"
 
-    def _get_balance_sync(self) -> float:
-        """Query on-chain USDC.e balance on Polygon for the funder wallet."""
+    def _get_balance_via_clob(self) -> float:
+        """Fetch USDC balance via Polymarket CLOB API (same as dashboard)."""
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=settings.POLYMARKET_PRIVATE_KEY,
+            chain_id=137,
+            creds=ApiCreds(
+                api_key=settings.POLYMARKET_API_KEY,
+                api_secret=settings.POLYMARKET_API_SECRET,
+                api_passphrase=settings.POLYMARKET_API_PASSPHRASE,
+            ),
+            signature_type=1,  # POLY_PROXY
+        )
+        params = BalanceAllowanceParams(asset_type="COLLATERAL", signature_type=1)
+        result = client.get_balance_allowance(params)
+        raw = int(result.get("balance", "0"))
+        return raw / 1e6
+
+    def _get_balance_via_rpc(self) -> float:
+        """Fallback: query on-chain USDC.e balance via Polygon RPC."""
         import httpx
 
         rpc_url = settings.POLYGON_RPC_URL or self._DEFAULT_RPC
@@ -278,23 +299,31 @@ class PolymarketExecutor:
         padded = wallet.lower().replace("0x", "").zfill(64)
         data = self._BALANCE_OF_SELECTOR + padded
 
+        resp = httpx.post(
+            rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{"to": self._USDC_E_ADDRESS, "data": data}, "latest"],
+                "id": 1,
+            },
+            timeout=10,
+        )
+        result = resp.json().get("result", "0x0")
+        return int(result, 16) / 1e6
+
+    def _get_balance_sync(self) -> float:
+        """Get USDC balance: CLOB API first, RPC fallback."""
         try:
-            resp = httpx.post(
-                rpc_url,
-                json={
-                    "jsonrpc": "2.0",
-                    "method": "eth_call",
-                    "params": [{"to": self._USDC_E_ADDRESS, "data": data}, "latest"],
-                    "id": 1,
-                },
-                timeout=10,
-            )
-            result = resp.json().get("result", "0x0")
-            return int(result, 16) / 1e6
+            return self._get_balance_via_clob()
         except Exception as exc:
-            logger.warning("polymarket_get_balance_failed", error=str(exc))
-            return 0.0
+            logger.warning("balance_clob_failed", error=str(exc))
+        try:
+            return self._get_balance_via_rpc()
+        except Exception as exc:
+            logger.warning("balance_rpc_failed", error=str(exc))
+        return 0.0
 
     async def get_balance(self) -> float:
-        """Return on-chain USDC.e balance for the wallet on Polygon."""
+        """Return USDC balance for the wallet."""
         return await asyncio.to_thread(self._get_balance_sync)
