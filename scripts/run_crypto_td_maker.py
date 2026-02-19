@@ -1371,10 +1371,24 @@ class CryptoTDMaker:
                         # else: order still at correct price, do nothing.
                     else:
                         # No existing order — place if in range
+                        _price_ok = bid is not None and self.target_bid <= bid <= self.max_bid
+                        if _price_ok and not bid_in_range:
+                            if not self._check_min_entry_time(cid):
+                                _reason = "min_entry_time"
+                            elif not self._check_max_entry_time(cid):
+                                _reason = "max_entry_time"
+                            elif not self._check_min_move(cid, outcome, bid):
+                                _reason = "min_move"
+                            elif not self._check_max_move(cid, outcome):
+                                _reason = "max_move"
+                            else:
+                                _reason = "model_skip"
+                            logger.info("td_bid_blocked", cid=cid[:14], outcome=outcome, bid=bid, reason=_reason)
                         if bid_in_range:
                             if (not self._check_min_book_depth(bid_sz)
                                     or self._check_avoid_hours(now)):
-                                pass  # depth or time filter blocked
+                                _reason = "avoid_hours" if self._check_avoid_hours(now) else "min_book_depth"
+                                logger.info("td_bid_blocked", cid=cid[:14], outcome=outcome, bid=bid, reason=_reason)
                             else:
                                 if model_p_win is not None:
                                     self._last_p_win[(cid, outcome)] = model_p_win
