@@ -2022,6 +2022,13 @@ class CryptoTDMaker:
             status = resp.get("status", "").upper()
 
             if status in ("MATCHED", "FILLED"):
+                # Re-check after await: _fill_listener may have processed this
+                # fill concurrently (race condition — order was cached before the
+                # await, so we must guard against double _process_fill calls).
+                if self._cid_fill_count.get(order.condition_id, 0) >= self.ladder_rungs:
+                    logger.debug("reconcile_already_processed", order_id=oid[:16])
+                    self.active_orders.pop(oid, None)
+                    continue
                 logger.warning(
                     "reconcile_fill_recovered",
                     order_id=oid[:16],
@@ -2073,6 +2080,12 @@ class CryptoTDMaker:
 
             status = resp.get("status", "").upper()
             if status in ("MATCHED", "FILLED"):
+                # Re-check after await: _fill_listener may have processed this
+                # fill concurrently during the get_order await.
+                if self._cid_fill_count.get(order.condition_id, 0) >= self.ladder_rungs:
+                    logger.debug("reconcile_pending_already_processed", order_id=oid[:16])
+                    self._pending_cancels.pop(oid, None)
+                    continue
                 logger.warning(
                     "reconcile_pending_cancel_was_filled",
                     order_id=oid[:16],

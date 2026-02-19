@@ -100,3 +100,6 @@ reports/
 #AI
 .claude
 docs
+
+#ML 
+*.joblib
