@@ -90,7 +90,7 @@ class ActiveSlot:
 
     __slots__ = (
         "symbol", "slot_ts", "slot_duration", "condition_id", "chainlink_sym",
-        "ref_price", "outcomes", "token_ids",
+        "ref_price", "outcomes", "token_ids", "market_volume_usd",
     )
 
     def __init__(
@@ -103,6 +103,7 @@ class ActiveSlot:
         ref_price: Optional[float],
         outcomes: list[str],
         token_ids: list[str],
+        market_volume_usd: Optional[float] = None,
     ) -> None:
         self.symbol = symbol
         self.slot_ts = slot_ts
@@ -112,6 +113,7 @@ class ActiveSlot:
         self.ref_price = ref_price
         self.outcomes = outcomes
         self.token_ids = token_ids
+        self.market_volume_usd = market_volume_usd
 
 
 # ------------------------------------------------------------------
@@ -227,7 +229,18 @@ class SlotCollector:
         new_count = 0
         for mkt in raw_markets:
             cid = str(mkt.get("conditionId", ""))
-            if not cid or cid in self._known_cids:
+            if not cid:
+                continue
+
+            # Refresh volume on already-tracked slots (discovery runs every 60s)
+            if cid in self._known_cids:
+                if cid in self._active_slots:
+                    vol_raw = mkt.get("volume")
+                    if vol_raw is not None:
+                        try:
+                            self._active_slots[cid].market_volume_usd = float(vol_raw)
+                        except (ValueError, TypeError):
+                            pass
                 continue
 
             outcomes = [str(o) for o in parse_json_list(mkt.get("outcomes", []))]
@@ -245,6 +258,12 @@ class SlotCollector:
             # Snapshot reference price
             ref_price = self.chainlink.get_price(chainlink_sym)
 
+            vol_raw = mkt.get("volume")
+            try:
+                market_volume_usd = float(vol_raw) if vol_raw is not None else None
+            except (ValueError, TypeError):
+                market_volume_usd = None
+
             slot = ActiveSlot(
                 symbol=symbol,
                 slot_ts=slot_ts,
@@ -254,6 +273,7 @@ class SlotCollector:
                 ref_price=ref_price,
                 outcomes=outcomes[:2],
                 token_ids=clob_ids[:2],
+                market_volume_usd=market_volume_usd,
             )
             self._active_slots[cid] = slot
             self._known_cids.add(cid)
@@ -369,6 +389,7 @@ class SlotCollector:
                 chainlink_price=current_price,
                 dir_move_pct=round(dir_move, 4) if dir_move is not None else None,
                 abs_move_pct=round(abs_move, 4) if abs_move is not None else None,
+                market_volume_usd=slot.market_volume_usd,
                 hour_utc=dt.hour,
                 day_of_week=dt.weekday(),
             ))

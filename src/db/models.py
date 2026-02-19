@@ -395,6 +395,9 @@ class SlotSnapshot(Base):
     dir_move_pct = Column(Float)
     abs_move_pct = Column(Float)
 
+    # Market volume
+    market_volume_usd = Column(Float)
+
     # Context
     hour_utc = Column(Integer)
     day_of_week = Column(Integer)
