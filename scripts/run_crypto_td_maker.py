@@ -154,6 +154,8 @@ class CryptoTDMaker:
         entry_fair_margin: float = 0.0,
         exit_model_path: str = "",
         exit_threshold: float = 0.35,
+        min_book_depth: float = 0.0,
+        avoid_hours_utc: list[int] | None = None,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -180,6 +182,8 @@ class CryptoTDMaker:
         self.stoploss_exit = stoploss_exit
         self.stoploss_fair_margin = stoploss_fair_margin
         self.entry_fair_margin = entry_fair_margin
+        self.min_book_depth = min_book_depth
+        self.avoid_hours_utc: frozenset[int] = frozenset(avoid_hours_utc or [])
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -691,6 +695,20 @@ class CryptoTDMaker:
         minutes_into = (now - slot_ts) / 60
         minutes_remaining = max(15.0 - minutes_into, 1.0)
         return estimate_fair_value(dir_move, minutes_remaining)
+
+    def _check_min_book_depth(self, bid_sz: Optional[float]) -> bool:
+        """Return True if the bid side has sufficient depth (or filter is disabled)."""
+        if self.min_book_depth <= 0.0:
+            return True
+        return bid_sz is not None and bid_sz >= self.min_book_depth
+
+    def _check_avoid_hours(self, now: float) -> bool:
+        """Return True if the current UTC hour is in the avoid list (skip placement)."""
+        if not self.avoid_hours_utc:
+            return False
+        import datetime
+        hour = datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc).hour
+        return hour in self.avoid_hours_utc
 
     def _check_min_entry_time(self, cid: str) -> bool:
         """Return True if enough time has elapsed since slot start.
@@ -1325,6 +1343,9 @@ class CryptoTDMaker:
                             continue
                         rung_key = (cid, outcome, int(round(rung_price * 100)))
                         if rung_key not in self._rung_placed:
+                            if (not self._check_min_book_depth(bid_sz)
+                                    or self._check_avoid_hours(now)):
+                                continue
                             if model_p_win is not None:
                                 self._last_p_win[(cid, outcome)] = model_p_win
                             place_intents.append((cid, outcome, token_id, rung_price, "maker"))
@@ -1351,13 +1372,17 @@ class CryptoTDMaker:
                     else:
                         # No existing order — place if in range
                         if bid_in_range:
-                            if model_p_win is not None:
-                                self._last_p_win[(cid, outcome)] = model_p_win
-                            ot = model_order_type if self._model else "maker"
-                            if ot == "taker" and ask is not None:
-                                place_intents.append((cid, outcome, token_id, ask, "taker"))
+                            if (not self._check_min_book_depth(bid_sz)
+                                    or self._check_avoid_hours(now)):
+                                pass  # depth or time filter blocked
                             else:
-                                place_intents.append((cid, outcome, token_id, bid, "maker"))
+                                if model_p_win is not None:
+                                    self._last_p_win[(cid, outcome)] = model_p_win
+                                ot = model_order_type if self._model else "maker"
+                                if ot == "taker" and ask is not None:
+                                    place_intents.append((cid, outcome, token_id, ask, "taker"))
+                                else:
+                                    place_intents.append((cid, outcome, token_id, bid, "maker"))
 
         # Execute cancels.
         for oid in cancel_ids:
@@ -2471,6 +2496,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--exit-threshold", type=float, default=0.35,
         help="ML exit: sell when P(win) drops below this (default: 0.35)",
     )
+    p.add_argument(
+        "--min-book-depth", type=float, default=0.0,
+        help="Min bid_sz at target price before placing order (0=disabled)",
+    )
+    p.add_argument(
+        "--avoid-hours-utc", type=int, nargs="*", default=[],
+        metavar="H",
+        help="UTC hours to avoid placing new orders e.g. 21 22 23 0 (default: none)",
+    )
     return p
 
 
@@ -2579,6 +2613,8 @@ async def main() -> None:
         entry_fair_margin=args.entry_fair_margin,
         exit_model_path=args.exit_model_path,
         exit_threshold=args.exit_threshold,
+        min_book_depth=args.min_book_depth,
+        avoid_hours_utc=args.avoid_hours_utc,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"

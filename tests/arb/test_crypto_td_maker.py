@@ -1168,3 +1168,130 @@ async def test_pending_cancel_not_recovered_when_truly_cancelled():
 
     assert reconciled == 0
     assert cid not in maker.positions
+
+
+# ---------------------------------------------------------------------------
+# min_book_depth: block entry when the bid side is too thin
+# ---------------------------------------------------------------------------
+
+
+class TestMinBookDepth:
+    """min_book_depth=N blocks orders when bid_sz < N; 0 disables the filter."""
+
+    def test_disabled_when_zero(self):
+        """min_book_depth=0 (default) → always allowed, even with None bid_sz."""
+        feed = _make_feed_with_book(CID, "Down", TOK_DOWN, bid=0.80, ask=0.82)
+        maker = _make_maker(feed, min_book_depth=0.0)
+        assert maker._check_min_book_depth(1.0) is True
+        assert maker._check_min_book_depth(None) is True
+
+    def test_blocks_thin_book(self):
+        """bid_sz < min_book_depth → blocked."""
+        feed = _make_feed_with_book(CID, "Down", TOK_DOWN, bid=0.80, ask=0.82)
+        maker = _make_maker(feed, min_book_depth=200.0)
+        assert maker._check_min_book_depth(50.0) is False
+        assert maker._check_min_book_depth(None) is False
+
+    def test_allows_sufficient_depth(self):
+        """bid_sz >= min_book_depth → allowed."""
+        feed = _make_feed_with_book(CID, "Down", TOK_DOWN, bid=0.80, ask=0.82)
+        maker = _make_maker(feed, min_book_depth=200.0)
+        assert maker._check_min_book_depth(200.0) is True
+        assert maker._check_min_book_depth(500.0) is True
+
+    @pytest.mark.asyncio
+    async def test_maker_tick_no_order_on_thin_book(self):
+        """When bid_sz=50 < min_book_depth=200, _maker_tick must not place the order."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        feed._best_cache[TOK_DOWN] = (0.80, 50.0, 0.82, 100.0)   # thin side
+        maker = _make_ladder_maker(feed, ladder_rungs=1, min_book_depth=200.0)
+
+        await maker._maker_tick()
+
+        assert len(maker.active_orders) == 0
+
+    @pytest.mark.asyncio
+    async def test_maker_tick_places_order_on_deep_book(self):
+        """When bid_sz=300 >= min_book_depth=200, _maker_tick places the order."""
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        feed._best_cache[TOK_DOWN] = (0.80, 300.0, 0.82, 100.0)  # deep side
+        maker = _make_ladder_maker(feed, ladder_rungs=1, min_book_depth=200.0)
+
+        await maker._maker_tick()
+
+        assert len(_orders_for_outcome(maker, "Down")) == 1
+
+
+# ---------------------------------------------------------------------------
+# avoid_hours_utc: block new orders during specified UTC hours
+# ---------------------------------------------------------------------------
+
+
+class TestAvoidHoursUtc:
+    """avoid_hours_utc=[21,22,23,0] prevents new orders during peak-vol window."""
+
+    def test_disabled_when_empty(self):
+        """avoid_hours_utc=[] (default) → never blocks, any hour allowed."""
+        feed = _make_feed_with_book(CID, "Down", TOK_DOWN, bid=0.80, ask=0.82)
+        maker = _make_maker(feed, avoid_hours_utc=[])
+        import datetime
+        for hour in [0, 6, 12, 21, 23]:
+            ts = datetime.datetime(2026, 2, 18, hour, 0,
+                                   tzinfo=datetime.timezone.utc).timestamp()
+            assert maker._check_avoid_hours(ts) is False
+
+    def test_blocks_listed_hour(self):
+        """Current UTC hour in avoid list → returns True (blocked)."""
+        feed = _make_feed_with_book(CID, "Down", TOK_DOWN, bid=0.80, ask=0.82)
+        maker = _make_maker(feed, avoid_hours_utc=[21, 22, 23, 0])
+        import datetime
+        ts = datetime.datetime(2026, 2, 18, 21, 30,
+                               tzinfo=datetime.timezone.utc).timestamp()
+        assert maker._check_avoid_hours(ts) is True
+
+    def test_allows_unlisted_hour(self):
+        """Current UTC hour NOT in avoid list → returns False (allowed)."""
+        feed = _make_feed_with_book(CID, "Down", TOK_DOWN, bid=0.80, ask=0.82)
+        maker = _make_maker(feed, avoid_hours_utc=[21, 22, 23, 0])
+        import datetime
+        ts = datetime.datetime(2026, 2, 18, 15, 0,
+                               tzinfo=datetime.timezone.utc).timestamp()
+        assert maker._check_avoid_hours(ts) is False
+
+    @pytest.mark.asyncio
+    async def test_maker_tick_no_order_during_avoided_hour(self, monkeypatch):
+        """Integration: _maker_tick must not place orders when current hour is avoided."""
+        import datetime
+        ts = datetime.datetime(2026, 2, 18, 21, 30, 0,
+                               tzinfo=datetime.timezone.utc).timestamp()
+        monkeypatch.setattr("time.time", lambda: ts)
+
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        feed.last_update_ts = time.monotonic()
+        maker = _make_ladder_maker(feed, ladder_rungs=1, avoid_hours_utc=[21, 22, 23, 0])
+        maker._last_book_update = ts - 1.0
+
+        await maker._maker_tick()
+
+        assert len(maker.active_orders) == 0
+
+    @pytest.mark.asyncio
+    async def test_maker_tick_places_order_outside_avoided_hours(self, monkeypatch):
+        """Integration: _maker_tick DOES place orders when current hour is not avoided."""
+        import datetime
+        ts = datetime.datetime(2026, 2, 18, 15, 0, 0,
+                               tzinfo=datetime.timezone.utc).timestamp()
+        monkeypatch.setattr("time.time", lambda: ts)
+
+        feed = _make_feed_both_sides(CID, bid_up=0.20, ask_up=0.22,
+                                     bid_down=0.80, ask_down=0.82)
+        feed.last_update_ts = time.monotonic()
+        maker = _make_ladder_maker(feed, ladder_rungs=1, avoid_hours_utc=[21, 22, 23, 0])
+        maker._last_book_update = ts - 1.0
+
+        await maker._maker_tick()
+
+        assert len(_orders_for_outcome(maker, "Down")) == 1
