@@ -931,6 +931,7 @@ class CryptoTDMaker:
             else:
                 self._db_fire(self._db_delete_order, oid)
 
+        self.shadow.settle(pos.condition_id, won=False)
         self.total_losses += 1
         self.realized_pnl += pnl
 
