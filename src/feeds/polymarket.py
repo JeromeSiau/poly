@@ -856,4 +856,5 @@ class PolymarketUserFeed:
                     price=evt.price,
                     size=evt.size,
                     status=evt.status,
+                    maker_order_id=evt.maker_order_id[:16] if evt.maker_order_id else "",
                 )

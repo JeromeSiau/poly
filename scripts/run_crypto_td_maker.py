@@ -207,6 +207,8 @@ class CryptoTDMaker:
         self._position_order_legs: dict[str, dict[str, float]] = {}
         # Per-cid fill count — blocks re-ordering when >= ladder_rungs.
         self._cid_fill_count: dict[str, int] = {}  # cid -> number of fills
+        # Guard to avoid scheduling duplicate reconcile tasks on unmatched fills.
+        self._reconcile_pending: bool = False
         # Rung-level dedup: (cid, outcome, price_cents) of placed/active rungs.
         self._rung_placed: set[tuple[str, str, int]] = set()
 
@@ -1953,9 +1955,15 @@ class CryptoTDMaker:
                     price=evt.price,
                     size=evt.size,
                     status=evt.status,
+                    maker_order_id=evt.maker_order_id[:16] if evt.maker_order_id else "",
                 )
-                # Even if unmatched, count it to prevent re-ordering.
-                self._cid_fill_count[evt.market] = self._cid_fill_count.get(evt.market, 0) + 1
+                # Do NOT increment _cid_fill_count here — this event may be another
+                # trader's fill in the same market, not ours. Incrementing would
+                # block processing of our own fill when it arrives.
+                # Instead, schedule an immediate reconcile to catch any fill we missed.
+                if not self._reconcile_pending and not self.paper_mode and self.executor:
+                    self._reconcile_pending = True
+                    asyncio.create_task(self._reconcile_fills_soon())
                 continue
 
             now = time.time()
@@ -2076,6 +2084,14 @@ class CryptoTDMaker:
         if recovered:
             logger.info("reconcile_summary", recovered=recovered, checked=len(order_ids))
         return recovered
+
+    async def _reconcile_fills_soon(self, delay: float = 2.0) -> None:
+        """Delay briefly then reconcile; resets _reconcile_pending when done."""
+        try:
+            await asyncio.sleep(delay)
+            await self._reconcile_fills()
+        finally:
+            self._reconcile_pending = False
 
     # ------------------------------------------------------------------
     # Settlement
