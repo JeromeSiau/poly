@@ -217,6 +217,7 @@ class CryptoTDMaker:
         self._cid_fill_analytics: dict[str, dict] = {}  # cid -> {dir_move_pct, minutes_into_slot}
         self._last_p_win: dict[tuple[str, str], float] = {}  # (cid, outcome) -> model P(win)
         self._last_order_type: dict[tuple[str, str], str] = {}  # (cid, outcome) -> "maker"/"taker"
+        self._blocked_cooldown: dict[tuple[str, str, str], float] = {}  # (cid, outcome, reason) -> last logged ts
 
         # Book history ring buffer for trend features (per cid).
         # Each entry: (timestamp, bid_up, ask_up, spread_up, spread_down)
@@ -1383,12 +1384,18 @@ class CryptoTDMaker:
                                 _reason = "max_move"
                             else:
                                 _reason = "model_skip"
-                            logger.info("td_bid_blocked", cid=cid[:14], outcome=outcome, bid=bid, reason=_reason)
+                            _bk = (cid, outcome, _reason)
+                            if now - self._blocked_cooldown.get(_bk, 0) >= 60:
+                                self._blocked_cooldown[_bk] = now
+                                logger.info("td_bid_blocked", cid=cid[:14], outcome=outcome, bid=bid, reason=_reason)
                         if bid_in_range:
                             if (not self._check_min_book_depth(bid_sz)
                                     or self._check_avoid_hours(now)):
                                 _reason = "avoid_hours" if self._check_avoid_hours(now) else "min_book_depth"
-                                logger.info("td_bid_blocked", cid=cid[:14], outcome=outcome, bid=bid, reason=_reason)
+                                _bk = (cid, outcome, _reason)
+                                if now - self._blocked_cooldown.get(_bk, 0) >= 60:
+                                    self._blocked_cooldown[_bk] = now
+                                    logger.info("td_bid_blocked", cid=cid[:14], outcome=outcome, bid=bid, reason=_reason)
                             else:
                                 if model_p_win is not None:
                                     self._last_p_win[(cid, outcome)] = model_p_win
