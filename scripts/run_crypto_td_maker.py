@@ -909,6 +909,13 @@ class CryptoTDMaker:
         if not sell_ok:
             logger.warning("stop_loss_sell_not_confirmed", cid=pos.condition_id[:16],
                            bid=bid, sell_price=sell_price)
+            # If book is already empty, the market is likely resolved/expired.
+            # Don't retry — defer to _prune_expired settlement to avoid a
+            # tight loop of failed sell attempts every 0.5s.
+            if bid is None:
+                self._awaiting_settlement.add(pos.condition_id)
+                logger.warning("stop_loss_deferred_to_settlement",
+                               cid=pos.condition_id[:16])
             return  # keep position in tracking, will retry next tick
 
         # Remove position from all tracking.
