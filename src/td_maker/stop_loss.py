@@ -108,45 +108,69 @@ class StopLossManager:
             return
 
         pos = market.position
-        try:
-            await clob_retry(
-                lambda: self.executor.cancel_and_sell(
-                    token_id=pos.token_id,
-                    shares=pos.shares,
-                    price=0.01,
-                    force_taker=True),
-                max_attempts=3,
-                base_delay=1.0,
-                operation="stop_loss")
+        sell_price = max(0.01, bid or 0.01)
 
-            # Success: cleanup
-            pnl = (1.0 - pos.entry_price) * pos.shares - pos.size_usd
+        # Cancel all active orders first
+        for oid in list(market.active_orders):
+            await self.order_mgr.cancel_order(market, oid)
+
+        # Live mode: place taker sell
+        if not self.config.paper_mode:
+            try:
+                # size = shares * (1 - price) so executor gets correct share count
+                sell_size = pos.shares * (1.0 - sell_price)
+                await clob_retry(
+                    lambda: self.executor.place_order(
+                        token_id=pos.token_id,
+                        side="SELL",
+                        size=sell_size,
+                        price=sell_price,
+                        outcome=pos.outcome,
+                        order_type="FOK",
+                        force_taker=True),
+                    max_attempts=3,
+                    base_delay=1.0,
+                    operation="stop_loss")
+            except Exception as e:
+                count = self._consecutive_failures.get(market.condition_id, 0) + 1
+                self._consecutive_failures[market.condition_id] = count
+                logger.error("stoploss_failed", cid=market.condition_id,
+                             attempt=count, error=str(e))
+                if count >= 3:
+                    try:
+                        await self.trade_manager._alerter.send_custom_alert(
+                            f"STOP-LOSS FAILED x{count} — INTERVENTION REQUISE\n"
+                            f"Market: {market.slug}\n"
+                            f"Position: {pos.size_usd:.2f} USD @ {pos.entry_price:.2f}")
+                    except Exception:
+                        pass
+                return  # Never cleanup position on failure — retry next tick
+
+        # Record settlement
+        from src.execution.models import TradeIntent, FillResult as TradeFillResult
+        pnl = pos.shares * (sell_price - pos.entry_price)
+        intent = TradeIntent(
+            condition_id=market.condition_id,
+            token_id=pos.token_id,
+            outcome=pos.outcome,
+            side="BUY",
+            price=pos.entry_price,
+            size_usd=pos.size_usd,
+            reason="stop_loss",
+            title=market.slug,
+        )
+        trade_fill = TradeFillResult(
+            filled=True, shares=pos.shares,
+            avg_price=sell_price, pnl_delta=pnl)
+        if not self.config.paper_mode:
             await self.trade_manager.record_settle_direct(
-                condition_id=market.condition_id,
-                outcome=pos.outcome,
-                entry_price=pos.entry_price,
-                exit_price=0.01,
-                size_usd=pos.size_usd,
-                pnl=pnl,
-                context=f"STOP-LOSS | peak {market.bid_max:.2f} -> {bid or 0:.2f}",
-            )
-            self.shadow.settle(market.condition_id, won=False)
-            market.position = None
-            market.bid_max = 0.0
-            self._consecutive_failures.pop(market.condition_id, None)
-            logger.info("stoploss_executed", cid=market.condition_id, pnl=pnl)
-
-        except Exception as e:
-            count = self._consecutive_failures.get(market.condition_id, 0) + 1
-            self._consecutive_failures[market.condition_id] = count
-            logger.error("stoploss_failed", cid=market.condition_id,
-                         attempt=count, error=str(e))
-            if count >= 3:
-                await self.trade_manager.notify_critical(
-                    f"STOP-LOSS FAILED x{count} — INTERVENTION REQUISE\n"
-                    f"Market: {market.slug}\n"
-                    f"Position: {pos.size_usd:.2f} USD @ {pos.entry_price:.2f}")
-            # Never cleanup position on failure — retry next tick
+                intent, trade_fill,
+                notify_context=f"STOP-LOSS | peak {market.bid_max:.2f} -> {sell_price:.2f}")
+        self.shadow.settle(market.condition_id, won=False)
+        market.position = None
+        market.bid_max = 0.0
+        self._consecutive_failures.pop(market.condition_id, None)
+        logger.info("stoploss_executed", cid=market.condition_id, pnl=round(pnl, 4))
 
     def _get_current_bid(self, market: MarketState) -> Optional[float]:
         if self.poly_feed is None:
@@ -170,5 +194,7 @@ class StopLossManager:
             return None
         from src.utils.fair_value import estimate_fair_value
         slot_remaining = max(0, market.slot_end_ts() - time.time())
-        return estimate_fair_value(
-            current, market.ref_price, market.position.outcome, slot_remaining)
+        dir_move_pct = (current - market.ref_price) / market.ref_price * 100.0
+        if market.position.outcome == "Down":
+            dir_move_pct = -dir_move_pct
+        return estimate_fair_value(dir_move_pct, slot_remaining / 60.0)

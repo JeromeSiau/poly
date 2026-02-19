@@ -111,8 +111,10 @@ class EntryFilters:
             return True
         from src.utils.fair_value import estimate_fair_value
         slot_remaining = max(0, market.slot_end_ts() - time.time())
-        fv = estimate_fair_value(
-            current, market.ref_price, outcome, slot_remaining)
+        dir_move_pct = (current - market.ref_price) / market.ref_price * 100.0
+        if outcome == "Down":
+            dir_move_pct = -dir_move_pct
+        fv = estimate_fair_value(dir_move_pct, slot_remaining / 60.0)
         return bid <= fv + self.config.entry_fair_margin
 
     def _check_model(self, market: Any, outcome: str,

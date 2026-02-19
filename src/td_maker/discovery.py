@@ -2,10 +2,12 @@
 from __future__ import annotations
 import time
 from typing import Any
+import httpx
 import structlog
 from src.td_maker.state import MarketState, MarketRegistry
 from src.td_maker.resilience import clob_retry
 from src.utils.crypto_markets import fetch_crypto_markets, SLUG_TO_CHAINLINK
+from src.utils.parsing import parse_json_list
 
 logger = structlog.get_logger()
 
@@ -43,35 +45,54 @@ class MarketDiscovery:
         self.config = config
 
     async def discover(self, registry: MarketRegistry) -> None:
+        slot_duration_sec = getattr(self.config, "slot_duration", 900)
         try:
-            raw_markets = await clob_retry(
-                lambda: fetch_crypto_markets(self.config.symbols),
-                operation="discover_markets")
+            async with httpx.AsyncClient(timeout=15) as client:
+                raw_markets = await fetch_crypto_markets(
+                    client, self.config.symbols,
+                    slot_duration_sec=slot_duration_sec)
         except Exception as e:
             logger.error("discovery_failed", error=str(e))
             return
 
-        default_slot_duration = getattr(self.config, "slot_duration", 15 * 60)
+        default_slot_duration = slot_duration_sec
         new_cids: list[str] = []
         for m in raw_markets:
-            if registry.get(m.condition_id):
+            # m is a dict from Gamma API
+            cid = m.get("conditionId", "")
+            if not cid or registry.get(cid):
                 continue
+
+            # Event slug (e.g. "btc-updown-15m-1771079400")
+            events = m.get("events", [])
+            slug = events[0].get("slug", "") if events else m.get("slug", "")
+
+            # Build token_ids: {outcome: token_id}
+            outcomes = parse_json_list(m.get("outcomes", []))
+            clob_ids = parse_json_list(m.get("clobTokenIds", []))
+            token_ids = dict(zip(outcomes, clob_ids)) if outcomes and clob_ids else {}
+
             chainlink_symbol, slot_ts, slot_duration = parse_slug_info(
-                m.slug, default_slot_duration)
+                slug, default_slot_duration)
             ref_price = self.chainlink.get_price(chainlink_symbol) or 0.0
             state = MarketState(
-                condition_id=m.condition_id,
-                slug=m.slug,
+                condition_id=cid,
+                slug=slug,
                 symbol=chainlink_symbol,
                 slot_ts=slot_ts,
-                token_ids=getattr(m, "token_ids", {}),
+                token_ids=token_ids,
                 ref_price=ref_price,
                 chainlink_symbol=chainlink_symbol,
                 slot_duration=slot_duration,
             )
             registry.register(state)
-            new_cids.append(m.condition_id)
+            new_cids.append(cid)
 
         if new_cids:
-            await self.poly_feed.subscribe_batch(new_cids)
+            for cid in new_cids:
+                market = registry.get(cid)
+                if market:
+                    await self.poly_feed.subscribe_market(
+                        cid, token_map=market.token_ids, send=False)
+            await self.poly_feed.flush_subscriptions()
             logger.info("markets_discovered", count=len(new_cids))

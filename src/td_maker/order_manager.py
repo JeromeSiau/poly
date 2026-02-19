@@ -41,8 +41,10 @@ class OrderManager:
                 clob_retry(
                     lambda: self.executor.place_order(
                         token_id=order.token_id,
+                        side="BUY",
+                        size=order.size_usd,
                         price=order.price,
-                        size_usd=order.size_usd,
+                        outcome=order.outcome,
                     ),
                     operation="place_order"),
                 timeout=_PLACEHOLDER_TIMEOUT)
@@ -110,7 +112,7 @@ class OrderManager:
         """Startup: cancel every open CLOB order from previous runs."""
         try:
             await clob_retry(
-                lambda: self.executor.cancel_all(),
+                lambda: self.executor.cancel_all_orders(),
                 operation="cancel_orphans")
             logger.info("orphaned_orders_cancelled")
         except Exception as e:
@@ -121,15 +123,22 @@ class OrderManager:
     ) -> None:
         """After placement timeout: verify order doesn't exist on CLOB."""
         try:
-            result = await self.executor.get_open_orders(
-                token_id=order.token_id, price=order.price)
-            if result:
-                real_id = getattr(result[0], "id", None)
-                if real_id:
-                    logger.warning("ghost_order_detected",
-                                   cid=market.condition_id, real_id=real_id)
-                    order.order_id = real_id
-                    market.add_order(order)
+            results = await self.executor.get_open_orders(
+                market=market.condition_id)
+            for o in (results or []):
+                o_price = float(o.get("price", 0) if isinstance(o, dict)
+                                else getattr(o, "price", 0))
+                o_token = (o.get("asset_id", "") if isinstance(o, dict)
+                           else getattr(o, "asset_id", ""))
+                if abs(o_price - order.price) < 0.005 and o_token == order.token_id:
+                    real_id = (o.get("id") if isinstance(o, dict)
+                               else getattr(o, "id", None))
+                    if real_id:
+                        logger.warning("ghost_order_detected",
+                                       cid=market.condition_id, real_id=real_id)
+                        order.order_id = real_id
+                        market.add_order(order)
+                        return
         except Exception as e:
             logger.warning("ghost_check_failed",
                            cid=market.condition_id, error=str(e))

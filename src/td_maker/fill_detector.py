@@ -1,6 +1,7 @@
 # src/td_maker/fill_detector.py
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Optional, Any
 
@@ -49,23 +50,32 @@ class FillDetector:
 
     async def listen(self, registry: MarketRegistry) -> None:
         """Infinite loop draining User WS fills."""
-        async for msg in self.user_feed:
-            if getattr(msg, "type", None) == "fill":
-                market = registry.get(msg.condition_id)
-                if not market:
-                    continue  # already settled, ignore
-                key = self._fill_key(
-                    msg.condition_id,
-                    getattr(msg, "order_id", ""),
-                    getattr(msg, "trade_id", ""))
-                if self._is_duplicate(key):
-                    continue
-                order = self._match_order(market, msg)
-                if order:
-                    await self._process_fill(market, order, shares=msg.shares)
-                    self._processed_fills[key] = time.time()
-            elif getattr(msg, "type", None) == "reconnected":
-                await self.reconcile()
+        while True:
+            try:
+                evt = await self.user_feed.fills.get()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(0.1)
+                continue
+            # evt is a UserTradeEvent: .market (cid), .size (shares), .maker_order_id
+            cid = getattr(evt, "market", None)
+            if not cid:
+                continue
+            market = registry.get(cid)
+            if not market:
+                continue
+            key = self._fill_key(
+                cid,
+                getattr(evt, "order_id", ""),
+                getattr(evt, "asset_id", ""))
+            if self._is_duplicate(key):
+                continue
+            order = self._match_order(market, evt)
+            if order:
+                shares = float(getattr(evt, "size", 0))
+                await self._process_fill(market, order, shares=shares)
+                self._processed_fills[key] = time.time()
 
     def _match_order(self, market: MarketState, msg: Any) -> Optional[PassiveOrder]:
         """4-priority matching: exact → placeholder → pending-cancel → broad."""
@@ -188,14 +198,22 @@ class FillDetector:
             pass
 
         # Telegram + DB
-        await self.trade_manager.record_fill_direct(
+        from src.execution.models import TradeIntent, FillResult as TradeFillResult
+        intent = TradeIntent(
             condition_id=market.condition_id,
+            token_id=order.token_id,
             outcome=order.outcome,
+            side="BUY",
             price=order.price,
             size_usd=order.size_usd,
-            shares=shares,
-            paper=paper,
+            reason="td_maker_fill",
+            title=market.slug,
         )
+        trade_fill = TradeFillResult(
+            filled=True, shares=shares, avg_price=order.price)
+        await self.trade_manager.record_fill_direct(
+            intent, trade_fill,
+            execution_mode="paper" if paper else "maker")
         self.db.fire(self.db.mark_filled(order.order_id, shares=shares))
 
         logger.info("fill_processed", cid=market.condition_id,

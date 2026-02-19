@@ -52,9 +52,18 @@ class BiddingEngine:
         if result.is_skip:
             return
 
-        # Check rung dedup
-        price_cents = int(result.price * 100)
-        rung_key = (outcome, price_cents)
+        # Guard: skip if already have an active order for this outcome
+        if any(o.outcome == outcome
+               for o in market.active_orders.values()
+               if not MarketState.is_placeholder(o.order_id)):
+            return
+
+        # Rung dedup based on the actual rung price (not filter result / bid price)
+        rung_idx = market.fill_count
+        if rung_idx >= len(self.sizing.rung_prices):
+            return
+        rung_price_cents = int(round(self.sizing.rung_prices[rung_idx] * 100))
+        rung_key = (outcome, rung_price_cents)
         if rung_key in market.rungs_placed:
             return
 

@@ -120,16 +120,23 @@ class SettlementManager:
         exit_price = 1.0 if resolution == "win" else 0.0
 
         if not self.config.paper_mode:
-            await self.trade_manager.record_settle_direct(
+            from src.execution.models import TradeIntent, FillResult as TradeFillResult
+            intent = TradeIntent(
                 condition_id=market.condition_id,
+                token_id=pos.token_id,
                 outcome=pos.outcome,
-                entry_price=pos.entry_price,
-                exit_price=exit_price,
+                side="BUY",
+                price=pos.entry_price,
                 size_usd=pos.size_usd,
-                pnl=pnl,
+                reason="settlement",
+                title=market.slug,
             )
+            trade_fill = TradeFillResult(
+                filled=True, shares=pos.shares,
+                avg_price=exit_price, pnl_delta=pnl)
+            await self.trade_manager.record_settle_direct(intent, trade_fill)
 
-        self.guard.record_result(pnl)
+        await self.guard.record_result(pnl=pnl, won=(resolution == "win"))
         self.shadow.settle(market.condition_id, won=(resolution == "win"))
         self.db.fire(self.db.mark_settled(pos, pnl))
 
@@ -164,8 +171,7 @@ class SettlementManager:
         return None
 
     async def _query_gamma(self, slug: str) -> Optional[str]:
-        from src.utils.parsing import _first_event_slug
-        url = f"https://gamma-api.polymarket.com/events?slug={_first_event_slug(slug)}"
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url)
             r.raise_for_status()

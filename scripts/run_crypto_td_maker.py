@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime, timezone
 
 import structlog
 
@@ -51,6 +52,8 @@ from src.td_maker.bidding import BiddingEngine
 from src.td_maker.status import StatusLine
 
 logger = structlog.get_logger()
+
+TD_MAKER_EVENT_TYPE = "crypto_td_maker"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -222,16 +225,34 @@ class DBFire:
             placed_at=order.placed_at)
 
     def mark_filled(self, order_id, *, shares):
+        import time
         from src.db.td_orders import mark_filled
         return mark_filled(db_url=self.db_url,
-                           order_id=order_id, shares=shares)
+                           order_id=order_id, shares=shares,
+                           filled_at=time.time())
 
     def mark_settled(self, position, pnl):
-        from src.db.td_orders import mark_settled
-        return mark_settled(db_url=self.db_url,
-                            order_id=position.order_legs[0][0]
-                            if position.order_legs else "",
-                            pnl=pnl)
+        """Mark all order legs as settled, splitting PnL proportionally."""
+        async def _settle_all():
+            import time
+            from src.db.td_orders import mark_settled
+            now = time.time()
+            legs = getattr(position, "order_legs", [])
+            real_legs = [
+                (oid, sz) for oid, sz in legs
+                if not oid.startswith("_placing_") and oid
+            ]
+            if not real_legs:
+                return
+            total_size = sum(max(sz, 0.0) for _, sz in real_legs) or 1.0
+            for oid, sz in real_legs:
+                weight = max(sz, 0.0) / total_size
+                try:
+                    await mark_settled(db_url=self.db_url, order_id=oid,
+                                       pnl=pnl * weight, settled_at=now)
+                except Exception as e:
+                    logger.error("db_settle_failed", oid=oid, error=str(e))
+        return _settle_all()
 
     def delete_order(self, order_id):
         from src.db.td_orders import delete_order
@@ -239,37 +260,92 @@ class DBFire:
 
 
 class MagicExecutor:
-    """Paper mode stub — raises on any real CLOB call."""
-    async def place_order(self, **kw): raise RuntimeError("paper mode")
+    """Paper mode stub — generates fake order IDs, no real CLOB calls."""
+    _counter: int = 0
+
+    async def place_order(self, **kw):
+        MagicExecutor._counter += 1
+        return {"orderId": f"paper_{MagicExecutor._counter:06d}", "status": "LIVE"}
+
     async def cancel_order(self, *a): pass
-    async def cancel_all(self): pass
+    async def cancel_all_orders(self): return []
     async def get_order(self, *a): return None
     async def get_open_orders(self, **kw): return []
-    async def sell_fok(self, **kw): raise RuntimeError("paper mode")
-    async def cancel_and_sell(self, **kw): raise RuntimeError("paper mode")
     async def get_wallet_balance(self): return 0.0
 
 
 class AsyncUserFeed:
     """Paper mode stub for user feed."""
+
+    class _Event:
+        def is_set(self): return False
+        def clear(self): pass
+        def set(self): pass
+
+    reconnected = _Event()
+    is_connected = False
+
     async def connect(self): pass
-    async def __aiter__(self):
-        while True:
-            await asyncio.sleep(3600)
-            if False:
-                yield
+    async def disconnect(self): pass
+    async def subscribe_markets(self, *a): pass
+
+    @property
+    def fills(self):
+        if not hasattr(self, "_q"):
+            import asyncio
+            self._q = asyncio.Queue()
+        return self._q
 
 
 async def main_async() -> None:
     args = build_parser().parse_args()
     config = Config(args)
 
+    run_id = (f"{config.strategy_tag}-"
+              f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+
     # Infrastructure
     executor = PolymarketExecutor(settings) if not config.paper_mode else MagicExecutor()
     poly_feed = PolymarketFeed(settings)
-    user_feed = PolymarketUserFeed(settings) if not config.paper_mode else AsyncUserFeed()
     chainlink_feed = ChainlinkFeed(settings)
     shadow = TakerShadow()
+
+    # User feed (live only — needs per-credential constructor)
+    if not config.paper_mode and settings.POLYMARKET_API_KEY:
+        user_feed = PolymarketUserFeed(
+            api_key=settings.POLYMARKET_API_KEY,
+            api_secret=settings.POLYMARKET_API_SECRET,
+            api_passphrase=settings.POLYMARKET_API_PASSPHRASE,
+        )
+    else:
+        user_feed = AsyncUserFeed()
+
+    # Trade manager
+    manager = TradeManager(
+        executor=executor if not config.paper_mode else None,
+        strategy=config.strategy_tag,
+        paper=config.paper_mode,
+        db_url=config.db_url,
+        event_type=TD_MAKER_EVENT_TYPE,
+        run_id=run_id,
+        notify_bids=False,
+        notify_fills=not config.paper_mode,
+        notify_closes=not config.paper_mode,
+    )
+
+    # Risk guard
+    guard = RiskGuard(
+        strategy_tag=config.strategy_tag,
+        db_url=config.db_url,
+        max_consecutive_losses=config.cb_max_losses,
+        max_drawdown_usd=config.cb_max_drawdown,
+        stale_seconds=config.cb_stale_seconds,
+        stale_cancel_seconds=config.cb_stale_cancel,
+        stale_exit_seconds=config.cb_stale_exit,
+        daily_loss_limit_usd=config.cb_daily_limit,
+        telegram_alerter=manager._alerter,
+    )
+    await guard.initialize()
 
     # Auto-sizing
     if config.wallet <= 0 and not config.paper_mode:
@@ -287,25 +363,6 @@ async def main_async() -> None:
     # Models
     entry_model = _load_model(config.model_path)
     exit_model = _load_exit_model(config.exit_model_path)
-
-    # Risk guard
-    guard = RiskGuard(
-        max_consecutive_losses=config.cb_max_losses,
-        max_drawdown=config.cb_max_drawdown,
-        daily_loss_limit=config.cb_daily_limit,
-        stale_threshold=config.cb_stale_seconds,
-        poly_feed=poly_feed,
-        db_url=config.db_url,
-    )
-
-    # Trade manager
-    manager = TradeManager(
-        executor=executor,
-        guard=guard,
-        settings=settings,
-        strategy_tag=config.strategy_tag,
-        paper_mode=config.paper_mode,
-    )
 
     db = DBFire(config.db_url, config.strategy_tag)
 
