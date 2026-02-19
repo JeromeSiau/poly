@@ -1419,14 +1419,19 @@ class CryptoTDMaker:
                 self._pending_cancels[oid] = order
                 try:
                     await self.executor.cancel_order(oid)
-                    # Cancel confirmed — safe to clean up everywhere.
-                    self._pending_cancels.pop(oid, None)
+                    # Don't pop from _pending_cancels immediately — the CLOB may
+                    # return success even for orders that were already filled.
+                    # The stale-cancel expiry will clean up; meanwhile the fill
+                    # listener can still match late WS events.
                     self.active_orders.pop(oid, None)
                     if self._orders_by_cid_outcome.get(key) == oid:
                         del self._orders_by_cid_outcome[key]
                     self._rung_placed.discard(
                         (order.condition_id, order.outcome, int(round(order.price * 100))))
-                    self._db_fire(self._db_delete_order, oid)
+                    # Don't delete DB record immediately — if a fill arrives before the
+                    # stale-cancel expiry, _db_mark_filled needs the record to exist.
+                    # The stale-cancel expiry (30s) will call _db_delete_order if no
+                    # fill arrives. (_async_cancel follows the same pattern.)
                 except Exception as exc:
                     # Cancel request failed — order likely still live.
                     # Keep in both active_orders AND _pending_cancels.
