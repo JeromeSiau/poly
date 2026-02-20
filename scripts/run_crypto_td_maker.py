@@ -145,6 +145,9 @@ class CryptoTDMaker:
         min_entry_minutes: float = 0.0,
         max_entry_minutes: float = 0.0,
         chainlink_feed: Optional[ChainlinkFeed] = None,
+        entry_mode: str = "hardcoded",
+        min_edge: float = 0.03,
+        edge_decay: bool = True,
         model_path: str = "",
         hybrid_skip_below: float = 0.55,
         hybrid_taker_above: float = 0.72,
@@ -183,6 +186,9 @@ class CryptoTDMaker:
         self.stoploss_fair_margin = stoploss_fair_margin
         self.entry_fair_margin = entry_fair_margin
         self.min_book_depth = min_book_depth
+        self.entry_mode = entry_mode  # "hardcoded", "ml-hybrid", "ml-dynamic"
+        self.min_edge = min_edge
+        self.edge_decay = edge_decay
         self.avoid_hours_utc: frozenset[int] = frozenset(avoid_hours_utc or [])
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
@@ -470,6 +476,41 @@ class CryptoTDMaker:
             self._last_order_type[(cid, outcome)] = "maker"
 
         return p_win
+
+    @staticmethod
+    def _decaying_edge(min_edge: float, minutes: float) -> float:
+        """Require more edge early (patience), less edge late (urgency).
+
+        Linear decay from 3× min_edge at minute 1 down to 1× at minute 12.
+        """
+        t = max(1.0, min(12.0, minutes))
+        multiplier = 3.0 - (2.0 * (t - 1.0) / 11.0)
+        return min_edge * multiplier
+
+    def _check_model_edge(self, cid: str, outcome: str, bid: float
+                          ) -> tuple[Optional[float], Optional[float]]:
+        """ML-dynamic entry check. Returns (p_win, edge) or (None, None).
+
+        Uses decaying edge threshold: requires more edge early in the slot.
+        """
+        p_win = self._check_model(cid, outcome, bid)
+        if p_win is None:
+            return None, None
+
+        slot_ts = self._cid_slot_ts.get(cid)
+        if slot_ts is None:
+            return None, None
+        minutes = (time.time() - slot_ts) / 60.0
+
+        # Only consider entering between minute 1 and 12
+        if minutes < 1.0 or minutes > 12.0:
+            return None, None
+
+        edge = p_win - bid
+        required = self._decaying_edge(self.min_edge, minutes) if self.edge_decay else self.min_edge
+        if edge < required:
+            return p_win, None  # p_win known but edge insufficient
+        return p_win, edge
 
     # ------------------------------------------------------------------
     # DB persistence
@@ -1302,8 +1343,27 @@ class CryptoTDMaker:
                 model_order_type = "maker"
 
                 # BUY signal: bid in [target_bid, max_bid] + filters
-                if self._model:
-                    # ML model replaces manual move/timing filters
+                if self.entry_mode == "ml-dynamic" and self._model:
+                    # ML-dynamic: continuous scan with decaying edge threshold
+                    _pw, _edge = self._check_model_edge(cid, outcome, bid) if bid is not None else (None, None)
+                    model_p_win = _pw
+                    bid_in_range = (
+                        bid is not None
+                        and self.target_bid <= bid <= self.max_bid
+                        and _edge is not None  # means edge >= required threshold
+                    )
+                elif self.entry_mode == "ml-hybrid" and self._model:
+                    # ML-hybrid: skip/maker/taker classification
+                    model_p_win = self._check_model(cid, outcome, bid) if bid is not None else None
+                    model_order_type = self._last_order_type.pop((cid, outcome), "skip")
+                    bid_in_range = (
+                        bid is not None
+                        and self.target_bid <= bid <= self.max_bid
+                        and model_p_win is not None
+                        and model_order_type != "skip"
+                    )
+                elif self._model:
+                    # Legacy: model loaded but entry_mode=hardcoded → use ml-hybrid
                     model_p_win = self._check_model(cid, outcome, bid) if bid is not None else None
                     model_order_type = self._last_order_type.pop((cid, outcome), "skip")
                     bid_in_range = (
@@ -1313,7 +1373,7 @@ class CryptoTDMaker:
                         and model_order_type != "skip"
                     )
                 else:
-                    # Manual filters fallback
+                    # Hardcoded: manual filters (default)
                     bid_in_range = (
                         bid is not None
                         and self.target_bid <= bid <= self.max_bid
@@ -2516,8 +2576,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max minutes into slot — stop entering after this (0=disabled)",
     )
     p.add_argument(
+        "--entry-mode", type=str, default="hardcoded",
+        choices=["hardcoded", "ml-hybrid", "ml-dynamic"],
+        help="Entry logic: hardcoded (manual filters), ml-hybrid (skip/maker/taker), ml-dynamic (decaying edge)",
+    )
+    p.add_argument(
+        "--min-edge", type=float, default=0.03,
+        help="Min edge (p_win - bid) for ml-dynamic mode (default: 0.03)",
+    )
+    p.add_argument(
+        "--no-edge-decay", action="store_true",
+        help="Disable decaying edge threshold (use flat min_edge at all times)",
+    )
+    p.add_argument(
         "--model-path", type=str, default="",
-        help="Path to trained XGBoost model (.joblib). Model replaces manual filters.",
+        help="Path to trained XGBoost model (.joblib). Required for ml-hybrid/ml-dynamic.",
     )
     p.add_argument(
         "--hybrid-skip-below", type=float, default=0.55,
@@ -2581,9 +2654,15 @@ async def main() -> None:
     if not paper_mode:
         executor = PolymarketExecutor.from_settings()
 
+    strategy_name = "CryptoTDMaker"
+    if args.entry_mode == "ml-dynamic":
+        strategy_name = "[ML] CryptoTDMaker"
+    elif args.entry_mode == "ml-hybrid":
+        strategy_name = "[MLH] CryptoTDMaker"
+
     manager = TradeManager(
         executor=executor,
-        strategy="CryptoTDMaker",
+        strategy=strategy_name,
         paper=paper_mode,
         db_url=args.db_url,
         event_type=TD_MAKER_EVENT_TYPE,
@@ -2659,6 +2738,9 @@ async def main() -> None:
         min_entry_minutes=args.min_entry_minutes,
         max_entry_minutes=args.max_entry_minutes,
         chainlink_feed=chainlink_feed,
+        entry_mode=args.entry_mode,
+        min_edge=args.min_edge,
+        edge_decay=not args.no_edge_decay,
         model_path=args.model_path,
         hybrid_skip_below=args.hybrid_skip_below,
         hybrid_taker_above=args.hybrid_taker_above,
@@ -2698,9 +2780,13 @@ async def main() -> None:
         print(f"  Move filter: {' & '.join(parts)} (Chainlink directional)")
     if args.model_path:
         print(f"  ML model:    {args.model_path}")
-        print(f"  Hybrid:      skip<{args.hybrid_skip_below} | "
-              f"maker {args.hybrid_skip_below}-{args.hybrid_taker_above} | "
-              f"taker>{args.hybrid_taker_above}")
+        print(f"  Entry mode:  {args.entry_mode}")
+        if args.entry_mode == "ml-dynamic":
+            print(f"  Min edge:    {args.min_edge} ({'decaying 3×→1×' if not args.no_edge_decay else 'flat'})")
+        else:
+            print(f"  Hybrid:      skip<{args.hybrid_skip_below} | "
+                  f"maker {args.hybrid_skip_below}-{args.hybrid_taker_above} | "
+                  f"taker>{args.hybrid_taker_above}")
     if args.stoploss_peak > 0:
         print(f"  Stop-loss:   peak>={args.stoploss_peak} & bid<={args.stoploss_exit} → sell FOK"
               f" (fair override margin={args.stoploss_fair_margin})")

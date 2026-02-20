@@ -29,8 +29,9 @@ async def load_snapshots(db_url: str, min_minutes: float = 4.0,
             s.bid_size_up, s.ask_size_up, s.bid_size_down, s.ask_size_down,
             s.spread_up, s.spread_down,
             s.chainlink_price, s.dir_move_pct, s.abs_move_pct,
+            s.market_volume_usd,
             s.hour_utc, s.day_of_week,
-            r.resolved_up
+            r.resolved_up, r.prev_resolved_up
         FROM slot_snapshots s
         JOIN slot_resolutions r ON s.symbol = r.symbol AND s.slot_ts = r.slot_ts
         WHERE r.resolved_up IS NOT NULL
@@ -81,8 +82,9 @@ async def load_all_snapshots(db_url: str) -> pd.DataFrame:
             s.bid_size_up, s.ask_size_up, s.bid_size_down, s.ask_size_down,
             s.spread_up, s.spread_down,
             s.chainlink_price, s.dir_move_pct, s.abs_move_pct,
+            s.market_volume_usd,
             s.hour_utc, s.day_of_week,
-            r.resolved_up
+            r.resolved_up, r.prev_resolved_up
         FROM slot_snapshots s
         JOIN slot_resolutions r ON s.symbol = r.symbol AND s.slot_ts = r.slot_ts
         WHERE r.resolved_up IS NOT NULL

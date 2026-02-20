@@ -14,8 +14,11 @@ FEATURE_COLS = [
     "spread_up", "spread_down",
     # Book sizes
     "bid_size_up", "ask_size_up", "bid_size_down", "ask_size_down",
-    # Chainlink move
-    "dir_move_pct", "abs_move_pct",
+    # Chainlink
+    "chainlink_price", "dir_move_pct", "abs_move_pct",
+    # Market context
+    "market_volume_usd",  # 0.0 when unknown (column added 2026-02-19)
+    "prev_resolved_up",   # 1.0=prev slot UP, 0.0=prev slot DOWN, 0.5=unknown
     # Timing
     "minutes_into_slot",
     "hour_utc", "day_of_week",
@@ -64,6 +67,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # book_pressure: relative size advantage of Up vs Down bids
     total_bid_sz = (df["bid_size_up"] + df["bid_size_down"]).clip(lower=0.01)
     df["book_pressure"] = (df["bid_size_up"] - df["bid_size_down"]) / total_bid_sz
+
+    # market_volume_usd: fill missing with 0 (column added 2026-02-19, low coverage)
+    if "market_volume_usd" in df.columns:
+        df["market_volume_usd"] = df["market_volume_usd"].fillna(0.0)
+
+    # prev_resolved_up: cast bool→float, fill unknown with 0.5 (neutral)
+    if "prev_resolved_up" in df.columns:
+        df["prev_resolved_up"] = df["prev_resolved_up"].astype("float64").fillna(0.5)
 
     return df
 
