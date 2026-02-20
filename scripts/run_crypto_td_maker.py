@@ -26,6 +26,14 @@ USAGE:
 
 from __future__ import annotations
 
+import os
+
+# Limit XGBoost/joblib parallelism — CalibratedClassifierCV spawns threads
+# on all cores by default, causing 1400% CPU on a 16-core server.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("JOBLIB_START_METHOD", "sequential")
+
 import argparse
 import asyncio
 import json

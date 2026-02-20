@@ -45,7 +45,7 @@ TAG="crypto_td_ml_${SYMBOLS//,/_}_edge${MIN_EDGE}"
 LOG_FILE="$BASE/logs/${TAG}.log"
 
 DISCOVERY_INTERVAL="${DISCOVERY_INTERVAL:-60}"
-MAKER_INTERVAL="${MAKER_INTERVAL:-5}"
+MAKER_INTERVAL="${MAKER_INTERVAL:-0.5}"
 
 MODE_FLAG="--paper"
 [[ "$MODE" == "live" ]] && MODE_FLAG="--live"
