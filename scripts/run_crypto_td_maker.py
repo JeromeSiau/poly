@@ -32,7 +32,8 @@ import os
 # on all cores by default, causing 1400% CPU on a 16-core server.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("JOBLIB_START_METHOD", "sequential")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
 import argparse
 import asyncio
