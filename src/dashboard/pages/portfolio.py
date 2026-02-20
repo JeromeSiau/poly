@@ -23,6 +23,86 @@ from src.dashboard._shared import (
     style_result,
 )
 
+
+def _strategy_filter_active() -> bool:
+    """True when the user has selected specific strategies in the sidebar."""
+    return bool(st.session_state.get("strategies"))
+
+
+def _fetch_db_trades(mode: str, pp: dict) -> list[dict]:
+    """Fetch trades from internal DB, filtered by selected strategy tags."""
+    tags = st.session_state.get("strategies", [])
+    all_trades: list[dict] = []
+    for tag in tags:
+        data = api("/trades", {"mode": mode, "tag": tag, **pp, "limit": 2000})
+        all_trades.extend(data.get("trades", []))
+    # Deduplicate by trade ID (tags may overlap via substring match)
+    seen: set[int] = set()
+    unique: list[dict] = []
+    for t in all_trades:
+        tid = t.get("trade_id") or t.get("id")
+        if tid not in seen:
+            seen.add(tid)
+            unique.append(t)
+    return unique
+
+
+def _db_stats(trades: list[dict]) -> dict:
+    """Compute KPI stats from DB trades, matching /winrate response shape."""
+    resolved = [t for t in trades if t.get("pnl") is not None]
+    pnls = [t["pnl"] for t in resolved]
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p <= 0)
+    total_pnl = sum(pnls) if pnls else 0.0
+    sizes = [t.get("size") or 0 for t in resolved]
+    total_cost = sum(
+        (t.get("entry_price") or 0) * (t.get("size") or 0) for t in resolved
+    )
+    avg_win = (
+        sum(p for p in pnls if p > 0) / wins if wins else 0.0
+    )
+    avg_loss = (
+        sum(p for p in pnls if p <= 0) / losses if losses else 0.0
+    )
+    pf = (
+        sum(p for p in pnls if p > 0) / abs(sum(p for p in pnls if p <= 0))
+        if any(p <= 0 for p in pnls)
+        else None
+    )
+    roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+
+    # Build per-market breakdown for charts
+    markets: list[dict] = []
+    for t in resolved:
+        ts_str = t.get("closed_at") or t.get("timestamp")
+        ts_val: float | None = None
+        if ts_str:
+            try:
+                dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                ts_val = dt.timestamp()
+            except Exception:
+                pass
+        cost = (t.get("entry_price") or 0) * (t.get("size") or 0)
+        markets.append({
+            "timestamp": ts_val,
+            "title": t.get("title", ""),
+            "outcome": t.get("outcome", ""),
+            "avg_entry": t.get("entry_price"),
+            "cost": round(cost, 2),
+            "pnl": t["pnl"],
+            "status": "WIN" if t["pnl"] > 0 else "LOSS",
+        })
+
+    return {
+        "total_pnl": round(total_pnl, 4),
+        "winrate": round(wins / len(pnls) * 100, 1) if pnls else 0.0,
+        "wins": wins,
+        "losses": losses,
+        "profit_factor": round(pf, 2) if pf is not None else None,
+        "roi_pct": round(roi, 1),
+        "markets": markets,
+    }
+
 # -- Period filter (inline, same position as ML page) --
 period_col, date_col = st.columns([1, 2])
 with period_col:
@@ -51,11 +131,17 @@ with tab_live:
     def kpi_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
+        filtered = _strategy_filter_active() and m == "live"
 
         balance_data = api("/balance", {"mode": m})
-        winrate_data = api("/winrate", {"mode": m, **pp})
-
         bal = balance_data.get("balance", 0.0)
+
+        if filtered:
+            trades = _fetch_db_trades(m, pp)
+            winrate_data = _db_stats(trades)
+        else:
+            winrate_data = api("/winrate", {"mode": m, **pp})
+
         pnl = winrate_data.get("total_pnl", 0.0)
         wr = winrate_data.get("winrate", 0.0)
         pf = winrate_data.get("profit_factor")
@@ -82,11 +168,18 @@ with tab_live:
     def pnl_chart_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
+        filtered = _strategy_filter_active() and m == "live"
 
         balance_data = api("/balance", {"mode": m})
-        winrate_data = api("/winrate", {"mode": m, **pp})
-        markets = winrate_data.get("markets", [])
         current_bal = balance_data.get("balance", 0.0)
+
+        if filtered:
+            trades = _fetch_db_trades(m, pp)
+            winrate_data = _db_stats(trades)
+        else:
+            winrate_data = api("/winrate", {"mode": m, **pp})
+
+        markets = winrate_data.get("markets", [])
         total_pnl = winrate_data.get("total_pnl", 0.0)
 
         if not markets:
@@ -161,10 +254,16 @@ with tab_live:
     def hourly_pnl_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
+        filtered = _strategy_filter_active() and m == "live"
 
         st.markdown('<p class="section-label">PnL by Hour</p>', unsafe_allow_html=True)
 
-        winrate_data = api("/winrate", {"mode": m, **pp})
+        if filtered:
+            trades = _fetch_db_trades(m, pp)
+            winrate_data = _db_stats(trades)
+        else:
+            winrate_data = api("/winrate", {"mode": m, **pp})
+
         markets = winrate_data.get("markets", [])
 
         if not markets:
@@ -241,10 +340,11 @@ with tab_live:
     def recent_trades_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
+        filtered = _strategy_filter_active() and m == "live"
 
         st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
 
-        if m == "live":
+        if m == "live" and not filtered:
             winrate_data = api("/winrate", {"mode": "live", **pp})
             markets = winrate_data.get("markets", [])
             if not markets:
@@ -276,6 +376,42 @@ with tab_live:
             w = sum(1 for p in pnls if p > 0)
             l = sum(1 for p in pnls if p <= 0)
             st.caption(f"{len(markets)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
+        elif m == "live" and filtered:
+            db_trades = _fetch_db_trades(m, pp)
+            resolved = [t for t in db_trades if t.get("pnl") is not None]
+            if not resolved:
+                st.caption("No trades in this period")
+                return
+            df = pd.DataFrame(resolved)
+
+            def _fmt_time_db(ts_str):
+                try:
+                    return datetime.fromisoformat(
+                        str(ts_str).replace("Z", "+00:00")
+                    ).strftime("%H:%M")
+                except Exception:
+                    return ""
+
+            display = pd.DataFrame({
+                "Time": (df["closed_at"].fillna(df["timestamp"])).apply(_fmt_time_db),
+                "Strategy": df["strategy_tag"],
+                "Market": df["title"],
+                "Side": df["outcome"],
+                "Entry": df["entry_price"].apply(lambda x: f"{x:.3f}" if x is not None else ""),
+                "Exit": df["exit_price"].apply(lambda x: f"{x:.3f}" if x is not None else ""),
+                "PnL": df["pnl"].apply(lambda x: f"${x:+.2f}" if x is not None else ""),
+                "Result": df["pnl"].apply(
+                    lambda x: "WIN" if x and x > 0 else "LOSS"
+                ),
+            })
+            styled = display.style.map(style_pnl, subset=["PnL"]).map(
+                style_result, subset=["Result"]
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+            pnls = [t["pnl"] for t in resolved]
+            w = sum(1 for p in pnls if p > 0)
+            l = sum(1 for p in pnls if p <= 0)
+            st.caption(f"{len(resolved)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
         else:
             data = api("/trades", {"mode": "paper", **pp, "limit": 200})
             trades = data.get("trades", [])
