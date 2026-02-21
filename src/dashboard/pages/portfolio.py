@@ -131,7 +131,7 @@ with tab_live:
     def kpi_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
-        filtered = _strategy_filter_active() and m == "live"
+        filtered = _strategy_filter_active()
 
         balance_data = api("/balance", {"mode": m})
         bal = balance_data.get("balance", 0.0)
@@ -168,7 +168,7 @@ with tab_live:
     def pnl_chart_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
-        filtered = _strategy_filter_active() and m == "live"
+        filtered = _strategy_filter_active()
 
         balance_data = api("/balance", {"mode": m})
         current_bal = balance_data.get("balance", 0.0)
@@ -254,7 +254,7 @@ with tab_live:
     def hourly_pnl_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
-        filtered = _strategy_filter_active() and m == "live"
+        filtered = _strategy_filter_active()
 
         st.markdown('<p class="section-label">PnL by Hour</p>', unsafe_allow_html=True)
 
@@ -340,11 +340,11 @@ with tab_live:
     def recent_trades_section():
         m = "live" if st.session_state.get("nav_mode", "Live") == "Live" else "paper"
         pp = period_params()
-        filtered = _strategy_filter_active() and m == "live"
+        filtered = _strategy_filter_active()
 
         st.markdown('<p class="section-label">Recent Trades</p>', unsafe_allow_html=True)
 
-        if m == "live" and not filtered:
+        if not filtered and m == "live":
             winrate_data = api("/winrate", {"mode": "live", **pp})
             markets = winrate_data.get("markets", [])
             if not markets:
@@ -376,7 +376,7 @@ with tab_live:
             w = sum(1 for p in pnls if p > 0)
             l = sum(1 for p in pnls if p <= 0)
             st.caption(f"{len(markets)} trades  |  {w}W {l}L  |  ${sum(pnls):+.2f}")
-        elif m == "live" and filtered:
+        elif filtered:
             db_trades = _fetch_db_trades(m, pp)
             resolved = [t for t in db_trades if t.get("pnl") is not None]
             if not resolved:
