@@ -26,12 +26,14 @@ STOPLOSS_PEAK="${STOPLOSS_PEAK:-0.75}"
 STOPLOSS_EXIT="${STOPLOSS_EXIT:-0.40}"
 STOPLOSS_FAIR_MARGIN="${STOPLOSS_FAIR_MARGIN:-0.10}"
 ENTRY_FAIR_MARGIN="${ENTRY_FAIR_MARGIN:-0}"
+TAKER_MODE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --symbols)        SYMBOLS="$2"; shift 2 ;;
     --paper)          MODE="paper"; shift ;;
     --live)           MODE="live"; shift ;;
+    --taker)          TAKER_MODE="1"; shift ;;
     --target-bid)     TARGET_BID="$2"; shift 2 ;;
     --max-bid)        MAX_BID="$2"; shift 2 ;;
     --wallet)         WALLET_USD="$2"; shift 2 ;;
@@ -53,7 +55,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$ENTRY_MODE" == "ml-dynamic" ]]; then
+if [[ -n "$TAKER_MODE" ]]; then
+    TAG="crypto_td_taker_${SYMBOLS//,/_}_bid${TARGET_BID}"
+elif [[ "$ENTRY_MODE" == "ml-dynamic" ]]; then
     TAG="crypto_td_ml_${SYMBOLS//,/_}_edge${MIN_EDGE}"
 elif [[ "$ENTRY_MODE" == "ml-hybrid" ]]; then
     TAG="crypto_td_mlh_${SYMBOLS//,/_}_bid${TARGET_BID}"
@@ -105,4 +109,5 @@ exec "$PYTHON" "$BASE/scripts/run_crypto_td_maker.py" \
   "${SIZING_ARGS[@]}" "${ML_ARGS[@]}" \
   --discovery-interval "$DISCOVERY_INTERVAL" --maker-interval "$MAKER_INTERVAL" \
   --strategy-tag "$TAG" --db-url "$DB_URL" \
-  "${CB_ARGS[@]}"
+  "${CB_ARGS[@]}" \
+  ${TAKER_MODE:+--taker}

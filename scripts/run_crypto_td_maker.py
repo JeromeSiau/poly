@@ -168,6 +168,7 @@ class CryptoTDMaker:
         exit_threshold: float = 0.35,
         min_book_depth: float = 0.0,
         avoid_hours_utc: list[int] | None = None,
+        force_taker: bool = False,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -199,6 +200,7 @@ class CryptoTDMaker:
         self.min_edge = min_edge
         self.edge_decay = edge_decay
         self.avoid_hours_utc: frozenset[int] = frozenset(avoid_hours_utc or [])
+        self.force_taker = force_taker
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -1470,7 +1472,10 @@ class CryptoTDMaker:
                             else:
                                 if model_p_win is not None:
                                     self._last_p_win[(cid, outcome)] = model_p_win
-                                ot = model_order_type if self._model else "maker"
+                                if self.force_taker:
+                                    ot = "taker"
+                                else:
+                                    ot = model_order_type if self._model else "maker"
                                 if ot == "taker" and ask is not None:
                                     place_intents.append((cid, outcome, token_id, ask, "taker"))
                                 else:
@@ -2642,6 +2647,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="H",
         help="UTC hours to avoid placing new orders e.g. 21 22 23 0 (default: none)",
     )
+    p.add_argument(
+        "--taker", action="store_true", default=False,
+        help="Force all entries to FOK at ask (taker mode) instead of GTC at bid",
+    )
     return p
 
 
@@ -2656,6 +2665,8 @@ async def main() -> None:
     ]
     paper_mode = not args.live
     strategy_tag = args.strategy_tag.strip() or "crypto_td_maker"
+    if args.taker and "_taker" not in strategy_tag:
+        strategy_tag += "_taker"
 
     run_id = f"{strategy_tag}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
@@ -2664,7 +2675,9 @@ async def main() -> None:
         executor = PolymarketExecutor.from_settings()
 
     strategy_name = "CryptoTDMaker"
-    if args.entry_mode == "ml-dynamic":
+    if args.taker:
+        strategy_name = "CryptoTDTaker"
+    elif args.entry_mode == "ml-dynamic":
         strategy_name = "[ML] CryptoTDMaker"
     elif args.entry_mode == "ml-hybrid":
         strategy_name = "[MLH] CryptoTDMaker"
@@ -2761,6 +2774,7 @@ async def main() -> None:
         exit_threshold=args.exit_threshold,
         min_book_depth=args.min_book_depth,
         avoid_hours_utc=args.avoid_hours_utc,
+        force_taker=args.taker,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"
@@ -2802,6 +2816,8 @@ async def main() -> None:
     if args.exit_model_path:
         print(f"  Exit model:  {args.exit_model_path}")
         print(f"  Exit thresh: P(win)<{args.exit_threshold} → sell FOK")
+    if args.taker:
+        print(f"  Order mode:  TAKER (FOK at ask)")
     print(f"  Strategy:    Passive maker on 15-min crypto markets")
     print()
 
