@@ -1487,8 +1487,10 @@ class CryptoTDMaker:
                                 else:
                                     ot = model_order_type if self._model else "maker"
                                 _spread = (ask - bid) if (ask is not None and bid is not None) else 0.0
-                                if ot == "taker" and ask is not None:
-                                    place_intents.append((cid, outcome, token_id, ask, "taker", _spread))
+                                if ot == "taker":
+                                    if ask is not None:
+                                        place_intents.append((cid, outcome, token_id, ask, "taker", _spread))
+                                    # else: no ask on book — skip (don't fallback to passive maker)
                                 else:
                                     place_intents.append((cid, outcome, token_id, bid, "maker", _spread))
 
