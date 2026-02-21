@@ -169,6 +169,7 @@ class CryptoTDMaker:
         min_book_depth: float = 0.0,
         avoid_hours_utc: list[int] | None = None,
         force_taker: bool = False,
+        spread_size_mult: float = 0.0,
     ) -> None:
         self.executor = executor
         self.polymarket = polymarket
@@ -201,6 +202,7 @@ class CryptoTDMaker:
         self.edge_decay = edge_decay
         self.avoid_hours_utc: frozenset[int] = frozenset(avoid_hours_utc or [])
         self.force_taker = force_taker
+        self.spread_size_mult = spread_size_mult
         self.rung_prices = compute_rung_prices(target_bid, max_bid, ladder_rungs)
         self._last_book_update: float = time.time()
 
@@ -281,11 +283,18 @@ class CryptoTDMaker:
         """Convert model confidence to size multiplier."""
         return max(0.2, min(2.0, (p_win - 0.5) / 0.25))
 
-    def _compute_order_size_usd(self, p_win: Optional[float]) -> float:
-        """Effective order size after optional model scaling."""
-        if p_win is None or not self._model:
-            return self.order_size_usd
-        return round(self.order_size_usd * self._model_size_scale(p_win), 2)
+    def _compute_order_size_usd(self, p_win: Optional[float], spread: float = 0.0) -> float:
+        """Effective order size after optional model scaling and spread boost."""
+        base = self.order_size_usd
+        if p_win is not None and self._model:
+            base = round(base * self._model_size_scale(p_win), 2)
+        # Spread sizing: wider spread → larger position (mispricing signal).
+        if self.spread_size_mult > 0 and spread >= 0.02:
+            if spread >= 0.04:
+                base *= min(self.spread_size_mult, 2.5)
+            else:
+                base *= min(1.0 + (self.spread_size_mult - 1.0) * 0.5, 2.0)
+        return base
 
     def _track_position_order_leg(self, cid: str, order_id: str, size_usd: float) -> None:
         """Track one DB order leg for settlement fan-out."""
@@ -1422,7 +1431,8 @@ class CryptoTDMaker:
                                 continue
                             if model_p_win is not None:
                                 self._last_p_win[(cid, outcome)] = model_p_win
-                            place_intents.append((cid, outcome, token_id, rung_price, "maker"))
+                            _spread = (ask - bid) if (ask is not None and bid is not None) else 0.0
+                            place_intents.append((cid, outcome, token_id, rung_price, "maker", _spread))
                 else:
                     # ---- Single-order mode (original logic) ----
                     existing_oid = self._orders_by_cid_outcome.get(existing_key)
@@ -1476,10 +1486,11 @@ class CryptoTDMaker:
                                     ot = "taker"
                                 else:
                                     ot = model_order_type if self._model else "maker"
+                                _spread = (ask - bid) if (ask is not None and bid is not None) else 0.0
                                 if ot == "taker" and ask is not None:
-                                    place_intents.append((cid, outcome, token_id, ask, "taker"))
+                                    place_intents.append((cid, outcome, token_id, ask, "taker", _spread))
                                 else:
-                                    place_intents.append((cid, outcome, token_id, bid, "maker"))
+                                    place_intents.append((cid, outcome, token_id, bid, "maker", _spread))
 
         # Execute cancels.
         for oid in cancel_ids:
@@ -1529,7 +1540,7 @@ class CryptoTDMaker:
         placed_cids_this_tick: set[str] = set()  # prevent BUY Up + SELL Down on same cid
         # Collect condition_ids with pending cancels — don't place new orders there.
         pending_cancel_cids = {o.condition_id for o in self._pending_cancels.values()}
-        for cid, outcome, token_id, price, order_type in place_intents:
+        for cid, outcome, token_id, price, order_type, spread in place_intents:
             if self._cid_fill_count.get(cid, 0) >= self.ladder_rungs:
                 continue
             # Don't place new orders while a cancel is in-flight for this market.
@@ -1553,7 +1564,7 @@ class CryptoTDMaker:
                     continue
 
             p_win_for_size = self._last_p_win.get((cid, outcome))
-            intent_size_usd = self._compute_order_size_usd(p_win_for_size)
+            intent_size_usd = self._compute_order_size_usd(p_win_for_size, spread=spread)
             if budget_left < intent_size_usd:
                 continue
 
@@ -1562,7 +1573,7 @@ class CryptoTDMaker:
                 continue
 
             order_id = await self._place_order(
-                cid, outcome, token_id, price, now, order_type=order_type,
+                cid, outcome, token_id, price, now, order_type=order_type, spread=spread,
             )
             if order_id:
                 placed += 1
@@ -1618,7 +1629,7 @@ class CryptoTDMaker:
 
     async def _place_order(
         self, cid: str, outcome: str, token_id: str, price: float, now: float,
-        *, order_type: str = "maker",
+        *, order_type: str = "maker", spread: float = 0.0,
     ) -> Optional[str]:
         """Place a BUY order — GTC maker or FOK taker depending on order_type."""
         if not self.manager:
@@ -1626,9 +1637,9 @@ class CryptoTDMaker:
 
         is_taker = order_type == "taker"
 
-        # Model-based sizing: scale order_size by confidence
+        # Model-based sizing: scale order_size by confidence + spread boost
         p_win = self._last_p_win.pop((cid, outcome), None)
-        size_usd = self._compute_order_size_usd(p_win)
+        size_usd = self._compute_order_size_usd(p_win, spread=spread)
         if p_win is not None and self._model:
             confidence_scale = self._model_size_scale(p_win)
             logger.debug("model_sizing", cid=cid[:12], outcome=outcome,
@@ -2643,6 +2654,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Min bid_sz at target price before placing order (0=disabled)",
     )
     p.add_argument(
+        "--spread-size-mult", type=float, default=0.0,
+        help="Spread-based sizing: wider spread = bigger bet (0=disabled, 2.0=recommended). "
+             "spread<2c: 1x, 2-4c: halfway to mult, >=4c: full mult.",
+    )
+    p.add_argument(
         "--avoid-hours-utc", type=int, nargs="*", default=[],
         metavar="H",
         help="UTC hours to avoid placing new orders e.g. 21 22 23 0 (default: none)",
@@ -2775,6 +2791,7 @@ async def main() -> None:
         min_book_depth=args.min_book_depth,
         avoid_hours_utc=args.avoid_hours_utc,
         force_taker=args.taker,
+        spread_size_mult=args.spread_size_mult,
     )
 
     wallet_src = "auto" if args.wallet <= 0 else "manual"
@@ -2801,6 +2818,8 @@ async def main() -> None:
         if args.max_move_pct > 0:
             parts.append(f"<={args.max_move_pct}%")
         print(f"  Move filter: {' & '.join(parts)} (Chainlink directional)")
+    if args.spread_size_mult > 0:
+        print(f"  Spread size: {args.spread_size_mult:.1f}x when spread >= 2c")
     if args.model_path:
         print(f"  ML model:    {args.model_path}")
         print(f"  Entry mode:  {args.entry_mode}")
